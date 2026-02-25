@@ -1714,6 +1714,7 @@ def launch_gui():
     add_row(tab_drone, r, "Arm width (m)", v_arm_width_m); r += 1
     add_row(tab_drone, r, "Max tilt (deg)", v_max_tilt_deg); r += 1
     coax_entry = add_row(tab_drone, r, "Coaxial spacing (m)", v_coaxial_spacing_m); r += 1
+    coax_entry.configure(state="disabled")  # initially disabled until "coaxial" config selected
 
     # Motor configuration dropdown
     # after creating v_motor_configuration and v_coaxial_spacing_m StringVars
