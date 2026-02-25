@@ -130,7 +130,7 @@ python simulator.py --help
 
 ## Motor-Prop CSV Table Format
 
-The simulator accepts **eCalc-style CSV exports**.
+The simulator accepts **CSV exports**.
 
 ### Required columns (any naming variant is accepted):
 
