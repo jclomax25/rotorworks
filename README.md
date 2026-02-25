@@ -39,63 +39,6 @@ Install from `requirements.txt`:
 
 ```bash
 pip install -r requirements.txt
-
-Absolutely — below is a **complete, consolidated `README.md`** that already includes **Quick Start, CSV table format, Mission JSON, modeling notes/assumptions, and troubleshooting**, written so someone new to the project can get productive quickly.
-
-You can copy-paste this directly into `README.md`.
-
----
-
-````markdown
-# Multicopter Power Simulator
-
-A cross-platform multicopter performance simulator inspired by **eCalc-style workflows**.  
-It supports **single-point analysis**, **full mission simulation**, **coaxial vs flat configurations**, **battery / motor / ESC / prop / avionics modeling**, **status limit checks**, and **rich plotting** via a GUI or CLI.
-
-The simulator is intended for **engineering trade studies**, not flight-controller-level dynamics.
-
----
-
-## Features
-
-### Core
-- **Single-point simulation** (hover / forward flight)
-- **Mission simulation** with time-series outputs
-- **Flat vs coaxial motor configurations**
-- **Coaxial spacing–dependent interference modeling**
-- **Battery voltage sag & internal resistance**
-- **ESC current limits & conduction losses**
-- **Avionics voltage rails with BEC efficiency**
-- **Automatic drag fallback from vehicle geometry**
-
-### GUI
-- Tabbed configuration:
-  - Drone · Battery · Motor · ESC · Avionics · Prop · Mission/Env
-- **Metrics tab** (eCalc-style single-point summary)
-- **Status tab** with color-coded limit checks
-- **Mission Plots tab** (multi-axis time series vs time)
-- **Save / Load configuration** (JSON)
-- **View → UI Scale** for high-DPI displays
-
-### Motor/Prop Test Table Support
-- Load **CSV motor-prop test data**
-- Robust parsing (handles extra header rows)
-- Uses **Power vs Thrust** interpolation
-- Uses **Throttle column** when available
-- Falls back to analytic throttle estimation if no CSV
-
----
-
-## Requirements
-
-### Python
-- **Python 3.9+** recommended
-
-### Dependencies
-Install via:
-
-```bash
-pip install -r requirements.txt
 ````
 
 `requirements.txt`:
