@@ -402,6 +402,100 @@ def solve_pack_voltage_and_current(battery: "BatteryConfig", total_power_W: floa
 # -------------------------------
 # Propeller Model
 # -------------------------------
+def load_motor_prop_table_csv(path: str) -> pd.DataFrame:
+    """Load a motor/prop test table CSV.
+
+    Supports two formats:
+    1) Simple header with columns like: Thrust_g, Power_W, Current_A, RPM, Voltage_V, Throttle_pct, Efficiency_gW, Temp_C
+    2) eCalc-style exported CSV where the *real* header is on a later row (e.g. first row says 'Test Data') and
+       columns are named like 'Thrust (g)', 'Power (W)', 'Current (A)', 'RPM', 'Voltage (V)', 'Throttle', etc.
+
+    Returns a cleaned DataFrame sorted by Thrust_g with standardized column names.
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+
+    # Try normal header first
+    try:
+        df0 = pd.read_csv(path)
+    except Exception:
+        df0 = pd.DataFrame()
+
+    def _looks_good(df: pd.DataFrame) -> bool:
+        cols = {str(c).strip().lower() for c in df.columns}
+        return ("thrust_g" in cols) or ("thrust (g)" in cols) or ("thrust" in cols and "(g)" in " ".join(cols))
+
+    if df0 is not None and len(df0.columns) > 1 and _looks_good(df0):
+        df = df0
+    else:
+        # Read without header, find the header row
+        raw = pd.read_csv(path, header=None)
+        header_row = None
+        for i in range(min(len(raw), 25)):
+            row = raw.iloc[i].astype(str).str.strip().str.lower().tolist()
+            if any("throttle" == x or x.startswith("throttle") for x in row) and any("thrust" in x for x in row):
+                header_row = i
+                break
+            # Some exports put "Voltage (V)" and "Thrust (g)" on same line
+            if any("voltage" in x for x in row) and any("thrust" in x for x in row) and any("power" in x for x in row):
+                header_row = i
+                break
+        if header_row is None:
+            raise ValueError(f"Could not locate header row in CSV: {path}")
+
+        df = pd.read_csv(path, header=header_row)
+
+    # Standardize column names
+    rename_map = {}
+    for c in df.columns:
+        c0 = str(c).strip()
+        cl = c0.lower()
+
+        if cl in ("thrust_g", "thrust (g)"):
+            rename_map[c] = "Thrust_g"
+        elif cl in ("power_w", "power (w)"):
+            rename_map[c] = "Power_W"
+        elif cl in ("current_a", "current (a)"):
+            rename_map[c] = "Current_A"
+        elif cl in ("voltage_v", "voltage (v)"):
+            rename_map[c] = "Voltage_V"
+        elif cl in ("rpm",):
+            rename_map[c] = "RPM"
+        elif cl in ("efficiency (g/w)", "efficiency_gw", "efficiency (g/w) "):
+            rename_map[c] = "Efficiency_gW"
+        elif "operating temperature" in cl or "temperature" in cl:
+            rename_map[c] = "Temp_C"
+        elif cl.startswith("throttle"):
+            rename_map[c] = "Throttle_pct"
+        elif cl == "propeller":
+            rename_map[c] = "Propeller"
+        elif cl == "type":
+            rename_map[c] = "Type"
+        elif "torque" in cl:
+            rename_map[c] = "Torque_Nm"
+
+    df = df.rename(columns=rename_map)
+
+    # Clean / coerce types
+    def _to_float_series(s: pd.Series) -> pd.Series:
+        return pd.to_numeric(s.astype(str).str.replace("%", "", regex=False).str.strip(), errors="coerce")
+
+    for col in ("Thrust_g", "Power_W", "Current_A", "Voltage_V", "RPM", "Efficiency_gW", "Temp_C", "Throttle_pct", "Torque_Nm"):
+        if col in df.columns:
+            df[col] = _to_float_series(df[col])
+
+    # Drop rows without thrust/power
+    if "Thrust_g" not in df.columns or "Power_W" not in df.columns:
+        raise ValueError("Motor/prop CSV must contain thrust and power columns (e.g., 'Thrust (g)' and 'Power (W)')")
+
+    df = df.dropna(subset=["Thrust_g", "Power_W"]).copy()
+
+    # Sort & de-duplicate by thrust (keep last)
+    df = df.sort_values("Thrust_g")
+    df = df.drop_duplicates(subset=["Thrust_g"], keep="last").reset_index(drop=True)
+
+    return df
+
 class PropellerConfig:
     def __init__(self,
                  diameter_in: float,
@@ -425,7 +519,7 @@ class PropellerConfig:
 
         self.table: Optional[pd.DataFrame] = None
         if table_csv:
-            self.table = pd.read_csv(table_csv)
+            self.table = load_motor_prop_table_csv(table_csv)
 
 
 # -------------------------------
@@ -669,12 +763,13 @@ def thrust_required(config: DroneConfig, speed_mps: float, orientation: str) -> 
 # -------------------------------
 # Power Models
 # -------------------------------
-def interpolate_motor_power(config: DroneConfig, thrust_per_motor_N: float) -> float:
-    """
-    Interpolate from CSV table with columns:
-      Thrust_g, Power_W
+def interpolate_motor_point(config: DroneConfig, thrust_per_motor_N: float) -> dict:
+    """Interpolate a full operating point from a motor/prop test table.
 
-    thrust_per_motor_N is converted to grams-force equivalent for table lookup.
+    Returns a dict with (when available):
+      Power_W, RPM, Current_A, Voltage_V, Throttle_pct, Efficiency_gW, Temp_C, Torque_Nm
+
+    The lookup key is thrust (grams-force). Interpolation is linear between nearest points.
     """
     if config.propeller.table is None:
         raise ValueError("No prop_table loaded, cannot interpolate.")
@@ -683,20 +778,44 @@ def interpolate_motor_power(config: DroneConfig, thrust_per_motor_N: float) -> f
     df = config.propeller.table
 
     if "Thrust_g" not in df.columns or "Power_W" not in df.columns:
-        raise ValueError("prop_table CSV must have columns: Thrust_g, Power_W")
+        raise ValueError("prop_table CSV must have columns: Thrust_g, Power_W (after parsing)")
 
-    if thrust_g <= df["Thrust_g"].min():
-        return float(df.iloc[0]["Power_W"])
-    if thrust_g >= df["Thrust_g"].max():
-        return float(df.iloc[-1]["Power_W"])
+    # clamp
+    if thrust_g <= float(df["Thrust_g"].min()):
+        row = df.iloc[0]
+        return {k: float(row[k]) for k in df.columns if k in (
+            "Thrust_g","Power_W","RPM","Current_A","Voltage_V","Throttle_pct","Efficiency_gW","Temp_C","Torque_Nm"
+        ) and pd.notna(row[k])}
+
+    if thrust_g >= float(df["Thrust_g"].max()):
+        row = df.iloc[-1]
+        return {k: float(row[k]) for k in df.columns if k in (
+            "Thrust_g","Power_W","RPM","Current_A","Voltage_V","Throttle_pct","Efficiency_gW","Temp_C","Torque_Nm"
+        ) and pd.notna(row[k])}
 
     lower = df[df["Thrust_g"] <= thrust_g].iloc[-1]
     upper = df[df["Thrust_g"] >= thrust_g].iloc[0]
 
-    return float(lower["Power_W"] + (upper["Power_W"] - lower["Power_W"]) * (
-        (thrust_g - lower["Thrust_g"]) / (upper["Thrust_g"] - lower["Thrust_g"])
-    ))
+    denom = float(upper["Thrust_g"] - lower["Thrust_g"])
+    frac = 0.0 if denom == 0 else float((thrust_g - lower["Thrust_g"]) / denom)
 
+    out = {}
+    for col in ("Power_W","RPM","Current_A","Voltage_V","Throttle_pct","Efficiency_gW","Temp_C","Torque_Nm"):
+        if col in df.columns and pd.notna(lower[col]) and pd.notna(upper[col]):
+            out[col] = float(lower[col] + (upper[col] - lower[col]) * frac)
+        elif col in df.columns and pd.notna(lower[col]) and pd.isna(upper[col]):
+            out[col] = float(lower[col])
+        elif col in df.columns and pd.isna(lower[col]) and pd.notna(upper[col]):
+            out[col] = float(upper[col])
+    return out
+
+
+def interpolate_motor_power(config: DroneConfig, thrust_per_motor_N: float) -> float:
+    """Interpolate electrical input power from a motor/prop test table."""
+    pt = interpolate_motor_point(config, thrust_per_motor_N)
+    if "Power_W" not in pt:
+        raise ValueError("prop_table interpolation failed to produce Power_W")
+    return float(pt["Power_W"])
 
 def motor_power_from_params(config: DroneConfig, thrust_per_motor_N: float) -> float:
     """
@@ -927,7 +1046,7 @@ def simulate_mission(config: DroneConfig,
                      orientation: str = "forward",
                      temperature_C: Optional[float] = None,
                      pressure_Pa: Optional[float] = None,
-                     wind_mps: float = 0.0) -> Tuple[List[Tuple[str, float, float, str]], Optional[dict]]:
+                     wind_mps: float = 0.0) -> Tuple[List[Tuple[str, float, float, str]], Optional[dict], Optional[dict]]:
     """
     Simulate mission phases, draining remaining energy (Wh).
 
@@ -945,6 +1064,57 @@ def simulate_mission(config: DroneConfig,
     remaining_wh = config.battery.usable_Wh
     results: List[Tuple[str, float, float, str]] = []
     worst_metrics: Optional[dict] = None
+    mission_series: dict = {
+        't_s': [],
+        'phase': [],
+        'airspeed_mps': [],
+        'groundspeed_mps': [],
+        'distance_km': [],
+        'altitude_m': [],
+        'tilt_deg': [],
+        'battery_voltage_V': [],
+        'battery_current_A': [],
+        'battery_energy_Wh': [],
+        'battery_capacity_mAh': [],
+        'total_power_W': [],
+        'motor_power_W': [],
+        'motor_power_per_motor_W': [],
+        'motor_current_A': [],
+        'motor_rpm': [],
+        'motor_thrust_N': [],
+        'thrust_total_N': [],
+        'periph_power_W': [],
+        'esc_loss_W': [],
+    }
+
+    t_s = 0.0
+    dist_km = 0.0
+
+    def _append_point(phase_name: str, phase_alt_m: float, m: dict, t_s_now: float, dist_km_now: float, remaining_wh_now: float):
+        # Note: many metrics are phase-steady; distance/energy change across the phase.
+        mission_series['t_s'].append(float(t_s_now))
+        mission_series['phase'].append(str(phase_name))
+        mission_series['airspeed_mps'].append(float(m.get('airspeed_mps', 0.0)))
+        mission_series['groundspeed_mps'].append(float(phase.speed))
+        mission_series['distance_km'].append(float(dist_km_now))
+        mission_series['altitude_m'].append(float(phase_alt_m))
+        mission_series['tilt_deg'].append(float(m.get('tilt_required_deg', 0.0)))
+        mission_series['battery_voltage_V'].append(float(m.get('v_load_V', 0.0)))
+        mission_series['battery_current_A'].append(float(m.get('pack_current_A', 0.0)))
+        mission_series['battery_energy_Wh'].append(float(remaining_wh_now))
+        vnom = float(config.battery.vnom_pack) if float(config.battery.vnom_pack) > 1e-9 else 1.0
+        mission_series['battery_capacity_mAh'].append(float(remaining_wh_now) * 1000.0 / vnom)
+        mission_series['total_power_W'].append(float(m.get('total_power_W', 0.0)))
+        mp = float(m.get('motor_power_W', 0.0))
+        mission_series['motor_power_W'].append(mp)
+        mission_series['motor_power_per_motor_W'].append(mp / max(int(config.num_motors), 1))
+        mission_series['motor_current_A'].append(float(m.get('motor_I_per_esc_A', 0.0)))
+        mission_series['motor_rpm'].append(float(m.get('prop_rpm')) if m.get('prop_rpm') is not None else float('nan'))
+        mission_series['motor_thrust_N'].append(float(m.get('thrust_per_motor_N', 0.0)))
+        mission_series['thrust_total_N'].append(float(m.get('thrust_total_N', 0.0)))
+        mission_series['periph_power_W'].append(float(m.get('periph_power_W', 0.0)))
+        mission_series['esc_loss_W'].append(float(m.get('esc_loss_W', 0.0)))
+
 
     def _merge_worst(worst: Optional[dict], m: dict) -> dict:
         if worst is None:
@@ -972,6 +1142,9 @@ def simulate_mission(config: DroneConfig,
         # Compute operating metrics for this phase, then fold into worst-case metrics.
         m = compute_operating_metrics(config, speed_mps=float(phase.speed), orientation=orientation, wind_mps=wind_mps)
         worst_metrics = _merge_worst(worst_metrics, m)
+
+        # Append phase-start sample for mission plots
+        _append_point(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_wh)
 
         airspeed = float(m.get("airspeed_mps", 0.0))
         total_power_W = float(m.get("total_power_W", 0.0))
@@ -1002,9 +1175,22 @@ def simulate_mission(config: DroneConfig,
             if energy_used_Wh > remaining_wh:
                 actual_time_min = (remaining_wh / total_power_W) * 60.0
                 actual_dist_km = airspeed * (actual_time_min * 60.0) / 1000.0
+                # advance and append final point at depletion
+                t_s += actual_time_min * 60.0
+                dist_km += actual_dist_km
+                remaining_wh = 0.0
+                _append_point(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_wh)
+                # advance and append final point at depletion
+                t_s += actual_time_min * 60.0
+                dist_km += actual_dist_km
+                remaining_wh = 0.0
+                _append_point(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_wh)
                 results.append((phase.name, actual_time_min, actual_dist_km, "Battery depleted"))
                 break
             remaining_wh -= energy_used_Wh
+            t_s += duration_s
+            dist_km += airspeed * duration_s / 1000.0
+            _append_point(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_wh)
             results.append((phase.name, duration_s / 60.0, airspeed * duration_s / 1000.0, status_ok))
 
         elif phase.distance is not None:
@@ -1019,16 +1205,24 @@ def simulate_mission(config: DroneConfig,
             if energy_used_Wh > remaining_wh:
                 actual_time_min = (remaining_wh / total_power_W) * 60.0
                 actual_dist_km = airspeed * (actual_time_min * 60.0) / 1000.0
+                # advance and append final point at depletion
+                t_s += actual_time_min * 60.0
+                dist_km += actual_dist_km
+                remaining_wh = 0.0
+                _append_point(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_wh)
                 results.append((phase.name, actual_time_min, actual_dist_km, "Battery depleted"))
                 break
 
             remaining_wh -= energy_used_Wh
+            t_s += time_s
+            dist_km += dist_m / 1000.0
+            _append_point(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_wh)
             results.append((phase.name, time_s / 60.0, dist_m / 1000.0, status_ok))
         else:
             results.append((phase.name, 0.0, 0.0, "Invalid: phase missing duration/distance"))
             break
 
-    return results, worst_metrics
+    return results, worst_metrics, mission_series
 
 
 
@@ -1271,6 +1465,12 @@ def launch_gui():
                 _apply_matplotlib_scale_to_fig(current_fig, scale)
             if current_canvas is not None:
                 current_canvas.draw_idle()
+        except Exception:
+            pass
+
+        try:
+            row_h = int(35 * scale) + 8
+            ttk.Style().configure("Avionics.Treeview", rowheight=row_h)
         except Exception:
             pass
 
@@ -1625,12 +1825,16 @@ def launch_gui():
     r += 1
 
     av_table_frame = ttk.Frame(tab_avionics)
-    av_table_frame.grid(row=r, column=0, columnspan=2, sticky="nsew", padx=6, pady=6)
+    av_table_frame.grid(row=r, column=0, columnspan=3, sticky="nsew", padx=6, pady=6)
     av_table_frame.rowconfigure(0, weight=1)
     av_table_frame.columnconfigure(0, weight=1)
 
     av_cols = ("voltage", "current", "eff")
-    avionics_tree = ttk.Treeview(av_table_frame, columns=av_cols, show="headings", height=10, selectmode="browse")
+
+    style = ttk.Style()
+    style.configure("Avionics.Treeview", rowheight=55)
+
+    avionics_tree = ttk.Treeview(av_table_frame, columns=av_cols, show="headings", height=14, style="Avionics.Treeview", selectmode="browse")
     avionics_tree.heading("voltage", text="Rail Voltage (V)")
     avionics_tree.heading("current", text="Rail Current (A)")
     avionics_tree.heading("eff", text="BEC Efficiency (0-1]")
@@ -1856,18 +2060,395 @@ def launch_gui():
 
     tab_plot_out = ttk.Frame(display_nb, padding=0)
     tab_status_out = ttk.Frame(display_nb, padding=0)
+    tab_metrics_out = ttk.Frame(display_nb, padding=0)
+    tab_mission_plots_out = ttk.Frame(display_nb, padding=0)
     tab_plot_out.columnconfigure(0, weight=1)
     tab_plot_out.rowconfigure(0, weight=1)
     tab_status_out.columnconfigure(0, weight=1)
     tab_status_out.rowconfigure(0, weight=1)
+    tab_metrics_out.columnconfigure(0, weight=1)
+    tab_metrics_out.rowconfigure(0, weight=1)
+    tab_mission_plots_out.columnconfigure(0, weight=1)
+    tab_mission_plots_out.rowconfigure(0, weight=1)
 
     display_nb.add(tab_plot_out, text="Plots")
     display_nb.add(tab_status_out, text="Status")
+    display_nb.add(tab_metrics_out, text="Metrics")
+    display_nb.add(tab_mission_plots_out, text="Mission Plots")
 
     plot_frame = ttk.LabelFrame(tab_plot_out, text="Plots", padding=6)
     plot_frame.grid(row=0, column=0, sticky="nsew")
     plot_frame.columnconfigure(0, weight=1)
     plot_frame.rowconfigure(0, weight=1)
+
+
+
+    # ---------- Metrics tab (single-point eCalc-like summary) ----------
+    metrics_container = ttk.Frame(tab_metrics_out, padding=6)
+    metrics_container.grid(row=0, column=0, sticky="nsew")
+    metrics_container.columnconfigure(0, weight=1)
+    metrics_container.rowconfigure(0, weight=1)
+
+    metrics_tv = ttk.Treeview(metrics_container, columns=("metric", "value"), show="headings", height=18)
+    metrics_tv.heading("metric", text="Metric")
+    metrics_tv.heading("value", text="Value")
+    metrics_tv.column("metric", width=280, anchor="w")
+    metrics_tv.column("value", width=260, anchor="w")
+
+    metrics_sb = ttk.Scrollbar(metrics_container, orient="vertical", command=metrics_tv.yview)
+    metrics_tv.configure(yscrollcommand=metrics_sb.set)
+
+    metrics_tv.grid(row=0, column=0, sticky="nsew")
+    metrics_sb.grid(row=0, column=1, sticky="ns")
+
+    # Section header styling
+    try:
+        _mstyle = ttk.Style()
+        _mstyle.configure("Metrics.Treeview", rowheight=24)
+        metrics_tv.configure(style="Metrics.Treeview")
+        metrics_tv.tag_configure("section", font=("TkDefaultFont", 11, "bold"))
+    except Exception:
+        pass
+
+    def _metrics_clear() -> None:
+        for _iid in metrics_tv.get_children():
+            metrics_tv.delete(_iid)
+
+    def _metrics_add_section(title: str) -> None:
+        metrics_tv.insert("", "end", values=(title, ""), tags=("section",))
+
+    def _metrics_add(metric: str, value: str) -> None:
+        metrics_tv.insert("", "end", values=(metric, value))
+
+    def update_metrics_tab(drone: DroneConfig, metrics: dict, speed_mps: float, orientation: str) -> None:
+        """Populate the Metrics tab for the last single-point run."""
+        _metrics_clear()
+
+        def fmt(x, nd=2):
+            try:
+                return f"{float(x):.{nd}f}"
+            except Exception:
+                return "n/a"
+
+        batt = drone.battery
+        nm = max(int(drone.num_motors), 1)
+        g0 = 9.80665
+
+        v_load = float(metrics.get("v_load_V", float("nan")))
+        I_pack = float(metrics.get("pack_current_A", float("nan")))
+        P_total = float(metrics.get("total_power_W", float("nan")))
+        P_motor_total = float(metrics.get("motor_power_W", 0.0))
+        P_periph = float(metrics.get("periph_power_W", 0.0))
+        P_esc_loss = float(metrics.get("esc_loss_W", 0.0))
+
+        # Battery
+        cap_mAh = float(batt.pack_capacity_mAh) if batt.pack_capacity_mAh is not None else float(batt.capacity_mAh)
+        cap_Ah = cap_mAh / 1000.0 if cap_mAh else 0.0
+        usable_frac = max(0.0, min(1.0, float(getattr(batt, "discharge_percent", 100.0)) / 100.0))
+        usable_mAh = cap_mAh * usable_frac
+        usable_Wh = float(batt.capacity_Wh) * usable_frac
+        load_C = (I_pack / cap_Ah) if cap_Ah > 0 else float("nan")
+
+        # Flight time + range at this point
+        t_min = estimate_flight_time_minutes(drone, speed_mps, orientation=orientation)
+        range_m = (t_min * 60.0) * float(speed_mps)
+        range_mi = (range_m / 1000.0) * 0.621371
+
+        # Motor estimates per motor
+        I_motor = float(metrics.get("motor_I_per_esc_A", float("nan")))
+        rpm = metrics.get("prop_rpm", None)
+        rpm = float(rpm) if rpm is not None else float("nan")
+        kv = getattr(drone.motor, "kv", None)
+        Rm = float(getattr(drone.motor, "resistance", 0.0))
+        I0 = float(getattr(drone.motor, "idle_current", 0.0))
+
+        V_emf = float("nan")
+        if kv and kv > 0 and rpm == rpm:
+            V_emf = rpm / float(kv)
+        V_motor = v_load
+        if V_emf == V_emf and I_motor == I_motor:
+            V_motor = V_emf + I_motor * Rm
+
+        throttle_linear = (V_motor / v_load) if (v_load == v_load and v_load > 1e-6 and V_motor == V_motor) else float("nan")
+        if throttle_linear == throttle_linear:
+            throttle_linear = max(0.0, min(1.2, throttle_linear))
+        throttle_log = float("nan")
+        if throttle_linear == throttle_linear:
+            throttle_log = math.log10(1 + 9 * max(0.0, min(1.0, throttle_linear)))
+
+        P_elec_motor = (I_motor * v_load) if (I_motor == I_motor and v_load == v_load) else float("nan")
+        P_mech_motor = float("nan")
+        if V_emf == V_emf and I_motor == I_motor:
+            P_mech_motor = V_emf * max(0.0, I_motor - I0)
+        motor_eff = (P_mech_motor / P_elec_motor) if (P_mech_motor == P_mech_motor and P_elec_motor == P_elec_motor and P_elec_motor > 0) else float("nan")
+
+        # Very rough temperature estimate
+        T_est = float("nan")
+        try:
+            Imax = float(getattr(drone.motor, "max_current", 0.0))
+            if Imax > 0 and I_motor == I_motor:
+                copper = (I_motor ** 2) * Rm
+                copper_max = (Imax ** 2) * Rm
+                T_amb = float(getattr(drone, "temperature_C", 25.0))
+                T_est = T_amb + 20.0 * (copper / max(1e-6, copper_max))
+        except Exception:
+            pass
+
+        # Thrust / ratios
+        thrust_total_N = float(metrics.get("thrust_total_N", float("nan")))
+        thrust_pm_N = float(metrics.get("thrust_per_motor_N", float("nan")))
+        weight_kg = float(drone.weight_kg)
+        twr = (thrust_total_N / (weight_kg * g0)) if weight_kg > 0 else float("nan")
+
+        thrust_pm_g = (thrust_pm_N / g0) * 1000.0 if thrust_pm_N == thrust_pm_N else float("nan")
+        spec_thrust = (thrust_pm_g / P_elec_motor) if (P_elec_motor == P_elec_motor and P_elec_motor > 0 and thrust_pm_g == thrust_pm_g) else float("nan")
+
+        # Drive weight (motors + ESCs + props)
+        drive_g = 0.0
+        if getattr(drone.motor, "weight_g", None) is not None:
+            drive_g += float(drone.motor.weight_g) * nm
+        if getattr(drone, "esc", None) is not None and getattr(drone.esc, "weight_g", None) is not None:
+            drive_g += float(drone.esc.weight_g) * nm
+        if getattr(drone.prop, "weight_g", None) is not None:
+            drive_g += float(drone.prop.weight_g) * nm
+
+        # Total disc area
+        D_in = float(getattr(drone.prop, "diameter_in", 0.0))
+        D_m = D_in * 0.0254
+        A_disk = math.pi * (D_m / 2.0) ** 2
+        A_total_m2 = A_disk * nm
+        A_total_cm2 = A_total_m2 * 1e4
+        A_total_in2 = A_total_m2 / (0.0254 ** 2)
+
+        # Total efficiencies / power-to-weight
+        p2w_Wkg = (P_total / weight_kg) if weight_kg > 0 else float("nan")
+        P_out = max(0.0, P_total - P_esc_loss - P_periph)
+        eff_total = (P_out / P_total) if P_total > 0 else float("nan")
+
+        # Speed conversions
+        v_kmh = speed_mps * 3.6
+        v_mph = v_kmh * 0.621371
+
+        # Tilt
+        tilt = float(metrics.get("tilt_required_deg", float("nan")))
+        tilt_lim = metrics.get("tilt_limit_deg", None)
+
+        # Max additional payload from thrust margin
+        max_payload_kg = (thrust_total_N / g0) - weight_kg if thrust_total_N == thrust_total_N else float("nan")
+        max_payload_g = max_payload_kg * 1000.0 if max_payload_kg == max_payload_kg else float("nan")
+
+        # ---- Populate table ----
+        _metrics_add_section("Battery")
+        _metrics_add("Load", f"{fmt(load_C, 2)} C")
+        _metrics_add("Voltage", f"{fmt(v_load, 2)} V")
+        _metrics_add("Rated Voltage", f"{fmt(batt.vmax_pack, 2)} V")
+        _metrics_add("Energy (usable)", f"{fmt(usable_Wh, 1)} Wh")
+        _metrics_add("Energy (total)", f"{fmt(float(batt.capacity_Wh), 1)} Wh")
+        _metrics_add("Total Capacity", f"{fmt(cap_mAh, 0)} mAh")
+        _metrics_add("Usable Capacity", f"{fmt(usable_mAh, 0)} mAh")
+        _metrics_add("Flight Time (this point)", f"{fmt(t_min, 2)} min")
+        _metrics_add("Battery Weight", f"{fmt(batt.weight_g, 0)} g")
+
+        _metrics_add_section("Motor @ Operating Point")
+        _metrics_add("Current", f"{fmt(I_motor, 2)} A")
+        _metrics_add("Voltage", f"{fmt(V_motor, 2)} V")
+        _metrics_add("RPM", f"{fmt(rpm, 0)} rpm")
+        _metrics_add("Thrust (per motor)", f"{fmt(thrust_pm_g, 0)} g")
+        _metrics_add("Thrust (total)", f"{fmt((thrust_total_N/g0)*1000.0, 0)} g")
+        _metrics_add("Electric Power", f"{fmt(P_elec_motor, 1)} W")
+        _metrics_add("Mechanical Power", f"{fmt(P_mech_motor, 1)} W")
+        _metrics_add("Throttle (log)", f"{fmt(throttle_log*100.0, 0)} %")
+        _metrics_add("Throttle (linear)", f"{fmt(throttle_linear*100.0, 0)} %")
+        if getattr(drone.motor, "weight_g", None):
+            _metrics_add("Power/Weight", f"{fmt(P_elec_motor / max(1e-6, (float(drone.motor.weight_g)/1000.0)), 1)} W/kg")
+        else:
+            _metrics_add("Power/Weight", "n/a")
+        _metrics_add("Efficiency", f"{fmt(motor_eff*100.0, 1)} %")
+        _metrics_add("Resistance (Rm)", f"{fmt(Rm*1000.0, 1)} mΩ")
+        _metrics_add("Specific Thrust", f"{fmt(spec_thrust, 2)} g/W")
+        _metrics_add("Est. Temperature", f"{fmt(T_est, 0)} °C")
+
+        _metrics_add_section("Total Drive")
+        _metrics_add("Drive Weight", f"{fmt(drive_g, 0)} g")
+        _metrics_add("Thrust-Weight", f"{fmt(twr, 2)} : 1")
+        _metrics_add("Total Current", f"{fmt(I_pack, 2)} A")
+        _metrics_add("P(in)", f"{fmt(P_total, 1)} W")
+        _metrics_add("P(out)", f"{fmt(P_out, 1)} W")
+        _metrics_add("Total Efficiency", f"{fmt(eff_total*100.0, 1)} %")
+        _metrics_add("Total Power/Weight", f"{fmt(p2w_Wkg, 1)} W/kg")
+
+        _metrics_add_section("Multicopter")
+        _metrics_add("Vehicle Weight", f"{fmt(weight_kg*1000.0, 0)} g")
+        if tilt_lim is not None:
+            _metrics_add("Tilt required vs max", f"{fmt(tilt, 1)}° / {fmt(tilt_lim, 1)}°")
+        else:
+            _metrics_add("Tilt required", f"{fmt(tilt, 1)}°")
+        _metrics_add("Speed", f"{fmt(v_kmh, 0)} km/h  ({fmt(v_mph, 0)} mph)")
+        _metrics_add("Estimated Range", f"{fmt(range_m, 0)} m  ({fmt(range_mi, 2)} mi)")
+        _metrics_add("Total Disc Area", f"{fmt(A_total_cm2, 0)} cm²  ({fmt(A_total_in2, 0)} in²)")
+        _metrics_add("Max additional payload", f"{fmt(max_payload_g, 0)} g")
+    # ---------- Mission Plots tab (time-series over mission) ----------
+    mission_container = ttk.Frame(tab_mission_plots_out, padding=6)
+    mission_container.grid(row=0, column=0, sticky="nsew")
+    mission_container.columnconfigure(0, weight=0)
+    mission_container.columnconfigure(1, weight=1)
+    mission_container.rowconfigure(0, weight=1)
+
+    mission_controls = ttk.LabelFrame(mission_container, text="Y-axis variables", padding=6)
+    mission_controls.grid(row=0, column=0, sticky="ns", padx=(0, 8))
+    mission_plot_frame = ttk.LabelFrame(mission_container, text="Mission plot", padding=6)
+    mission_plot_frame.grid(row=0, column=1, sticky="nsew")
+    mission_plot_frame.columnconfigure(0, weight=1)
+    mission_plot_frame.rowconfigure(0, weight=1)
+
+    ttk.Label(mission_controls, text="Select one or more variables to plot vs mission time.").grid(row=0, column=0, sticky="w")
+
+    mission_var_list = tk.Listbox(mission_controls, selectmode="extended", height=16, exportselection=False)
+    mission_var_list.grid(row=1, column=0, sticky="nsew", pady=(6, 6))
+    mission_controls.rowconfigure(1, weight=1)
+    mission_controls.columnconfigure(0, weight=1)
+
+    mission_list_sb = ttk.Scrollbar(mission_controls, orient="vertical", command=mission_var_list.yview)
+    mission_list_sb.grid(row=1, column=1, sticky="ns", pady=(6, 6))
+    mission_var_list.configure(yscrollcommand=mission_list_sb.set)
+
+    mission_btns = ttk.Frame(mission_controls)
+    mission_btns.grid(row=2, column=0, columnspan=2, sticky="ew")
+    ttk.Button(mission_btns, text="Plot selected", command=lambda: update_mission_plot()).grid(row=0, column=0, padx=(0, 6))
+    ttk.Button(mission_btns, text="Clear", command=lambda: clear_mission_plot()).grid(row=0, column=1)
+
+    # mission plot canvas state
+    mission_canvas = None
+    mission_fig = None
+    last_mission_series = None
+
+    MISSION_VARS = [
+        ("airspeed_mps", "Vehicle airspeed", "m/s"),
+        ("groundspeed_mps", "Ground speed", "m/s"),
+        ("distance_km", "Distance traveled", "km"),
+        ("altitude_m", "Altitude", "m"),
+        ("tilt_deg", "Tilt angle", "deg"),
+        ("battery_voltage_V", "Battery voltage (loaded)", "V"),
+        ("battery_current_A", "Battery current", "A"),
+        ("battery_energy_Wh", "Battery energy remaining", "Wh"),
+        ("battery_capacity_mAh", "Battery capacity remaining", "mAh"),
+        ("total_power_W", "Total power", "W"),
+        ("motor_power_W", "Motor power (total)", "W"),
+        ("motor_power_per_motor_W", "Motor power (per motor)", "W"),
+        ("motor_current_A", "Motor/ESC current (per ESC)", "A"),
+        ("motor_rpm", "Motor RPM", "rpm"),
+        ("motor_thrust_N", "Motor thrust (per motor)", "N"),
+        ("thrust_total_N", "Total thrust", "N"),
+        ("periph_power_W", "Avionics/peripherals power", "W"),
+        ("esc_loss_W", "ESC loss power", "W"),
+    ]
+
+    _mission_display_items = []  # parallel to listbox indices: (key,label,unit)
+    for k, lbl, unit in MISSION_VARS:
+        mission_var_list.insert(tk.END, f"{lbl} ({unit})")
+        _mission_display_items.append((k, lbl, unit))
+
+    def clear_mission_plot():
+        nonlocal mission_canvas, mission_fig
+        for w in mission_plot_frame.winfo_children():
+            w.destroy()
+        mission_canvas = None
+        mission_fig = None
+
+    def show_mission_figure(fig):
+        nonlocal mission_canvas, mission_fig
+        for w in mission_plot_frame.winfo_children():
+            w.destroy()
+        mission_fig = fig
+        mission_canvas = FigureCanvasTkAgg(fig, master=mission_plot_frame)
+        try:
+            _apply_matplotlib_scale_to_fig(fig, float(ui_scale.get()))
+        except Exception:
+            pass
+        mission_canvas.draw()
+        mission_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+    def update_mission_plot():
+        nonlocal last_mission_series
+        if last_mission_series is None:
+            messagebox.showinfo("Mission plot", "Run a mission simulation first to generate mission time series.")
+            return
+        sel = list(mission_var_list.curselection())
+        if not sel:
+            messagebox.showinfo("Mission plot", "Select one or more variables to plot.")
+            return
+
+        # Build figure with multiple y-axes (grouped by unit)
+        import matplotlib.pyplot as plt
+        fig = plt.Figure(figsize=(7.5, 4.5), dpi=100)
+        ax0 = fig.add_subplot(111)
+
+        t_min = [x / 60.0 for x in last_mission_series.get('t_s', [])]
+        if not t_min:
+            messagebox.showinfo("Mission plot", "Mission time series is empty.")
+            return
+
+        # Group selected variables by unit
+        selected_items = [_mission_display_items[i] for i in sel]
+        by_unit = {}
+        for key, lbl, unit in selected_items:
+            by_unit.setdefault(unit, []).append((key, lbl))
+
+        axes = []
+        unit_list = list(by_unit.keys())
+        if not unit_list:
+            return
+
+        # First unit on left axis
+        first_unit = unit_list[0]
+        axes.append((ax0, first_unit))
+        ax0.set_ylabel(first_unit)
+
+        # Additional units on right axes
+        for ui, unit in enumerate(unit_list[1:], start=1):
+            axn = ax0.twinx()
+            # offset spines so multiple y-axes don't overlap
+            axn.spines['right'].set_position(('outward', 55 * (ui - 0)))
+            axn.set_ylabel(unit)
+            axes.append((axn, unit))
+
+        # Plot each unit group
+        lines = []
+        labels = []
+        for ax, unit in axes:
+            for key, lbl in by_unit.get(unit, []):
+                y = last_mission_series.get(key, [])
+                if y is None:
+                    continue
+                # Replace NaN RPMs with None to avoid breaking autoscale
+                yy = []
+                for v in y:
+                    try:
+                        if isinstance(v, float) and (v != v):
+                            yy.append(float('nan'))
+                        else:
+                            yy.append(float(v))
+                    except Exception:
+                        yy.append(float('nan'))
+                ln, = ax.plot(t_min, yy, label=lbl)
+                lines.append(ln)
+                labels.append(lbl)
+
+        ax0.set_xlabel('Mission time (min)')
+        ax0.grid(True)
+        fig.suptitle('Mission variables vs time')
+        if lines:
+            ax0.legend(lines, labels, loc='best')
+
+        show_mission_figure(fig)
+
+    # Scroll wheel for listbox
+    def _on_list_wheel(event):
+        if event.delta:
+            mission_var_list.yview_scroll(int(-1 * (event.delta / 120)), 'units')
+        return 'break'
+    mission_var_list.bind('<MouseWheel>', _on_list_wheel)
+
     out_frame = ttk.LabelFrame(right, text="Output", padding=6)
     out_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
     out_frame.columnconfigure(0, weight=1)
@@ -2406,6 +2987,22 @@ def launch_gui():
         # ESC loss is total_power - motor - periph
         esc_loss_W = max(0.0, float(total_power_W) - float(motor_power_W) - float(periph_power_W))
         rpm_est = _estimate_prop_rpm_if_possible(drone, thrust_per_motor_N)
+
+        motor_table = None
+
+        if getattr(drone, 'propeller', None) is not None and drone.propeller.table is not None:
+
+            try:
+
+                motor_table = interpolate_motor_point(drone, thrust_per_motor_N)
+
+                if 'RPM' in motor_table:
+
+                    rpm_est = float(motor_table['RPM'])
+
+            except Exception:
+
+                motor_table = None
         tilt_req = required_tilt_deg(drone, airspeed, orientation)
         return {
             "airspeed_mps": float(airspeed),
@@ -2422,6 +3019,11 @@ def launch_gui():
             "thrust_total_N": float(total_thrust_N),
             "thrust_per_motor_N": float(thrust_per_motor_N),
             "prop_rpm": (float(rpm_est) if rpm_est is not None else None),
+            "motor_table_throttle_pct": (float(motor_table["Throttle_pct"]) if motor_table and "Throttle_pct" in motor_table else None),
+            "motor_table_eff_gW": (float(motor_table["Efficiency_gW"]) if motor_table and "Efficiency_gW" in motor_table else None),
+            "motor_table_temp_C": (float(motor_table["Temp_C"]) if motor_table and "Temp_C" in motor_table else None),
+            "motor_table_voltage_V": (float(motor_table["Voltage_V"]) if motor_table and "Voltage_V" in motor_table else None),
+            "motor_table_current_A": (float(motor_table["Current_A"]) if motor_table and "Current_A" in motor_table else None),
         }
     
 
@@ -2445,6 +3047,7 @@ def launch_gui():
 
             metrics = compute_operating_metrics(drone, speed_mps=speed, orientation=orientation, wind_mps=0.0)
             update_status_tables_from_metrics(drone, metrics)
+            update_metrics_tab(drone, metrics, speed_mps=speed, orientation=orientation)
 
             fig = make_performance_figure(drone, max_speed=parse_float("Max speed plot", v_max_speed_plot.get()))
             show_figure(fig)
@@ -2469,7 +3072,7 @@ def launch_gui():
             wind = parse_float("Wind", v_wind.get())
 
             mission = MissionProfile.from_json(mission_path)
-            results, worst_metrics = simulate_mission(
+            results, worst_metrics, mission_series = simulate_mission(
                 drone,
                 mission,
                 orientation=orientation,
@@ -2493,6 +3096,13 @@ def launch_gui():
 
             if worst_metrics is not None:
                 update_status_tables_from_metrics(drone, worst_metrics)
+
+            # Store mission time series for Mission Plots tab
+            try:
+                nonlocal last_mission_series
+                last_mission_series = mission_series
+            except Exception:
+                pass
 
             fig = make_performance_figure(drone, max_speed=parse_float("Max speed plot", v_max_speed_plot.get()))
             show_figure(fig)
