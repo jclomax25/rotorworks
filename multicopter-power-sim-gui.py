@@ -531,7 +531,7 @@ class DroneConfig:
                  battery: BatteryConfig,
                  motor: MotorConfig,
                  propeller: PropellerConfig,
-                 drone_weight_kg: float,
+                 drone_weight_g: float,
                  profile_drag_coefficient: float,
                  profile_area: float,
                  parasite_drag_coefficient: float,
@@ -556,7 +556,7 @@ class DroneConfig:
         self.battery = battery
         self.motor = motor
         self.propeller = propeller
-        self.drone_weight_kg = float(drone_weight_kg)
+        self.drone_weight_g = float(drone_weight_g)
 
         # Drag parameters (may be overridden / derived from geometry if not provided)
         self.profile_drag_coefficient = float(profile_drag_coefficient) if profile_drag_coefficient is not None else 0.0
@@ -706,7 +706,7 @@ def required_tilt_deg(config: DroneConfig, speed_mps: float, orientation: str) -
     """Approximate tilt angle (deg) required in forward flight to balance drag."""
     if orientation != "forward":
         return 0.0
-    weight_force = config.drone_weight_kg * 9.81
+    weight_force = config.drone_weight_g * 9.81 / 1000.0  # Convert grams to kg
     drag_force = drag_force_required(config, speed_mps, orientation="forward")
     return math.degrees(math.atan2(drag_force, max(weight_force, 1e-9)))
 
@@ -749,7 +749,7 @@ def thrust_required(config: DroneConfig, speed_mps: float, orientation: str) -> 
 
     This function returns total thrust magnitude (N).
     """
-    weight_force = config.drone_weight_kg * 9.81
+    weight_force = config.drone_weight_g * 9.81 / 1000.0  # Convert grams to kg
 
     drag_force = drag_force_required(config, speed_mps, orientation)
 
@@ -1337,7 +1337,7 @@ def build_drone_from_args(args) -> DroneConfig:
         battery=battery,
         motor=motor,
         propeller=prop,
-        drone_weight_kg=args.weight,
+        drone_weight_g=args.weight,
         profile_drag_coefficient=args.profile_drag,
         profile_area=args.profile_area,
         parasite_drag_coefficient=args.parasite_drag,
@@ -1572,7 +1572,7 @@ def launch_gui():
     # ---------- Variables (defaults) ----------
     # Drone
     v_num_motors = tk.StringVar(value="4")
-    v_weight = tk.StringVar(value="1.5")
+    v_weight = tk.StringVar(value="1500")
     v_area = tk.StringVar(value="0.05")
     v_speed = tk.StringVar(value="10")
     v_periph_current = tk.StringVar(value="0.0")
@@ -1695,7 +1695,7 @@ def launch_gui():
     # Drone tab
     r = 1
     num_motor_entry = add_row(tab_drone, r, "Num motors", v_num_motors); r += 1
-    weight_entry = add_row(tab_drone, r, "Weight (kg)", v_weight); r += 1
+    weight_entry = add_row(tab_drone, r, "Weight (g)", v_weight); r += 1
     area_entry = add_row(tab_drone, r, "Frontal area (m^2)", v_area); r += 1
     speed_entry = add_row(tab_drone, r, "Speed (m/s)", v_speed); r += 1
     periph_current_entry = add_row(tab_drone, r, "Peripheral current (A)", v_periph_current); r += 1
@@ -2894,7 +2894,7 @@ def launch_gui():
             battery=batt,
             motor=motor,
             propeller=prop,
-            drone_weight_kg=parse_float("Weight", v_weight.get()),
+            drone_weight_g=parse_float("Weight", v_weight.get()),
             profile_drag_coefficient=(parse_float("Profile Cd", v_profile_drag.get()) if v_profile_drag.get().strip() else 0.0),
             profile_area=(parse_float("Profile area", v_profile_area.get()) if v_profile_area.get().strip() else 0.0),
             parasite_drag_coefficient=(parse_float("Parasite Cd", v_parasite_drag.get()) if v_parasite_drag.get().strip() else 0.0),
@@ -3142,7 +3142,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Drone
     parser.add_argument("--num_motors", type=int, required=False)
-    parser.add_argument("--weight", type=float, required=False, help="Drone weight (kg)")
+    parser.add_argument("--weight", type=float, required=False, help="Drone weight (g)")
     parser.add_argument("--profile_drag", type=float, default=0.0, help="Profile drag coefficient")
     parser.add_argument("--profile_area", type=float, default=0.0, help="Rotor/arms profile reference area (m^2)")
     parser.add_argument("--parasite_drag", type=float, default=0.0, help="Parasite drag coefficient (fuselage/arms)")

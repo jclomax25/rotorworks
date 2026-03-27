@@ -2,14 +2,14 @@
 UASforge
 dronefoundry
 
-A cross-platform multicopter performance simulator inspired by eCalc-style workflows.  
+A cross-platform multicopter performance simulator.  
 It supports **single-point analysis**, **mission simulation**, configurable **battery / motor / ESC / prop / avionics rails**, **status limit checks**, and **plots** including mission time-series.
 
 ## Features
 
 - **GUI (Tkinter)**
   - Tabs for Drone, Battery, Motor, ESC, Avionics, Prop, Mission/Env
-  - **Metrics tab** (single-point “eCalc-style” output summary)
+  - **Metrics tab** (single-point output summary)
   - **Status tab** with color-coded limit checks (green/yellow/red)
   - **Mission Plots tab** to plot selected variables vs mission time with multi-unit y-axes
   - Save/Load configuration to JSON (so you don’t retype values)
@@ -205,8 +205,6 @@ Mission simulation uses a JSON file with ordered phases.
 ---
 
 ## Metrics Tab (Single-Point Output)
-
-Similar to eCalc, including:
 
 ### Battery
 
