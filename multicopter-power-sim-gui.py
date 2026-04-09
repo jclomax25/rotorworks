@@ -123,23 +123,32 @@ class BatteryConfig:
         self.cell_weight_g = float(cell_weight_g) if cell_weight_g is not None else None
         self.cell_capacity_mAh = float(cell_capacity_mAh) if cell_capacity_mAh is not None else None
         self.pack_capacity_mAh = float(pack_capacity_mAh) if pack_capacity_mAh is not None else None
-        self.energy_density_Wh_per_kg = float(unit_energy_density) if unit_energy_density is not None else float(self.capacity_Wh / (self.weight_g / 1000.0))
         self.max_operating_temperature_C = float(max_operating_temperature_C) if max_operating_temperature_C is not None else None
         self.min_operating_temperature_C = float(min_operating_temperature_C) if min_operating_temperature_C is not None else None
-        self.charge_current_max = float(charge_current_max)
+        self.charge_current_max = float(charge_current_max) if charge_current_max is not None else 0.0
 
-        # Capacity in Ah for C-rate conversions
+        # Capacity in Ah — must be computed before energy_density_Wh_per_kg
         if unit_mode == "cell":
-            self.capacity_mAh = self.cell_capacity_mAh * self.parallel_cells
+            self.capacity_mAh = (self.cell_capacity_mAh or 0.0) * self.parallel_cells
         elif unit_mode == "pack":
-            self.capacity_mAh = self.pack_capacity_mAh * self.parallel_units
-        
+            self.capacity_mAh = (self.pack_capacity_mAh or 0.0) * self.parallel_units
+        else:
+            self.capacity_mAh = 0.0
         self.capacity_Ah = self.capacity_mAh / 1000.0
 
         if unit_mode == "cell":
-            self.weight_g = self.cell_weight_g * self.total_cells
+            self.weight_g = (self.cell_weight_g or 0.0) * self.total_cells
         elif unit_mode == "pack":
-            self.weight_g = self.pack_weight_g * self.parallel_units * self.series_units
+            self.weight_g = (self.pack_weight_g or 0.0) * self.parallel_units * self.series_units
+        else:
+            self.weight_g = 0.0
+
+        # Energy density — must follow capacity_Ah and weight_g
+        if unit_energy_density is not None:
+            self.energy_density_Wh_per_kg = float(unit_energy_density)
+        else:
+            wkg = self.weight_g / 1000.0
+            self.energy_density_Wh_per_kg = (self.capacity_Wh / wkg) if wkg > 0 else 0.0
 
         # Discharge limits:
         # - If you provide discharge_cont_A (legacy), we use it directly (amps).
@@ -252,7 +261,7 @@ class AvionicsConfig:
 def parse_voltage_tree(spec: Optional[str]) -> dict:
     """Parse an avionics voltage tree specification into {V_rail: (I_rail, eff)}.
 
-    Accepted formats (comma-separated rails):
+    Accepted formats (comma-separated rails, commas inside parentheses are ignored):
       - "5.0:(2,0.9), 12.0:(1.5,0.85)"
       - "5.0:2:0.9, 12.0:1.5:0.85"
 
@@ -262,7 +271,6 @@ def parse_voltage_tree(spec: Optional[str]) -> dict:
     if spec is None:
         return {}
     if isinstance(spec, dict):
-        # Allow passing already-parsed dicts (e.g., from programmatic use).
         out = {}
         for k, v in spec.items():
             try:
@@ -279,15 +287,28 @@ def parse_voltage_tree(spec: Optional[str]) -> dict:
     if not s:
         return {}
 
-    out: dict[float, tuple[float, float]] = {}
-    parts = [p.strip() for p in s.split(",") if p.strip()]
+    # Split on commas that are NOT inside parentheses
+    parts, depth, buf = [], 0, ""
+    for ch in s:
+        if ch == "(":
+            depth += 1; buf += ch
+        elif ch == ")":
+            depth -= 1; buf += ch
+        elif ch == "," and depth == 0:
+            parts.append(buf.strip()); buf = ""
+        else:
+            buf += ch
+    if buf.strip():
+        parts.append(buf.strip())
+
+    out: dict = {}
     for p in parts:
-        # Try "V:(I,eff)"
+        if not p:
+            continue
         m = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*:\s*\(\s*([0-9]*\.?[0-9]+)\s*,\s*([0-9]*\.?[0-9]+)\s*\)\s*$", p)
         if m:
             v, i, eff = map(float, m.groups())
         else:
-            # Try "V:I:eff"
             m2 = re.match(r"^\s*([0-9]*\.?[0-9]+)\s*:\s*([0-9]*\.?[0-9]+)\s*:\s*([0-9]*\.?[0-9]+)\s*$", p)
             if not m2:
                 raise ValueError(
@@ -305,8 +326,6 @@ def parse_voltage_tree(spec: Optional[str]) -> dict:
         out[float(v)] = (float(i), float(eff))
 
     return out
-
-
 def avionics_input_power_W(avionics: Optional[AvionicsConfig]) -> float:
     """Return total input power drawn from the battery to supply avionics rails (W).
 
@@ -1229,23 +1248,93 @@ def simulate_mission(config: DroneConfig,
 # -------------------------------
 # Plotting
 # -------------------------------
-def make_performance_figure(config: DroneConfig, max_speed: float = 30.0):
-    speeds, times, distances = [], [], []
-    for v in range(1, int(max_speed) + 1):
-        speeds.append(v)
-        times.append(estimate_flight_time_minutes(config, v, orientation="forward"))
-        distances.append(estimate_flight_distance_km(config, v, orientation="forward"))
+def make_performance_figure(config: DroneConfig,
+                             max_speed: float = 30.0,
+                             figsize: tuple = (15, 9)):
+    """
+    Four-panel multicopter performance figure:
+      1. Flight Time & Range vs Speed  (forward)
+      2. Power Required vs Speed       (hover + forward)
+      3. Thrust Required vs Speed      (hover + forward)
+      4. Power Breakdown bar chart     (at cruise speed)
+    """
+    v_lo  = 0.5
+    steps = 200
+    speeds = [v_lo + (max_speed - v_lo) * i / steps for i in range(steps + 1)]
 
-    fig = plt.figure(figsize=(10, 5))
-    ax = fig.add_subplot(111)
-    ax.plot(speeds, times, label="Flight Time (min)")
-    ax.plot(speeds, distances, label="Flight Distance (km)")
-    ax.set_xlabel("Speed (m/s)")
-    ax.set_ylabel("Performance")
-    ax.set_title("Drone Performance vs Speed")
-    ax.legend()
-    ax.grid(True)
-    fig.tight_layout()
+    times_fwd, dists_fwd = [], []
+    pwr_fwd, pwr_hov     = [], []
+    thr_fwd, thr_hov     = [], []
+    cruise = float(config.cruise_speed)
+
+    for V in speeds:
+        times_fwd.append(estimate_flight_time_minutes(config, V, orientation="forward"))
+        dists_fwd.append(estimate_flight_distance_km(config, V, orientation="forward"))
+        pwr_fwd.append(power_required(config, V, "forward"))
+        pwr_hov.append(power_required(config, V, "hover"))
+        thr_fwd.append(thrust_required(config, V, "forward"))
+        thr_hov.append(thrust_required(config, V, "hover"))
+
+    be_v, be_t, br_v, br_d = find_optimal_speeds(config, min_speed=v_lo, max_speed=max_speed)
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    fig.suptitle("Multicopter Performance", fontsize=13, fontweight="bold")
+
+    # 1. Time & Range
+    ax = axes[0, 0]
+    ax2 = ax.twinx()
+    l1, = ax.plot(speeds, times_fwd, color="royalblue",  label="Flight Time (min)")
+    l2, = ax2.plot(speeds, dists_fwd, color="darkorange", label="Range (km)", linestyle="--")
+    ax.axvline(be_v,  color="royalblue",  linestyle=":", linewidth=1.2)
+    ax.axvline(br_v,  color="darkorange", linestyle=":", linewidth=1.2)
+    ax.axvline(cruise,color="gray",       linestyle="-.", linewidth=1.0, alpha=0.7)
+    ax.set_xlabel("Speed (m/s)"); ax.set_ylabel("Time (min)"); ax2.set_ylabel("Range (km)")
+    ax.set_title("Flight Time & Range vs Speed")
+    ax.legend(handles=[l1, l2], loc="upper right", fontsize=8)
+    ax.grid(True, alpha=0.4)
+
+    # 2. Power
+    ax = axes[0, 1]
+    ax.plot(speeds, [p/1000 for p in pwr_fwd], color="crimson",   label="Forward Flight")
+    ax.plot(speeds, [p/1000 for p in pwr_hov], color="steelblue", label="Hover", linestyle="--")
+    ax.axvline(cruise, color="gray", linestyle="-.", linewidth=1.0, alpha=0.7)
+    ax.set_xlabel("Speed (m/s)"); ax.set_ylabel("Power (kW)")
+    ax.set_title("Power Required vs Speed")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.4)
+
+    # 3. Thrust
+    ax = axes[1, 0]
+    ax.plot(speeds, thr_fwd, color="teal",      label="Forward Flight")
+    ax.plot(speeds, thr_hov, color="slategray", label="Hover", linestyle="--")
+    ax.axvline(cruise, color="gray", linestyle="-.", linewidth=1.0, alpha=0.7)
+    ax.set_xlabel("Speed (m/s)"); ax.set_ylabel("Thrust (N)")
+    ax.set_title("Thrust Required vs Speed")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.4)
+
+    # 4. Power breakdown at cruise
+    ax = axes[1, 1]
+    try:
+        motor_P  = power_required(config, cruise, "forward")
+        periph_P = avionics_input_power_W(getattr(config, "avionics", None))
+        if periph_P <= 0.0:
+            periph_P = config.battery.vnom_pack * max(config.periph_current, 0.0)
+        total_P, _, _, _, _ = total_power_with_esc(
+            config, motor_power_W=motor_P, periph_power_W=periph_P)
+        esc_P = max(0.0, total_P - motor_P - periph_P)
+        labels = ["Motor", "ESC Loss", "Avionics"]
+        values = [motor_P, esc_P, periph_P]
+        colors = ["#4c72b0", "#dd8452", "#55a868"]
+        valid  = [(l, v, c) for l, v, c in zip(labels, values, colors) if v > 0.1]
+        if valid:
+            ls, vs, cs = zip(*valid)
+            bars = ax.bar(ls, [v/1000 for v in vs], color=cs, edgecolor="white", linewidth=0.8)
+            ax.bar_label(bars, fmt=lambda x: f"{x*1000:.0f} W", padding=3, fontsize=8)
+    except Exception:
+        pass
+    ax.set_ylabel("Power (kW)"); ax.set_title(f"Power Breakdown @ {cruise:.1f} m/s")
+    ax.grid(True, axis="y", alpha=0.4)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
     return fig
 
 
@@ -1370,182 +1459,27 @@ def build_drone_from_args(args) -> DroneConfig:
 # -------------------------------
 # GUI
 # -------------------------------
+
+# -------------------------------
+# GUI
+# -------------------------------
 def launch_gui():
     """
-    Tkinter GUI that:
-      - lets you fill in parameters
-      - choose optional CSV/JSON files
-      - run a single-point performance calc or mission sim
-      - shows the performance plot embedded in the window
-      - prints textual outputs in an embedded log panel
+    Tkinter GUI — styled to match the fixed-wing simulator:
+      - Scrollable input tabs (Drone / Battery / Motor / ESC / Avionics / Propeller / Mission+Env)
+      - Right panel: Plots | Status | Metrics | Mission Plots
+      - View menu with Window Scale, Plot Size, UI Font Size, Plot Font Size, Quick Presets
+      - Save / Load config (JSON)
     """
     import tkinter as tk
     from tkinter import ttk, filedialog, messagebox
+    import matplotlib
+    matplotlib.use("TkAgg")
     from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-    # Ensure matplotlib uses a GUI backend
-    try:
-        import matplotlib
-        matplotlib.use("TkAgg")  # safe if already set
-    except Exception:
-        pass
-
-    root = tk.Tk()
-    root.title("Multicopter Power Simulator")
-
-# --- High-DPI / UI scaling helpers ---
-    # Enable Windows DPI awareness so Tk uses the correct scaling on high-DPI displays.
-    try:
-        import ctypes  # type: ignore
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-
-    # Base font sizes are captured once so we can scale deterministically.
-    import tkinter.font as tkfont
-    _BASE_TK_FONTS = {}
-    for _fname in ("TkDefaultFont", "TkTextFont", "TkFixedFont", "TkMenuFont", "TkHeadingFont", "TkCaptionFont"):
-        try:
-            _f = tkfont.nametofont(_fname)
-            _BASE_TK_FONTS[_fname] = _f.cget("size")
-        except Exception:
-            pass
-
-    # Matplotlib base font sizes (used for dynamic scaling)
-    _BASE_MPL = {
-        "font.size": 11,
-        "axes.titlesize": 12,
-        "axes.labelsize": 11,
-        "legend.fontsize": 10,
-        "xtick.labelsize": 10,
-        "ytick.labelsize": 10,
-    }
-
-    ui_scale = tk.DoubleVar(value=1.5)  # default; user can change in View menu
-
-    def apply_ui_scale(scale: float) -> None:
-        """Apply UI scaling to Tk widgets + Matplotlib plots."""
-        try:
-            scale = float(scale)
-        except Exception:
-            return
-        if scale <= 0:
-            return
-
-        # Tk scaling affects widget geometry (padding, etc.)
-        try:
-            root.tk.call("tk", "scaling", scale)
-        except Exception:
-            pass
-
-        # Scale named fonts
-        try:
-            for fname, base_sz in _BASE_TK_FONTS.items():
-                try:
-                    f = tkfont.nametofont(fname)
-                    # Tk font sizes are in points; round to int for consistency.
-                    new_sz = int(round(abs(base_sz) * scale)) * (1 if base_sz >= 0 else -1)
-                    # keep sign for negative sizes (some themes use negative to mean pixels)
-                    f.configure(size=new_sz)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # Scale Matplotlib defaults (for future plots)
-        try:
-            import matplotlib as mpl
-            mpl.rcParams.update({k: (v * scale) for k, v in _BASE_MPL.items()})
-        except Exception:
-            pass
-
-        # Also scale the currently displayed figure (if any)
-        try:
-            if current_fig is not None:
-                _apply_matplotlib_scale_to_fig(current_fig, scale)
-            if current_canvas is not None:
-                current_canvas.draw_idle()
-        except Exception:
-            pass
-
-        try:
-            row_h = int(35 * scale) + 8
-            ttk.Style().configure("Avionics.Treeview", rowheight=row_h)
-        except Exception:
-            pass
-
-    def _apply_matplotlib_scale_to_fig(fig, scale: float) -> None:
-        """Best-effort scaling of an existing Matplotlib figure's text."""
-        for ax in getattr(fig, "axes", []):
-            try:
-                ax.title.set_fontsize(_BASE_MPL["axes.titlesize"] * scale)
-                ax.xaxis.label.set_fontsize(_BASE_MPL["axes.labelsize"] * scale)
-                ax.yaxis.label.set_fontsize(_BASE_MPL["axes.labelsize"] * scale)
-                for t in ax.get_xticklabels() + ax.get_yticklabels():
-                    t.set_fontsize(_BASE_MPL["xtick.labelsize"] * scale)
-                leg = ax.get_legend()
-                if leg is not None:
-                    for t in leg.get_texts():
-                        t.set_fontsize(_BASE_MPL["legend.fontsize"] * scale)
-                    if leg.get_title() is not None:
-                        leg.get_title().set_fontsize(_BASE_MPL["legend.fontsize"] * scale)
-            except Exception:
-                pass
-        # Suptitle if present
-        try:
-            st = fig._suptitle
-            if st is not None:
-                st.set_fontsize(_BASE_MPL["axes.titlesize"] * scale)
-        except Exception:
-            pass
-
-    # ---------- Menu (Save/Load Config) ----------
-    menubar = tk.Menu(root)
-    file_menu = tk.Menu(menubar, tearoff=0)
-    menubar.add_cascade(label="File", menu=file_menu)
-
-    view_menu = tk.Menu(menubar, tearoff=0)
-    menubar.add_cascade(label="View", menu=view_menu)
-
-    def _set_scale_and_var(v: float) -> None:
-        ui_scale.set(float(v))
-        apply_ui_scale(float(v))
-
-    # Common UI scaling presets
-    for _lbl, _val in [("100%", 1.0), ("125%", 1.25), ("150%", 1.5), ("175%", 1.75), ("200%", 2.0)]:
-        view_menu.add_radiobutton(label=_lbl, variable=ui_scale, value=_val, command=lambda vv=_val: _set_scale_and_var(vv))
-
-    view_menu.add_separator()
-    view_menu.add_command(label="Reset to 100%", command=lambda: _set_scale_and_var(1.0))
-
-    root.config(menu=menubar)
-
-    # Apply default scaling once at startup
-    apply_ui_scale(float(ui_scale.get()))
-
-    # ---------- Helpers ----------
-    def add_row(parent, r, label, var, width=14):
-        ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=2)
-        e = ttk.Entry(parent, textvariable=var, width=width)
-        e.grid(row=r, column=1, sticky="ew", padx=6, pady=2)
-        return e
-
-    def choose_file(var, filetypes):
-        p = filedialog.askopenfilename(filetypes=filetypes)
-        if p:
-            var.set(p)
-
-    def log(msg: str):
-        out.configure(state="normal")
-        out.insert("end", msg + "\n")
-        out.see("end")
-        out.configure(state="disabled")
-
-    def clear_log():
-        out.configure(state="normal")
-        out.delete("1.0", "end")
-        out.configure(state="disabled")
-
+    # ------------------------------------------------------------------ #
+    #  HELPERS                                                            #
+    # ------------------------------------------------------------------ #
     def parse_float(name, s):
         try:
             return float(s)
@@ -1557,611 +1491,1001 @@ def launch_gui():
             return int(float(s))
         except Exception:
             raise ValueError(f"Invalid {name}: {s!r}")
-        
-    def exit_app():
-        print("Exiting Application.")
+
+    def safe_float(val, default=0.0):
         try:
-            plt.close("all")   # stop matplotlib event loops
+            return float(str(val).strip())
+        except Exception:
+            return default
+
+    def choose_file(var, filetypes):
+        p = filedialog.askopenfilename(filetypes=filetypes)
+        if p:
+            var.set(p)
+
+    def exit_app():
+        try:
+            plt.close("all")
         except Exception:
             pass
+        root.quit()
+        root.destroy()
 
-        root.quit()            # stop Tk mainloop
-        root.destroy()         # destroy the window
-        sys.exit(0)
-
-    # ---------- Variables (defaults) ----------
-    # Drone
-    v_num_motors = tk.StringVar(value="4")
-    v_weight = tk.StringVar(value="1500")
-    v_area = tk.StringVar(value="0.05")
-    v_speed = tk.StringVar(value="10")
-    v_periph_current = tk.StringVar(value="0.0")
-
-    v_profile_drag = tk.StringVar(value="0.02")
-    v_profile_area = tk.StringVar(value="0.01")
-    v_parasite_drag = tk.StringVar(value="0.9")
-    v_parasite_area = tk.StringVar(value="0.05")
-    # Vehicle geometry (optional; used for drag fallback when drag params are not provided)
-    v_body_length_m = tk.StringVar(value="")
-    v_body_width_m = tk.StringVar(value="")
-    v_body_height_m = tk.StringVar(value="")
-    v_arm_length_m = tk.StringVar(value="")
-    v_arm_width_m = tk.StringVar(value="")
-    v_coaxial_spacing_m = tk.StringVar(value="")
-    v_max_tilt_deg = tk.StringVar(value="")
-    v_motor_configuration = tk.StringVar(value="flat")  # flat or coaxial
-
-
-    # Battery
-    v_batt_vmin = tk.StringVar(value="3.0")
-    v_batt_vnom = tk.StringVar(value="3.7")
-    v_batt_vmax = tk.StringVar(value="4.2")
-    v_batt_unit_mode = tk.StringVar(value="cell")
-    v_batt_cell_capacity = tk.StringVar(value="5000")
-    v_batt_pack_capacity = tk.StringVar(value="5000")
-    v_batt_energy_density = tk.StringVar(value="200")
-    v_batt_chg = tk.StringVar(value="5")
-    v_batt_a_cont = tk.StringVar(value="50")
-    v_batt_a_max = tk.StringVar(value="100")
-    v_batt_c_cont = tk.StringVar(value="15")
-    v_batt_c_max = tk.StringVar(value="25")
-    v_batt_dischg_pct = tk.StringVar(value="100")
-    v_batt_r = tk.StringVar(value="20")
-    v_batt_chem = tk.StringVar(value="LiIon")
-    v_batt_series = tk.StringVar(value="1")
-    v_batt_parallel = tk.StringVar(value="1")
-    v_batt_cells_series = tk.StringVar(value="1")
-    v_batt_cells_parallel = tk.StringVar(value="1")
-    v_batt_pack_weight = tk.StringVar(value="0")
-    v_batt_cell_weight = tk.StringVar(value="0")
-
-    # Motor
-    v_motor_kv = tk.StringVar(value="650")
-    v_motor_i0 = tk.StringVar(value="0.5")
-    v_motor_v0 = tk.StringVar(value="10")
-    v_motor_rated_v = tk.StringVar(value="6")
-    v_motor_r = tk.StringVar(value="0.2")
-    v_motor_imax = tk.StringVar(value="20")
-    v_motor_pmax = tk.StringVar(value="200")
-    v_motor_pole_count = tk.StringVar(value="14")
-    v_motor_weight = tk.StringVar(value="168")
-    v_motor_size = tk.StringVar(value="28x28mm")
-
-    # ESC
-    v_esc_voltage_rating = tk.StringVar(value="6")
-    v_esc_cont_current = tk.StringVar(value="30")
-    v_esc_max_current = tk.StringVar(value="60")
-    v_esc_idle_current = tk.StringVar(value="0.5")
-    v_esc_r = tk.StringVar(value="0.01")
-    v_esc_weight = tk.StringVar(value="36")
-
-    # Avionics
-    v_avionics_voltage_tree = tk.StringVar(value="5.0:(2,0.9), 12.0:(1.5,0.85)")  # e.g., "5:2:0.9,12:1.5:0.85"
-
-    # Prop
-    v_prop_d = tk.StringVar(value="12")
-    v_prop_pitch = tk.StringVar(value="6")
-    v_prop_max_rpm = tk.StringVar(value="10000")
-    v_prop_max_thrust = tk.StringVar(value="3000")
-    v_prop_blades = tk.StringVar(value="2")
-    v_prop_table = tk.StringVar(value="")
-    v_prop_tconst = tk.StringVar(value="")
-    v_prop_pconst = tk.StringVar(value="")
-    v_prop_weight = tk.StringVar(value="20")
-
-    # Mission / env
-    v_mission = tk.StringVar(value="")
-    v_alt = tk.StringVar(value="0")
-    v_temp = tk.StringVar(value="")
-    v_press = tk.StringVar(value="")
-    v_wind = tk.StringVar(value="0")
-    v_orientation = tk.StringVar(value="forward")
-    v_max_speed_plot = tk.StringVar(value="30")
-
-    # ---------- Layout ----------
+    # ------------------------------------------------------------------ #
+    #  ROOT WINDOW                                                        #
+    # ------------------------------------------------------------------ #
+    root = tk.Tk()
+    root.title("Multicopter Power Simulator")
+    root.minsize(1100, 700)
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
 
-    main = ttk.Frame(root, padding=8)
-    main.grid(row=0, column=0, sticky="nsew")
-    main.columnconfigure(0, weight=1)
-    main.columnconfigure(1, weight=1)
-    main.rowconfigure(1, weight=1)
+    # ------------------------------------------------------------------ #
+    #  VIEW STATE  (shared by all scaling callbacks)                      #
+    # ------------------------------------------------------------------ #
+    try:
+        _base_tk_scale = float(root.tk.call("tk", "scaling"))
+    except Exception:
+        _base_tk_scale = 1.333
 
-    # Left: Inputs
-    inputs = ttk.Notebook(main)
-    inputs.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+    _view = {
+        "scale_pct":    100,
+        "plot_w":       15.0,
+        "plot_h":        9.0,
+        "mpl_fontsize":  9,
+        "ui_fontsize":   9,
+    }
+    _last_run: dict = {}   # cached after each single-point run for View re-renders
+
+    # ---- scaling helpers ----
+    def _apply_tk_scale(pct: int) -> None:
+        _view["scale_pct"] = pct
+        factor = _base_tk_scale * (pct / 100.0)
+        try:
+            root.tk.call("tk", "scaling", factor)
+        except Exception:
+            pass
+        root.minsize(int(1100 * pct / 100), int(700 * pct / 100))
+        root.update_idletasks()
+
+    def _apply_ui_font(size: int) -> None:
+        _view["ui_fontsize"] = size
+        sty = ttk.Style()
+        font_spec = ("TkDefaultFont", size)
+        for ws in ("TLabel", "TButton", "TEntry", "TCombobox",
+                   "TNotebook.Tab", "Treeview", "Treeview.Heading",
+                   "TLabelframe.Label", "TLabelframe"):
+            try:
+                sty.configure(ws, font=font_spec)
+            except Exception:
+                pass
+        try:
+            sty.configure("Treeview", rowheight=max(18, size + 8))
+        except Exception:
+            pass
+        root.update_idletasks()
+
+    def _apply_mpl_font(size: int) -> None:
+        _view["mpl_fontsize"] = size
+        import matplotlib as mpl
+        mpl.rcParams.update({
+            "font.size":        size,
+            "axes.titlesize":   size + 1,
+            "axes.labelsize":   size,
+            "xtick.labelsize":  size - 1,
+            "ytick.labelsize":  size - 1,
+            "legend.fontsize":  size - 1,
+        })
+        _rerender_if_possible()
+
+    def _apply_plot_size(w: float, h: float) -> None:
+        _view["plot_w"] = w
+        _view["plot_h"] = h
+        _rerender_if_possible()
+
+    def _rerender_if_possible() -> None:
+        if not _last_run:
+            return
+        try:
+            drone   = _last_run["drone"]
+            max_spd = _last_run["max_spd"]
+            fig = make_performance_figure(
+                drone,
+                max_speed=max_spd,
+                figsize=(_view["plot_w"], _view["plot_h"]),
+            )
+            _show_figure(fig)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ #
+    #  MENU BAR                                                           #
+    # ------------------------------------------------------------------ #
+    menubar   = tk.Menu(root)
+    file_menu = tk.Menu(menubar, tearoff=0)
+    menubar.add_cascade(label="File", menu=file_menu)
+
+    view_menu = tk.Menu(menubar, tearoff=0)
+    menubar.add_cascade(label="View", menu=view_menu)
+
+    # -- Window Scale --
+    _scale_var = tk.IntVar(value=100)
+    scale_menu = tk.Menu(view_menu, tearoff=0)
+    view_menu.add_cascade(label="Window Scale", menu=scale_menu)
+    for pct, lbl in [(75,  "75 %  – Compact"),
+                     (90,  "90 %  – Smaller"),
+                     (100, "100 % – Default"),
+                     (115, "115 % – Slightly Larger"),
+                     (125, "125 % – Large"),
+                     (150, "150 % – Extra Large"),
+                     (175, "175 % – Very Large"),
+                     (200, "200 % – Max")]:
+        scale_menu.add_radiobutton(label=lbl, variable=_scale_var, value=pct,
+                                   command=lambda p=pct: _apply_tk_scale(p))
+    view_menu.add_separator()
+
+    # -- Plot Size --
+    _plot_size_var = tk.StringVar(value="medium")
+    plot_size_menu = tk.Menu(view_menu, tearoff=0)
+    view_menu.add_cascade(label="Plot Size", menu=plot_size_menu)
+    for key, lbl, (w, h) in [
+        ("small",   "Small  (12 × 7)",          (12.0,  7.0)),
+        ("medium",  "Medium (15 × 9)  ← default",(15.0,  9.0)),
+        ("large",   "Large  (18 × 11)",          (18.0, 11.0)),
+        ("xlarge",  "X-Large (22 × 13)",         (22.0, 13.0)),
+        ("xxlarge", "XX-Large (26 × 15)",        (26.0, 15.0)),
+    ]:
+        plot_size_menu.add_radiobutton(label=lbl, variable=_plot_size_var, value=key,
+                                       command=lambda pw=w, ph=h: _apply_plot_size(pw, ph))
+    view_menu.add_separator()
+
+    # -- UI Font Size --
+    _ui_font_var = tk.IntVar(value=9)
+    ui_font_menu = tk.Menu(view_menu, tearoff=0)
+    view_menu.add_cascade(label="UI Font Size", menu=ui_font_menu)
+    for sz, lbl in [(8, "8 pt  – Tiny"), (9, "9 pt  – Default"),
+                    (10,"10 pt – Comfortable"), (11,"11 pt – Large"),
+                    (13,"13 pt – Extra Large"), (15,"15 pt – Accessibility")]:
+        ui_font_menu.add_radiobutton(label=lbl, variable=_ui_font_var, value=sz,
+                                     command=lambda s=sz: _apply_ui_font(s))
+    view_menu.add_separator()
+
+    # -- Plot Font Size --
+    _mpl_font_var = tk.IntVar(value=9)
+    mpl_font_menu = tk.Menu(view_menu, tearoff=0)
+    view_menu.add_cascade(label="Plot Font Size", menu=mpl_font_menu)
+    for sz, lbl in [(7, "7 pt  – Tiny"), (8, "8 pt  – Small"),
+                    (9, "9 pt  – Default"), (10,"10 pt – Medium"),
+                    (12,"12 pt – Large"), (14,"14 pt – Extra Large")]:
+        mpl_font_menu.add_radiobutton(label=lbl, variable=_mpl_font_var, value=sz,
+                                      command=lambda s=sz: _apply_mpl_font(s))
+    view_menu.add_separator()
+
+    # -- Quick Presets --
+    def _preset_compact():
+        _scale_var.set(85);       _apply_tk_scale(85)
+        _ui_font_var.set(8);      _apply_ui_font(8)
+        _mpl_font_var.set(8);     _apply_mpl_font(8)
+        _plot_size_var.set("small"); _apply_plot_size(12.0, 7.0)
+
+    def _preset_default():
+        _scale_var.set(100);      _apply_tk_scale(100)
+        _ui_font_var.set(9);      _apply_ui_font(9)
+        _mpl_font_var.set(9);     _apply_mpl_font(9)
+        _plot_size_var.set("medium"); _apply_plot_size(15.0, 9.0)
+
+    def _preset_presentation():
+        _scale_var.set(140);      _apply_tk_scale(140)
+        _ui_font_var.set(12);     _apply_ui_font(12)
+        _mpl_font_var.set(12);    _apply_mpl_font(12)
+        _plot_size_var.set("large"); _apply_plot_size(18.0, 11.0)
+
+    def _preset_accessibility():
+        _scale_var.set(160);      _apply_tk_scale(160)
+        _ui_font_var.set(14);     _apply_ui_font(14)
+        _mpl_font_var.set(13);    _apply_mpl_font(13)
+        _plot_size_var.set("xlarge"); _apply_plot_size(22.0, 13.0)
+
+    presets_menu = tk.Menu(view_menu, tearoff=0)
+    view_menu.add_cascade(label="Quick Presets", menu=presets_menu)
+    presets_menu.add_command(label="🗜  Compact",       command=_preset_compact)
+    presets_menu.add_command(label="⚙  Default",        command=_preset_default)
+    presets_menu.add_command(label="📊  Presentation",  command=_preset_presentation)
+    presets_menu.add_command(label="♿  Accessibility",  command=_preset_accessibility)
+    view_menu.add_separator()
+    view_menu.add_command(label="Reset All to Default", command=_preset_default)
+
+    root.config(menu=menubar)
+
+    # ------------------------------------------------------------------ #
+    #  STRING VARS (with sensible defaults)                               #
+    # ------------------------------------------------------------------ #
+    def sv(val=""):
+        return tk.StringVar(value=str(val))
+
+    # Drone
+    v_num_motors        = sv(4)
+    v_weight            = sv(1500)
+    v_area              = sv(0.05)
+    v_speed             = sv(10)
+    v_periph_current    = sv(0.0)
+    v_profile_drag      = sv(0.02)
+    v_profile_area      = sv(0.01)
+    v_parasite_drag     = sv(0.9)
+    v_parasite_area     = sv(0.05)
+    v_body_length_m     = sv("")
+    v_body_width_m      = sv("")
+    v_body_height_m     = sv("")
+    v_arm_length_m      = sv("")
+    v_arm_width_m       = sv("")
+    v_coaxial_spacing_m = sv("")
+    v_max_tilt_deg      = sv("")
+    v_motor_configuration = sv("flat")
+
+    # Battery
+    v_batt_vmin         = sv(3.0)
+    v_batt_vnom         = sv(3.7)
+    v_batt_vmax         = sv(4.2)
+    v_batt_unit_mode    = sv("cell")
+    v_batt_cell_capacity= sv(5000)
+    v_batt_pack_capacity= sv(5000)
+    v_batt_energy_density = sv(200)
+    v_batt_chg          = sv(5)
+    v_batt_a_cont       = sv(50)
+    v_batt_a_max        = sv(100)
+    v_batt_c_cont       = sv(15)
+    v_batt_c_max        = sv(25)
+    v_batt_dischg_pct   = sv(80)
+    v_batt_r            = sv(20)
+    v_batt_chem         = sv("LiPo")
+    v_batt_series       = sv(4)
+    v_batt_parallel     = sv(1)
+    v_batt_cells_series = sv(1)
+    v_batt_cells_parallel = sv(1)
+    v_batt_pack_weight  = sv(0)
+    v_batt_cell_weight  = sv(0)
+
+    # Motor
+    v_motor_kv          = sv(650)
+    v_motor_i0          = sv(0.5)
+    v_motor_v0          = sv(10)
+    v_motor_rated_v     = sv(6)
+    v_motor_r           = sv(0.2)
+    v_motor_imax        = sv(20)
+    v_motor_pmax        = sv(200)
+    v_motor_pole_count  = sv(14)
+    v_motor_weight      = sv(168)
+    v_motor_size        = sv("28x28mm")
+
+    # ESC
+    v_esc_voltage_rating= sv(6)
+    v_esc_cont_current  = sv(30)
+    v_esc_max_current   = sv(60)
+    v_esc_idle_current  = sv(0.5)
+    v_esc_r             = sv(0.01)
+    v_esc_weight        = sv(36)
+
+    # Avionics (string var kept in sync with the treeview)
+    v_avionics_voltage_tree = sv("5.0:(2,0.9), 12.0:(1.5,0.85)")
+
+    # Prop
+    v_prop_d            = sv(12)
+    v_prop_pitch        = sv(6)
+    v_prop_max_rpm      = sv(10000)
+    v_prop_max_thrust   = sv(3000)
+    v_prop_blades       = sv(2)
+    v_prop_table        = sv("")
+    v_prop_tconst       = sv("")
+    v_prop_pconst       = sv("")
+    v_prop_weight       = sv(20)
+
+    # Mission / env
+    v_mission           = sv("")
+    v_alt               = sv(0)
+    v_temp              = sv("")
+    v_press             = sv("")
+    v_wind              = sv(0)
+    v_orientation       = sv("forward")
+    v_max_speed_plot    = sv(30)
+
+    # config_vars collected for save/load  (populated after tab widgets are built)
+    config_vars: dict = {}
+
+    # ------------------------------------------------------------------ #
+    #  MAIN LAYOUT                                                        #
+    # ------------------------------------------------------------------ #
+    main = ttk.Frame(root, padding=8)
+    main.grid(sticky="nsew")
+    main.columnconfigure(0, weight=1, minsize=370)
+    main.columnconfigure(1, weight=3)
     main.rowconfigure(0, weight=1)
 
-    tab_drone = ttk.Frame(inputs, padding=8)
-    tab_batt = ttk.Frame(inputs, padding=8)
-    tab_motor = ttk.Frame(inputs, padding=8)
-    tab_esc = ttk.Frame(inputs, padding=8)
-    tab_avionics = ttk.Frame(inputs, padding=8)
-    tab_prop = ttk.Frame(inputs, padding=8)
-    tab_mission = ttk.Frame(inputs, padding=8)
+    # ===== LEFT: scrollable input notebook =====
+    left = ttk.Frame(main)
+    left.grid(row=0, column=0, sticky="nsew")
+    left.columnconfigure(0, weight=1)
+    left.rowconfigure(0, weight=1)
 
-    inputs.add(tab_drone, text="Drone")
-    inputs.add(tab_batt, text="Battery")
-    inputs.add(tab_motor, text="Motor")
-    inputs.add(tab_esc, text="ESC")
-    inputs.add(tab_avionics, text="Avionics")
-    inputs.add(tab_prop, text="Prop")
-    inputs.add(tab_mission, text="Mission/Env")
+    input_nb = ttk.Notebook(left)
+    input_nb.grid(row=0, column=0, sticky="nsew")
 
-    for t in (tab_drone, tab_batt, tab_motor, tab_esc, tab_avionics, tab_prop, tab_mission):
-        t.columnconfigure(1, weight=1)
+    # --- Scrollable-tab registry so the single wheel binding can find the
+    #     active canvas without iterating or calling bind_all repeatedly.
+    _tab_canvases: list = []
 
-    # Drone tab
+    def make_scrollable_tab(nb, title):
+        """
+        Wrap a notebook tab in a Canvas + vertical Scrollbar.
+
+        Key fixes vs the original:
+          1. canvas.<Configure> — fires when the canvas itself is resized
+             (e.g. when the tab is first shown).  Without this, winfo_width()
+             returns 1 at startup so the inner frame is rendered 1 px wide
+             and appears blank until the user switches tabs twice.
+          2. bind_all is NOT used here — a single wheel binding is attached
+             to the notebook after all tabs are created (see below), routing
+             scroll events only to the currently-visible canvas.  Calling
+             bind_all inside a loop creates N overlapping handlers on every
+             widget in the application, which stalls the Tk event loop and
+             causes the multi-minute render delay.
+        """
+        outer = ttk.Frame(nb)
+        nb.add(outer, text=title)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+        cv  = tk.Canvas(outer, highlightthickness=0)
+        sb  = ttk.Scrollbar(outer, orient="vertical", command=cv.yview)
+        inn = ttk.Frame(cv)
+        cv.configure(yscrollcommand=sb.set)
+        cv.grid(row=0, column=0, sticky="nsew")
+        sb.grid(row=0, column=1, sticky="ns")
+        win_id = cv.create_window((0, 0), window=inn, anchor="nw")
+
+        def _resize_inner(width):
+            """Set the embedded-window width to match the canvas width."""
+            if width > 1:                     # ignore the startup 1-px dummy value
+                cv.itemconfig(win_id, width=width)
+
+        def _on_inner_configure(evt):
+            """Called when widgets are added to / removed from the inner frame."""
+            cv.configure(scrollregion=cv.bbox("all"))
+            _resize_inner(cv.winfo_width())
+
+        def _on_canvas_configure(evt):
+            """
+            Called when the canvas is resized — critically, this fires when
+            the tab is *first shown*, giving us the real pixel width.
+            """
+            cv.configure(scrollregion=cv.bbox("all"))
+            _resize_inner(evt.width)
+
+        inn.bind("<Configure>", _on_inner_configure)
+        cv.bind("<Configure>",  _on_canvas_configure)   # <- the essential new line
+
+        inn.columnconfigure(0, weight=1)
+        inn.columnconfigure(1, weight=1)
+        _tab_canvases.append(cv)   # register so wheel handler can find it
+        return inn
+
+    tab_drone    = make_scrollable_tab(input_nb, "Drone")
+    tab_batt     = make_scrollable_tab(input_nb, "Battery")
+    tab_motor    = make_scrollable_tab(input_nb, "Motor")
+    tab_esc      = make_scrollable_tab(input_nb, "ESC")
+    tab_avionics = make_scrollable_tab(input_nb, "Avionics")
+    tab_prop     = make_scrollable_tab(input_nb, "Propeller")
+    tab_mission  = make_scrollable_tab(input_nb, "Mission/Environment")
+
+    # --- Single notebook-level mouse-wheel binding ----------------------------
+    # Replaces the old bind_all-per-tab pattern.  We find whichever canvas
+    # belongs to the currently-selected tab and scroll only that one.
+    def _on_nb_mousewheel(evt):
+        try:
+            idx = input_nb.index(input_nb.select())
+            if 0 <= idx < len(_tab_canvases):
+                _tab_canvases[idx].yview_scroll(
+                    int(-1 * (evt.delta / 120)), "units")
+        except Exception:
+            pass
+    input_nb.bind("<MouseWheel>", _on_nb_mousewheel)
+    # Also bind directly to each canvas so hovering over tab content works.
+    for _cv in _tab_canvases:
+        _cv.bind("<MouseWheel>", lambda evt, c=_cv:
+                 c.yview_scroll(int(-1 * (evt.delta / 120)), "units"))
+    # --------------------------------------------------------------------------
+
+
+    def add_row(parent, r, label, var, **kw):
+        ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=3)
+        e = ttk.Entry(parent, textvariable=var, width=14, **kw)
+        e.grid(row=r, column=1, sticky="ew", padx=6, pady=3)
+        return e
+
+    # ===== DRONE TAB =====
+    ttk.Label(tab_drone, text="Motor Configuration:").grid(
+        row=0, column=0, sticky="w", padx=6, pady=4)
+    motor_cfg_cb = ttk.Combobox(tab_drone, textvariable=v_motor_configuration,
+                                values=["flat","coaxial"], state="readonly", width=12)
+    motor_cfg_cb.grid(row=0, column=1, sticky="w", padx=6, pady=4)
+
     r = 1
-    num_motor_entry = add_row(tab_drone, r, "Num motors", v_num_motors); r += 1
-    weight_entry = add_row(tab_drone, r, "Weight (g)", v_weight); r += 1
-    area_entry = add_row(tab_drone, r, "Frontal area (m^2)", v_area); r += 1
-    speed_entry = add_row(tab_drone, r, "Speed (m/s)", v_speed); r += 1
-    periph_current_entry = add_row(tab_drone, r, "Peripheral current (A)", v_periph_current); r += 1
+    add_row(tab_drone, r, "Num Motors",              v_num_motors);        r += 1
+    add_row(tab_drone, r, "Weight (g)",              v_weight);            r += 1
+    add_row(tab_drone, r, "Frontal Area (m²)",       v_area);              r += 1
+    add_row(tab_drone, r, "Cruise Speed (m/s)",      v_speed);             r += 1
+    add_row(tab_drone, r, "Peripheral Current (A)",  v_periph_current);    r += 1
 
-    ttk.Separator(tab_drone, orient="horizontal").grid(row=r, column=0, columnspan=2, sticky="ew", pady=8); r += 1
-    profile_cd_entry = add_row(tab_drone, r, "Profile Cd", v_profile_drag); r += 1
-    profile_area_entry = add_row(tab_drone, r, "Profile area (m^2)", v_profile_area); r += 1
-    parasite_cd_entry = add_row(tab_drone, r, "Parasite Cd", v_parasite_drag); r += 1
-    parasite_area_entry = add_row(tab_drone, r, "Parasite area (m^2)", v_parasite_area); r += 1
+    ttk.Separator(tab_drone, orient="horizontal").grid(
+        row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
+    ttk.Label(tab_drone, text="── Drag Parameters ──",
+              foreground="gray").grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
+    add_row(tab_drone, r, "Profile Cd",              v_profile_drag);      r += 1
+    add_row(tab_drone, r, "Profile Area (m²)",       v_profile_area);      r += 1
+    add_row(tab_drone, r, "Parasite Cd",             v_parasite_drag);     r += 1
+    add_row(tab_drone, r, "Parasite Area (m²)",      v_parasite_area);     r += 1
 
-    ttk.Separator(tab_drone, orient="horizontal").grid(row=r, column=0, columnspan=2, sticky="ew", pady=8); r += 1
-    add_row(tab_drone, r, "Body length (m)", v_body_length_m); r += 1
-    add_row(tab_drone, r, "Body width (m)", v_body_width_m); r += 1
-    add_row(tab_drone, r, "Body height (m)", v_body_height_m); r += 1
-    add_row(tab_drone, r, "Arm length (m)", v_arm_length_m); r += 1
-    add_row(tab_drone, r, "Arm width (m)", v_arm_width_m); r += 1
-    add_row(tab_drone, r, "Max tilt (deg)", v_max_tilt_deg); r += 1
-    coax_entry = add_row(tab_drone, r, "Coaxial spacing (m)", v_coaxial_spacing_m); r += 1
-    coax_entry.configure(state="disabled")  # initially disabled until "coaxial" config selected
+    ttk.Separator(tab_drone, orient="horizontal").grid(
+        row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
+    ttk.Label(tab_drone, text="── Body Geometry (optional) ──",
+              foreground="gray").grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
+    add_row(tab_drone, r, "Body Length (m)",         v_body_length_m);     r += 1
+    add_row(tab_drone, r, "Body Width (m)",          v_body_width_m);      r += 1
+    add_row(tab_drone, r, "Body Height (m)",         v_body_height_m);     r += 1
+    add_row(tab_drone, r, "Arm Length (m)",          v_arm_length_m);      r += 1
+    add_row(tab_drone, r, "Arm Width (m)",           v_arm_width_m);       r += 1
+    add_row(tab_drone, r, "Max Tilt (deg)",          v_max_tilt_deg);      r += 1
+    coax_entry = add_row(tab_drone, r, "Coaxial Spacing (m)", v_coaxial_spacing_m); r += 1
+    coax_entry.configure(state="disabled")
 
-    # Motor configuration dropdown
-    # after creating v_motor_configuration and v_coaxial_spacing_m StringVars
-    ttk.Label(tab_drone, text="Motor Configuration:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
-    motor_cfg = ttk.Combobox(tab_drone, textvariable=v_motor_configuration,
-                            values=["flat", "coaxial"], state="readonly", width=12)
-    motor_cfg.grid(row=0, column=1, sticky="w", padx=6, pady=4)
-
-    def _update_coaxial_spacing_enabled(event=None):
-        is_coax = (v_motor_configuration.get().strip().lower() == "coaxial")
-
-        if is_coax:
-            # enable
+    def _update_coax_state(event=None):
+        if v_motor_configuration.get().strip().lower() == "coaxial":
             coax_entry.configure(state="normal")
         else:
-            # disable + clear value (optional but recommended)
             v_coaxial_spacing_m.set("")
             coax_entry.configure(state="disabled")
+    motor_cfg_cb.bind("<<ComboboxSelected>>", _update_coax_state)
 
-    motor_cfg.bind("<<ComboboxSelected>>", _update_coaxial_spacing_enabled)
-
-    # Battery tab
-    r = 1
-    cell_vmin_entry = add_row(tab_batt, r, "Vmin/cell (V)", v_batt_vmin); r += 1
-    cell_vnom_entry = add_row(tab_batt, r, "Vnom/cell (V)", v_batt_vnom); r += 1
-    cell_vmax_entry = add_row(tab_batt, r, "Vmax/cell (V)", v_batt_vmax); r += 1
-    cell_capacity_entry = add_row(tab_batt, r, "Cell Capacity (mAh)", v_batt_cell_capacity); r += 1
-    pack_capacity_entry = add_row(tab_batt, r, "Pack Capacity (mAh)", v_batt_pack_capacity); r += 1
-    cell_weight_entry = add_row(tab_batt, r, "Cell Weight (g)", v_batt_cell_weight); r += 1
-    pack_weight_entry = add_row(tab_batt, r, "Pack Weight (g)", v_batt_pack_weight); r += 1
-    energy_density_entry = add_row(tab_batt, r, "Energy density (Wh/kg)", v_batt_energy_density); r += 1
-    max_charge_current_entry = add_row(tab_batt, r, "Max charge current (A)", v_batt_chg); r += 1
-    cont_discharge_current_entry = add_row(tab_batt, r, "Cont discharge current (A)", v_batt_a_cont); r += 1
-    max_discharge_current_entry = add_row(tab_batt, r, "Max discharge current (A)", v_batt_a_max); r += 1
-    cont_discharge_c_rate_entry = add_row(tab_batt, r, "Cont discharge C-rate (C)", v_batt_c_cont); r += 1
-    max_discharge_c_rate_entry = add_row(tab_batt, r, "Max discharge C-rate (C)", v_batt_c_max); r += 1
-    discharge_usable_entry = add_row(tab_batt, r, "Discharge usable (%)", v_batt_dischg_pct); r += 1
-    rcell_entry = add_row(tab_batt, r, "Rcell (mΩ)", v_batt_r); r += 1
-    series_units_entry = add_row(tab_batt, r, "Series Cells/Packs", v_batt_series); r += 1
-    parallel_units_entry = add_row(tab_batt, r, "Parallel Cells/Packs", v_batt_parallel); r += 1
-    cells_in_series_entry = add_row(tab_batt, r, "Cells in series per pack", v_batt_cells_series); r += 1
-    cells_in_parallel_entry = add_row(tab_batt, r, "Cells in parallel per pack", v_batt_cells_parallel); r += 1
-    chemistry_entry = add_row(tab_batt, r, "Chemistry (text)", v_batt_chem); r += 1
-
+    # ===== BATTERY TAB =====
     ttk.Label(tab_batt, text="Unit mode:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
+    unit_mode_cb = ttk.Combobox(tab_batt, textvariable=v_batt_unit_mode,
+                                values=["cell","pack"], state="readonly", width=10)
+    unit_mode_cb.grid(row=0, column=1, sticky="w", padx=6, pady=4)
 
-    unit_mode_combo = ttk.Combobox(
-        tab_batt,
-        textvariable=v_batt_unit_mode,
-        values=["cell", "pack"],
-        state="readonly",     # prevents typing arbitrary values
-        width=10
-    )
-    unit_mode_combo.grid(row=0, column=1, sticky="w", padx=6, pady=4)
+    r = 1
+    add_row(tab_batt, r, "Vmin/cell (V)",            v_batt_vmin);         r += 1
+    add_row(tab_batt, r, "Vnom/cell (V)",            v_batt_vnom);         r += 1
+    add_row(tab_batt, r, "Vmax/cell (V)",            v_batt_vmax);         r += 1
+    cell_cap_e = add_row(tab_batt, r, "Cell Capacity (mAh)",   v_batt_cell_capacity); r += 1
+    pack_cap_e = add_row(tab_batt, r, "Pack Capacity (mAh)",   v_batt_pack_capacity); r += 1
+    cell_wt_e  = add_row(tab_batt, r, "Cell Weight (g)",       v_batt_cell_weight);   r += 1
+    pack_wt_e  = add_row(tab_batt, r, "Pack Weight (g)",       v_batt_pack_weight);   r += 1
+    add_row(tab_batt, r, "Energy Density (Wh/kg)",   v_batt_energy_density); r += 1
+    add_row(tab_batt, r, "Max Charge Current (A)",   v_batt_chg);          r += 1
+    add_row(tab_batt, r, "Cont Discharge (A)",       v_batt_a_cont);       r += 1
+    add_row(tab_batt, r, "Max Discharge (A)",        v_batt_a_max);        r += 1
+    add_row(tab_batt, r, "Cont C-rate",              v_batt_c_cont);       r += 1
+    add_row(tab_batt, r, "Max C-rate",               v_batt_c_max);        r += 1
+    add_row(tab_batt, r, "Usable Discharge (%)",     v_batt_dischg_pct);   r += 1
+    add_row(tab_batt, r, "Rcell (mΩ)",               v_batt_r);            r += 1
+    add_row(tab_batt, r, "Series Cells/Packs",       v_batt_series);       r += 1
+    add_row(tab_batt, r, "Parallel Cells/Packs",     v_batt_parallel);     r += 1
+    cells_s_e = add_row(tab_batt, r, "Cells in Series/Pack",  v_batt_cells_series);  r += 1
+    cells_p_e = add_row(tab_batt, r, "Cells in Parallel/Pack",v_batt_cells_parallel); r += 1
+    add_row(tab_batt, r, "Chemistry",                v_batt_chem);         r += 1
 
     def on_unit_mode_change(event=None):
         mode = v_batt_unit_mode.get()
         if mode == "cell":
-            # example: enable per-cell fields, disable pack-only fields
-            cell_capacity_entry.configure(state="normal")
-            cell_weight_entry.configure(state="normal")
-            pack_capacity_entry.configure(state="disabled")
-            pack_weight_entry.configure(state="disabled")
-            cells_in_parallel_entry.configure(state="disabled")
-            cells_in_series_entry.configure(state="disabled")
-        else:  # "pack"
-            cell_capacity_entry.configure(state="disabled")
-            cell_weight_entry.configure(state="disabled")
-            pack_capacity_entry.configure(state="normal")
-            pack_weight_entry.configure(state="normal")
-            cells_in_parallel_entry.configure(state="normal")
-            cells_in_series_entry.configure(state="normal")
+            cell_cap_e.configure(state="normal");  cell_wt_e.configure(state="normal")
+            pack_cap_e.configure(state="disabled"); pack_wt_e.configure(state="disabled")
+            cells_s_e.configure(state="disabled");  cells_p_e.configure(state="disabled")
+        else:
+            cell_cap_e.configure(state="disabled"); cell_wt_e.configure(state="disabled")
+            pack_cap_e.configure(state="normal");   pack_wt_e.configure(state="normal")
+            cells_s_e.configure(state="normal");    cells_p_e.configure(state="normal")
+    unit_mode_cb.bind("<<ComboboxSelected>>", on_unit_mode_change)
+    on_unit_mode_change()
 
-    unit_mode_combo.bind("<<ComboboxSelected>>", on_unit_mode_change)
-
-    # Motor tab
+    # ===== MOTOR TAB =====
     r = 0
-    kv_entry = add_row(tab_motor, r, "Kv (RPM/V)", v_motor_kv); r += 1
-    idle_current_entry = add_row(tab_motor, r, "Idle current I0 (A)", v_motor_i0); r += 1
-    idle_voltage_entry = add_row(tab_motor, r, "Idle voltage V0 (V)", v_motor_v0); r += 1
-    rated_voltage_entry = add_row(tab_motor, r, "Rated voltage (V)", v_motor_rated_v); r += 1
-    resistance_entry = add_row(tab_motor, r, "Resistance (Ω)", v_motor_r); r += 1
-    max_current_entry = add_row(tab_motor, r, "Max current (A)", v_motor_imax); r += 1
-    max_power_entry = add_row(tab_motor, r, "Max power (W)", v_motor_pmax); r += 1
-    pole_count_entry = add_row(tab_motor, r, "Pole count", v_motor_pole_count); r += 1
-    motor_weight_entry = add_row(tab_motor, r, "Weight (g)", v_motor_weight); r += 1
-    motor_size_entry = add_row(tab_motor, r, "Size (e.g., 28x28mm)", v_motor_size); r += 1
+    add_row(tab_motor, r, "Kv (RPM/V)",          v_motor_kv);         r += 1
+    add_row(tab_motor, r, "Idle Current I0 (A)",  v_motor_i0);         r += 1
+    add_row(tab_motor, r, "Idle Voltage V0 (V)",  v_motor_v0);         r += 1
+    add_row(tab_motor, r, "Rated Voltage (V)",    v_motor_rated_v);    r += 1
+    add_row(tab_motor, r, "Resistance Rm (Ω)",    v_motor_r);          r += 1
+    add_row(tab_motor, r, "Max Current (A)",      v_motor_imax);       r += 1
+    add_row(tab_motor, r, "Max Power (W)",        v_motor_pmax);       r += 1
+    add_row(tab_motor, r, "Pole Count",           v_motor_pole_count); r += 1
+    add_row(tab_motor, r, "Weight (g)",           v_motor_weight);     r += 1
+    add_row(tab_motor, r, "Size (e.g. 28x28mm)",  v_motor_size);       r += 1
 
-    #ESC tab
+    # ===== ESC TAB =====
     r = 0
-    esc_voltage_entry = add_row(tab_esc, r, "Voltage rating (V)", v_esc_voltage_rating); r += 1
-    esc_cont_current_entry = add_row(tab_esc, r, "Continuous current (A)", v_esc_cont_current); r += 1
-    esc_max_current_entry = add_row(tab_esc, r, "Max current (A)", v_esc_max_current); r += 1
-    esc_idle_current_entry = add_row(tab_esc, r, "Idle current (A)", v_esc_idle_current); r += 1
-    esc_resistance_entry = add_row(tab_esc, r, "Resistance (Ω)", v_esc_r); r += 1
-    esc_weight_entry = add_row(tab_esc, r, "Weight (g)", v_esc_weight); r += 1
+    add_row(tab_esc, r, "Voltage Rating (V)",     v_esc_voltage_rating); r += 1
+    add_row(tab_esc, r, "Continuous Current (A)",  v_esc_cont_current);   r += 1
+    add_row(tab_esc, r, "Max Current (A)",         v_esc_max_current);    r += 1
+    add_row(tab_esc, r, "Idle Current (A)",        v_esc_idle_current);   r += 1
+    add_row(tab_esc, r, "Resistance (Ω)",          v_esc_r);              r += 1
+    add_row(tab_esc, r, "Weight (g)",              v_esc_weight);         r += 1
 
-    #Avionics tab
-    r = 0
+    # ===== AVIONICS TAB =====
     tab_avionics.columnconfigure(0, weight=1)
-    tab_avionics.grid_columnconfigure(1, weight=1)
-    tab_avionics.grid_rowconfigure(r, weight=1)
+    tab_avionics.rowconfigure(1, weight=1)
 
     ttk.Label(
         tab_avionics,
-        text="Avionics voltage rails (double-click a cell to edit).\n"
-             "Each row is: rail voltage (V), rail current (A), and BEC efficiency (0-1]."
-    ).grid(row=r, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 2))
-    r += 1
+        text="BEC / Avionics voltage rails  —  one row per regulated output bus.\n"
+             "Double-click any cell to edit it in-place.",
+        wraplength=340, justify="left", foreground="#555555",
+    ).grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 2))
 
-    av_table_frame = ttk.Frame(tab_avionics)
-    av_table_frame.grid(row=r, column=0, columnspan=3, sticky="nsew", padx=6, pady=6)
-    av_table_frame.rowconfigure(0, weight=1)
-    av_table_frame.columnconfigure(0, weight=1)
+    av_tree_frame = ttk.Frame(tab_avionics)
+    av_tree_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=6, pady=(0, 4))
+    av_tree_frame.columnconfigure(0, weight=1)
+    av_tree_frame.rowconfigure(0, weight=1)
 
-    av_cols = ("voltage", "current", "eff")
-
-    style = ttk.Style()
-    style.configure("Avionics.Treeview", rowheight=55)
-
-    avionics_tree = ttk.Treeview(av_table_frame, columns=av_cols, show="headings", height=14, style="Avionics.Treeview", selectmode="browse")
-    avionics_tree.heading("voltage", text="Rail Voltage (V)")
-    avionics_tree.heading("current", text="Rail Current (A)")
-    avionics_tree.heading("eff", text="BEC Efficiency (0-1]")
-    avionics_tree.column("voltage", width=120, anchor="center")
-    avionics_tree.column("current", width=120, anchor="center")
-    avionics_tree.column("eff", width=140, anchor="center")
+    _AV_COLS = ("voltage", "current", "efficiency")
+    avionics_tree = ttk.Treeview(
+        av_tree_frame, columns=_AV_COLS, show="headings", height=8, selectmode="browse")
+    for col, heading, width in [
+        ("voltage",    "Rail Voltage (V)",      130),
+        ("current",    "Rail Current (A)",      130),
+        ("efficiency", "BEC Efficiency (0–1]",  150),
+    ]:
+        avionics_tree.heading(col, text=heading)
+        avionics_tree.column(col, width=width, anchor="center", stretch=True)
     avionics_tree.grid(row=0, column=0, sticky="nsew")
 
-    av_sb = ttk.Scrollbar(av_table_frame, orient="vertical", command=avionics_tree.yview)
+    av_sb = ttk.Scrollbar(av_tree_frame, orient="vertical", command=avionics_tree.yview)
     av_sb.grid(row=0, column=1, sticky="ns")
     avionics_tree.configure(yscrollcommand=av_sb.set)
 
-    av_edit_frame = ttk.Frame(tab_avionics)
-    av_edit_frame.grid(row=r+1, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
-    for c in range(6):
-        av_edit_frame.columnconfigure(c, weight=1)
-
-    v_av_row_voltage = tk.StringVar(value="5.0")
-    v_av_row_current = tk.StringVar(value="2.0")
-    v_av_row_eff = tk.StringVar(value="0.9")
-
-    ttk.Label(av_edit_frame, text="Voltage (V)").grid(row=0, column=0, sticky="w")
-    ttk.Entry(av_edit_frame, textvariable=v_av_row_voltage, width=10).grid(row=0, column=1, sticky="ew", padx=(0, 8))
-    ttk.Label(av_edit_frame, text="Current (A)").grid(row=0, column=2, sticky="w")
-    ttk.Entry(av_edit_frame, textvariable=v_av_row_current, width=10).grid(row=0, column=3, sticky="ew", padx=(0, 8))
-    ttk.Label(av_edit_frame, text="Efficiency").grid(row=0, column=4, sticky="w")
-    ttk.Entry(av_edit_frame, textvariable=v_av_row_eff, width=10).grid(row=0, column=5, sticky="ew")
-
-    av_btn_frame = ttk.Frame(tab_avionics)
-    av_btn_frame.grid(row=r+2, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
-    av_btn_frame.columnconfigure(0, weight=1)
-
+    # ---- Helpers for the avionics table ----
     def _canonical_voltage_tree_string(d: dict) -> str:
-        # Sort for stable display.
-        items = sorted(((float(v), float(i), float(e)) for v, (i, e) in d.items()), key=lambda t: t[0])
-        return ", ".join([f"{v:.3g}:({i:.3g},{e:.3g})" for v, i, e in items])
+        items = sorted(((float(v), float(i), float(e)) for v, (i, e) in d.items()),
+                       key=lambda t: t[0])
+        return ", ".join(f"{v:.3g}:({i:.3g},{e:.3g})" for v, i, e in items)
 
     def _sync_voltage_tree_var_from_table() -> None:
         d = {}
         for iid in avionics_tree.get_children():
-            v_str, i_str, e_str = avionics_tree.item(iid, "values")
+            v_s, i_s, e_s = avionics_tree.item(iid, "values")
             try:
-                v = float(v_str)
-                i = float(i_str)
-                e = float(e_str)
+                d[float(v_s)] = (float(i_s), float(e_s))
             except Exception:
                 continue
-            d[float(v)] = (float(i), float(e))
         v_avionics_voltage_tree.set(_canonical_voltage_tree_string(d))
 
     def _get_voltage_tree_from_table() -> dict:
         d = {}
         for iid in avionics_tree.get_children():
-            v_str, i_str, e_str = avionics_tree.item(iid, "values")
-            v = float(v_str); i = float(i_str); e = float(e_str)
-            # Validate using existing parser rules
-            if v <= 0:
-                raise ValueError(f"Avionics rail voltage must be > 0, got {v}.")
-            if i < 0:
-                raise ValueError(f"Avionics rail current must be >= 0, got {i}.")
-            if e <= 0 or e > 1.0:
-                raise ValueError(f"BEC efficiency must be in (0, 1], got {e}.")
-            d[float(v)] = (float(i), float(e))
+            v_s, i_s, e_s = avionics_tree.item(iid, "values")
+            v, i, e = float(v_s), float(i_s), float(e_s)
+            if v <= 0:   raise ValueError(f"Rail voltage must be > 0, got {v}.")
+            if i < 0:    raise ValueError(f"Rail current must be ≥ 0, got {i}.")
+            if e <= 0 or e > 1.0: raise ValueError(f"BEC efficiency must be in (0,1], got {e}.")
+            d[v] = (i, e)
         return d
 
-    def _add_or_update_rail() -> None:
-        try:
-            v = float(v_av_row_voltage.get().strip())
-            i = float(v_av_row_current.get().strip())
-            e = float(v_av_row_eff.get().strip())
-        except Exception:
-            messagebox.showerror("Invalid avionics rail", "Voltage/current/efficiency must be numeric.")
-            return
-
-        try:
-            if v <= 0:
-                raise ValueError("Voltage must be > 0.")
-            if i < 0:
-                raise ValueError("Current must be >= 0.")
-            if e <= 0 or e > 1.0:
-                raise ValueError("Efficiency must be in (0, 1].")
-        except Exception as ex:
-            messagebox.showerror("Invalid avionics rail", str(ex))
-            return
-
-        # Update existing row if same voltage exists (as float string match tolerant).
-        for iid in avionics_tree.get_children():
-            vv, _, _ = avionics_tree.item(iid, "values")
+    def _av_load_rows(rows: list) -> None:
+        avionics_tree.delete(*avionics_tree.get_children())
+        for r in sorted(rows, key=lambda x: float(x.get("voltage", 0))):
             try:
-                if abs(float(vv) - v) < 1e-9:
-                    avionics_tree.item(iid, values=(f"{v}", f"{i}", f"{e}"))
-                    _sync_voltage_tree_var_from_table()
-                    return
+                v = float(r.get("voltage")); i = float(r.get("current")); e = float(r.get("eff"))
+                avionics_tree.insert("", "end", values=(f"{v:g}", f"{i:g}", f"{e:g}"))
             except Exception:
-                pass
-
-        avionics_tree.insert("", "end", values=(f"{v}", f"{i}", f"{e}"))
+                continue
         _sync_voltage_tree_var_from_table()
 
-    def _remove_selected_rail() -> None:
-        sel = avionics_tree.selection()
-        if not sel:
-            return
-        avionics_tree.delete(sel[0])
-        _sync_voltage_tree_var_from_table()
-
-    def _clear_all_rails() -> None:
-        for iid in avionics_tree.get_children():
-            avionics_tree.delete(iid)
-        _sync_voltage_tree_var_from_table()
-
-    ttk.Button(av_btn_frame, text="Add / Update Rail", command=_add_or_update_rail).grid(row=0, column=0, sticky="w")
-    ttk.Button(av_btn_frame, text="Remove Selected", command=_remove_selected_rail).grid(row=0, column=1, sticky="w", padx=(8, 0))
-    ttk.Button(av_btn_frame, text="Clear", command=_clear_all_rails).grid(row=0, column=2, sticky="w", padx=(8, 0))
-
-    # In-place editing on double-click
-    def _begin_cell_edit(event):
+    # ---- Double-click in-place editing ----
+    def _av_begin_edit(event):
         region = avionics_tree.identify("region", event.x, event.y)
-        if region != "cell":
-            return
+        if region != "cell": return
         row_id = avionics_tree.identify_row(event.y)
-        col_id = avionics_tree.identify_column(event.x)  # '#1', '#2', '#3'
-        if not row_id or not col_id:
-            return
+        col_id = avionics_tree.identify_column(event.x)
+        if not row_id or not col_id: return
+        col_idx = int(col_id.replace("#", "")) - 1
+        bbox = avionics_tree.bbox(row_id, col_id)
+        if not bbox: return
+        x, y, w, h = bbox
+        old_vals = list(avionics_tree.item(row_id, "values"))
 
-        col_index = int(col_id.replace("#", "")) - 1
-        x, y, w, h = avionics_tree.bbox(row_id, col_id)
-        old_values = list(avionics_tree.item(row_id, "values"))
-        if col_index < 0 or col_index >= len(old_values):
-            return
-
-        edit = tk.Entry(avionics_tree)
-        edit.insert(0, old_values[col_index])
-        edit.select_range(0, tk.END)
-        edit.focus_set()
-        edit.place(x=x, y=y, width=w, height=h)
+        ed = tk.Entry(avionics_tree, justify="center")
+        ed.insert(0, old_vals[col_idx])
+        ed.select_range(0, tk.END)
+        ed.focus_set()
+        ed.place(x=x, y=y, width=w, height=h)
 
         def _commit(_evt=None):
-            new_val = edit.get().strip()
-            old_values[col_index] = new_val
-            avionics_tree.item(row_id, values=tuple(old_values))
-            edit.destroy()
-            try:
-                # Validate table (will raise if bad), then sync string var.
-                _get_voltage_tree_from_table()
-            except Exception as ex:
-                messagebox.showerror("Invalid avionics rail", str(ex))
+            old_vals[col_idx] = ed.get().strip()
+            avionics_tree.item(row_id, values=tuple(old_vals))
+            ed.destroy()
             _sync_voltage_tree_var_from_table()
 
-        def _cancel(_evt=None):
-            edit.destroy()
+        def _cancel(_evt=None): ed.destroy()
 
-        edit.bind("<Return>", _commit)
-        edit.bind("<FocusOut>", _commit)
-        edit.bind("<Escape>", _cancel)
+        ed.bind("<Return>",   _commit)
+        ed.bind("<Tab>",      _commit)
+        ed.bind("<FocusOut>", _commit)
+        ed.bind("<Escape>",   _cancel)
 
-    avionics_tree.bind("<Double-1>", _begin_cell_edit)
+    avionics_tree.bind("<Double-1>", _av_begin_edit)
 
-    # Populate the table from the current string var (so CLI/GUI stay consistent).
+    # ---- Click row → populate entry fields ----
+    _av_v_var = tk.StringVar()
+    _av_i_var = tk.StringVar()
+    _av_e_var = tk.StringVar(value="0.90")
+
+    def _av_on_select(event):
+        sel = avionics_tree.selection()
+        if not sel: return
+        vals = avionics_tree.item(sel[0], "values")
+        try: _av_v_var.set(vals[0]); _av_i_var.set(vals[1]); _av_e_var.set(vals[2])
+        except Exception: pass
+    avionics_tree.bind("<<TreeviewSelect>>", _av_on_select)
+
+    # ---- Entry fields for add/update ----
+    av_entry_frame = ttk.Frame(tab_avionics)
+    av_entry_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(2, 2))
+    for c in range(6): av_entry_frame.columnconfigure(c, weight=1)
+
+    ttk.Label(av_entry_frame, text="Voltage (V):").grid(row=0, column=0, sticky="e", padx=(0,2))
+    ttk.Entry(av_entry_frame, textvariable=_av_v_var, width=7).grid(row=0, column=1, sticky="ew", padx=(0,6))
+    ttk.Label(av_entry_frame, text="Current (A):").grid(row=0, column=2, sticky="e", padx=(0,2))
+    ttk.Entry(av_entry_frame, textvariable=_av_i_var, width=7).grid(row=0, column=3, sticky="ew", padx=(0,6))
+    ttk.Label(av_entry_frame, text="Efficiency:").grid(row=0, column=4, sticky="e", padx=(0,2))
+    ttk.Entry(av_entry_frame, textvariable=_av_e_var, width=7).grid(row=0, column=5, sticky="ew")
+
+    # ---- Buttons ----
+    av_btn_frame = ttk.Frame(tab_avionics)
+    av_btn_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+
+    def _av_add_or_update():
+        try:
+            v = float(_av_v_var.get()); i = float(_av_i_var.get()); e = float(_av_e_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid input", "Voltage, Current and Efficiency must be numbers.")
+            return
+        if v <= 0:
+            messagebox.showerror("Invalid input", "Rail voltage must be > 0 V."); return
+        if i < 0:
+            messagebox.showerror("Invalid input", "Rail current must be ≥ 0 A."); return
+        if not (0 < e <= 1.0):
+            messagebox.showerror("Invalid input", "BEC efficiency must be in (0, 1]."); return
+        for iid in avionics_tree.get_children():
+            try:
+                if abs(float(avionics_tree.item(iid,"values")[0]) - v) < 1e-9:
+                    avionics_tree.item(iid, values=(f"{v:g}", f"{i:g}", f"{e:g}"))
+                    _sync_voltage_tree_var_from_table()
+                    _av_v_var.set(""); _av_i_var.set(""); _av_e_var.set("0.90")
+                    return
+            except Exception: pass
+        avionics_tree.insert("", "end", values=(f"{v:g}", f"{i:g}", f"{e:g}"))
+        _sync_voltage_tree_var_from_table()
+        _av_v_var.set(""); _av_i_var.set(""); _av_e_var.set("0.90")
+
+    def _av_remove():
+        sel = avionics_tree.selection()
+        for iid in sel: avionics_tree.delete(iid)
+        _sync_voltage_tree_var_from_table()
+
+    def _av_clear():
+        avionics_tree.delete(*avionics_tree.get_children())
+        _sync_voltage_tree_var_from_table()
+
+    ttk.Button(av_btn_frame, text="➕  Add / Update Rail",
+               command=_av_add_or_update).grid(row=0, column=0, sticky="w", padx=(0, 6))
+    ttk.Button(av_btn_frame, text="🗑  Remove Selected",
+               command=_av_remove).grid(row=0, column=1, sticky="w", padx=(0, 6))
+    ttk.Button(av_btn_frame, text="✖  Clear All",
+               command=_av_clear).grid(row=0, column=2, sticky="w")
+
+    # Seed the table from the default string var
     try:
         _initial_tree = parse_voltage_tree(v_avionics_voltage_tree.get())
-        for vv, (ii, ee) in sorted(_initial_tree.items(), key=lambda t: float(t[0])):
-            avionics_tree.insert("", "end", values=(f"{float(vv)}", f"{float(ii)}", f"{float(ee)}"))
-        _sync_voltage_tree_var_from_table()
+        _av_load_rows([{"voltage": v, "current": ci[0], "eff": ci[1]}
+                       for v, ci in sorted(_initial_tree.items())])
     except Exception:
-        # If the stored string is invalid, leave the table empty.
-        _clear_all_rails()
+        _av_clear()
 
-    r += 3
-
-
-    # Prop tab
+    # ===== PROPELLER TAB =====
     r = 0
-    diameter_entry = add_row(tab_prop, r, "Diameter (in)", v_prop_d); r += 1
-    pitch_entry = add_row(tab_prop, r, "Pitch (in)", v_prop_pitch); r += 1
-    blades_entry = add_row(tab_prop, r, "Blades", v_prop_blades); r += 1
-    max_rpm_entry = add_row(tab_prop, r, "Max RPM", v_prop_max_rpm); r += 1
-    max_thrust_entry = add_row(tab_prop, r, "Max thrust (g)", v_prop_max_thrust); r += 1
-
-    ttk.Separator(tab_prop, orient="horizontal").grid(row=r, column=0, columnspan=2, sticky="ew", pady=8); r += 1
-
-    ttk.Label(tab_prop, text="Prop/motor table CSV (optional)").grid(row=r, column=0, sticky="w", padx=6, pady=2)
-    frow = ttk.Frame(tab_prop)
-    frow.grid(row=r, column=1, sticky="ew")
+    add_row(tab_prop, r, "Diameter (in)",         v_prop_d);          r += 1
+    add_row(tab_prop, r, "Pitch (in)",            v_prop_pitch);      r += 1
+    add_row(tab_prop, r, "Blades",                v_prop_blades);     r += 1
+    add_row(tab_prop, r, "Max RPM",               v_prop_max_rpm);    r += 1
+    add_row(tab_prop, r, "Max Thrust (g)",         v_prop_max_thrust); r += 1
+    ttk.Separator(tab_prop, orient="horizontal").grid(
+        row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
+    ttk.Label(tab_prop, text="Prop/Motor CSV table (optional)").grid(
+        row=r, column=0, sticky="w", padx=6, pady=2)
+    frow = ttk.Frame(tab_prop); frow.grid(row=r, column=1, sticky="ew")
     frow.columnconfigure(0, weight=1)
-    ttk.Entry(frow, textvariable=v_prop_table).grid(row=0, column=0, sticky="ew", padx=(6, 4))
-    ttk.Button(frow, text="Browse…", command=lambda: choose_file(v_prop_table, [("CSV files", "*.csv"), ("All files", "*.*")])).grid(row=0, column=1, padx=(0, 6))
-    r += 1
+    ttk.Entry(frow, textvariable=v_prop_table).grid(row=0, column=0, sticky="ew", padx=(6,4))
+    ttk.Button(frow, text="Browse…",
+               command=lambda: choose_file(v_prop_table, [("CSV","*.csv"),("All","*.*")])).grid(
+        row=0, column=1, padx=(0,6)); r += 1
+    add_row(tab_prop, r, "TConst (optional)",     v_prop_tconst);     r += 1
+    add_row(tab_prop, r, "PConst (optional)",     v_prop_pconst);     r += 1
+    add_row(tab_prop, r, "Weight (g)",            v_prop_weight);     r += 1
 
-    tconst_entry = add_row(tab_prop, r, "TConst (optional)", v_prop_tconst); r += 1
-    pconst_entry = add_row(tab_prop, r, "PConst (optional)", v_prop_pconst); r += 1
-    prop_weight_entry = add_row(tab_prop, r, "Weight (g)", v_prop_weight); r += 1
-
-    # Mission tab
+    # ===== MISSION / ENV TAB =====
     r = 0
-    ttk.Label(tab_mission, text="Mission JSON (optional)").grid(row=r, column=0, sticky="w", padx=6, pady=2)
-    mrow = ttk.Frame(tab_mission)
-    mrow.grid(row=r, column=1, sticky="ew")
+    ttk.Label(tab_mission, text="Mission JSON (optional)").grid(
+        row=r, column=0, sticky="w", padx=6, pady=2)
+    mrow = ttk.Frame(tab_mission); mrow.grid(row=r, column=1, sticky="ew")
     mrow.columnconfigure(0, weight=1)
-    ttk.Entry(mrow, textvariable=v_mission).grid(row=0, column=0, sticky="ew", padx=(6, 4))
-    ttk.Button(mrow, text="Browse…", command=lambda: choose_file(v_mission, [("JSON files", "*.json"), ("All files", "*.*")])).grid(row=0, column=1, padx=(0, 6))
-    r += 1
+    ttk.Entry(mrow, textvariable=v_mission).grid(row=0, column=0, sticky="ew", padx=(6,4))
+    ttk.Button(mrow, text="Browse…",
+               command=lambda: choose_file(v_mission, [("JSON","*.json"),("All","*.*")])).grid(
+        row=0, column=1, padx=(0,6)); r += 1
+    ttk.Separator(tab_mission, orient="horizontal").grid(
+        row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
 
-    ttk.Separator(tab_mission, orient="horizontal").grid(row=r, column=0, columnspan=2, sticky="ew", pady=8); r += 1
-    orientation_entry = add_row(tab_mission, r, "Orientation (hover/forward)", v_orientation); r += 1
-    altitude_entry = add_row(tab_mission, r, "Altitude (m)", v_alt); r += 1
-    temperature_entry = add_row(tab_mission, r, "Temperature (°C, optional)", v_temp); r += 1
-    pressure_entry = add_row(tab_mission, r, "Pressure (Pa, optional)", v_press); r += 1
-    wind_entry = add_row(tab_mission, r, "Wind (m/s)", v_wind); r += 1
-    max_speed_plot_entry = add_row(tab_mission, r, "Max speed for plot (m/s)", v_max_speed_plot); r += 1
+    orientation_cb = ttk.Combobox(tab_mission, textvariable=v_orientation,
+                                  values=["forward","hover"], state="readonly", width=12)
+    ttk.Label(tab_mission, text="Orientation:").grid(row=r, column=0, sticky="w", padx=6, pady=3)
+    orientation_cb.grid(row=r, column=1, sticky="w", padx=6, pady=3); r += 1
 
-    # Right: plot + output
+    add_row(tab_mission, r, "Altitude (m)",              v_alt);             r += 1
+    add_row(tab_mission, r, "Temperature (°C, optional)",v_temp);            r += 1
+    add_row(tab_mission, r, "Pressure (Pa, optional)",   v_press);           r += 1
+    add_row(tab_mission, r, "Wind (m/s, + = headwind)",  v_wind);            r += 1
+    add_row(tab_mission, r, "Max Speed for Plot (m/s)",  v_max_speed_plot);  r += 1
+
+    # ------------------------------------------------------------------ #
+    #  Collect config_vars for save/load                                  #
+    # ------------------------------------------------------------------ #
+    config_vars = {
+        "num_motors": v_num_motors, "weight": v_weight, "area": v_area,
+        "speed": v_speed, "periph_current": v_periph_current,
+        "profile_drag": v_profile_drag, "profile_area": v_profile_area,
+        "parasite_drag": v_parasite_drag, "parasite_area": v_parasite_area,
+        "body_length_m": v_body_length_m, "body_width_m": v_body_width_m,
+        "body_height_m": v_body_height_m, "arm_length_m": v_arm_length_m,
+        "arm_width_m": v_arm_width_m, "coaxial_spacing_m": v_coaxial_spacing_m,
+        "max_tilt_deg": v_max_tilt_deg, "motor_configuration": v_motor_configuration,
+        "batt_vmin": v_batt_vmin, "batt_vnom": v_batt_vnom, "batt_vmax": v_batt_vmax,
+        "batt_unit_mode": v_batt_unit_mode,
+        "batt_cell_capacity": v_batt_cell_capacity, "batt_pack_capacity": v_batt_pack_capacity,
+        "batt_energy_density": v_batt_energy_density,
+        "batt_chg": v_batt_chg, "batt_a_cont": v_batt_a_cont, "batt_a_max": v_batt_a_max,
+        "batt_c_cont": v_batt_c_cont, "batt_c_max": v_batt_c_max,
+        "batt_dischg_pct": v_batt_dischg_pct, "batt_r": v_batt_r, "batt_chem": v_batt_chem,
+        "batt_series": v_batt_series, "batt_parallel": v_batt_parallel,
+        "batt_cells_series": v_batt_cells_series, "batt_cells_parallel": v_batt_cells_parallel,
+        "batt_pack_weight": v_batt_pack_weight, "batt_cell_weight": v_batt_cell_weight,
+        "motor_kv": v_motor_kv, "motor_i0": v_motor_i0, "motor_v0": v_motor_v0,
+        "motor_rated_v": v_motor_rated_v, "motor_r": v_motor_r,
+        "motor_imax": v_motor_imax, "motor_pmax": v_motor_pmax,
+        "motor_pole_count": v_motor_pole_count, "motor_weight": v_motor_weight,
+        "motor_size": v_motor_size,
+        "esc_voltage_rating": v_esc_voltage_rating, "esc_cont_current": v_esc_cont_current,
+        "esc_max_current": v_esc_max_current, "esc_idle_current": v_esc_idle_current,
+        "esc_r": v_esc_r, "esc_weight": v_esc_weight,
+        "avionics_voltage_tree": v_avionics_voltage_tree,
+        "prop_d": v_prop_d, "prop_pitch": v_prop_pitch, "prop_blades": v_prop_blades,
+        "prop_max_rpm": v_prop_max_rpm, "prop_max_thrust": v_prop_max_thrust,
+        "prop_table": v_prop_table, "prop_tconst": v_prop_tconst,
+        "prop_pconst": v_prop_pconst, "prop_weight": v_prop_weight,
+        "mission": v_mission, "alt": v_alt, "temp": v_temp,
+        "press": v_press, "wind": v_wind, "orientation": v_orientation,
+        "max_speed_plot": v_max_speed_plot,
+    }
+
+    # ================================================================== #
+    #  RIGHT PANEL: output notebooks                                      #
+    # ================================================================== #
     right = ttk.Frame(main)
-    right.grid(row=0, column=1, sticky="nsew")
+    right.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
     right.columnconfigure(0, weight=1)
     right.rowconfigure(0, weight=2)
     right.rowconfigure(1, weight=1)
 
     display_nb = ttk.Notebook(right)
     display_nb.grid(row=0, column=0, sticky="nsew")
-    display_nb.columnconfigure(0, weight=1)
-    display_nb.rowconfigure(0, weight=1)
 
-    tab_plot_out = ttk.Frame(display_nb, padding=0)
-    tab_status_out = ttk.Frame(display_nb, padding=0)
-    tab_metrics_out = ttk.Frame(display_nb, padding=0)
-    tab_mission_plots_out = ttk.Frame(display_nb, padding=0)
-    tab_plot_out.columnconfigure(0, weight=1)
-    tab_plot_out.rowconfigure(0, weight=1)
-    tab_status_out.columnconfigure(0, weight=1)
-    tab_status_out.rowconfigure(0, weight=1)
-    tab_metrics_out.columnconfigure(0, weight=1)
-    tab_metrics_out.rowconfigure(0, weight=1)
-    tab_mission_plots_out.columnconfigure(0, weight=1)
-    tab_mission_plots_out.rowconfigure(0, weight=1)
-
-    display_nb.add(tab_plot_out, text="Plots")
-    display_nb.add(tab_status_out, text="Status")
-    display_nb.add(tab_metrics_out, text="Metrics")
+    tab_plot_out         = ttk.Frame(display_nb, padding=0)
+    tab_status_out       = ttk.Frame(display_nb, padding=0)
+    tab_metrics_out      = ttk.Frame(display_nb, padding=0)
+    tab_mission_plots_out= ttk.Frame(display_nb, padding=0)
+    for t in (tab_plot_out, tab_status_out, tab_metrics_out, tab_mission_plots_out):
+        t.columnconfigure(0, weight=1); t.rowconfigure(0, weight=1)
+    display_nb.add(tab_plot_out,          text="Plots")
+    display_nb.add(tab_status_out,        text="Status")
+    display_nb.add(tab_metrics_out,       text="Metrics")
     display_nb.add(tab_mission_plots_out, text="Mission Plots")
 
-    plot_frame = ttk.LabelFrame(tab_plot_out, text="Plots", padding=6)
+    # ---- Plots panel ----
+    plot_frame = ttk.LabelFrame(tab_plot_out, text="Performance Plots", padding=4)
     plot_frame.grid(row=0, column=0, sticky="nsew")
     plot_frame.columnconfigure(0, weight=1)
     plot_frame.rowconfigure(0, weight=1)
 
+    _canvas_widget = [None]
 
+    def _show_figure(fig):
+        if _canvas_widget[0] is not None:
+            _canvas_widget[0].get_tk_widget().destroy()
+        fc = FigureCanvasTkAgg(fig, master=plot_frame)
+        fc.draw()
+        fc.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        _canvas_widget[0] = fc
+        plt.close(fig)
 
-    # ---------- Metrics tab (single-point eCalc-like summary) ----------
-    metrics_container = ttk.Frame(tab_metrics_out, padding=6)
+    # ---- Status panel ----
+    sty = ttk.Style()
+    try: sty.theme_use(sty.theme_use())
+    except Exception: pass
+
+    def _status_color_tag(value, limit, kind):
+        try: v = float(value); L = float(limit)
+        except Exception: return "na"
+        if kind == "max": return "bad" if v > L else ("warn" if v > 0.9*L else "ok")
+        else:             return "bad" if v < L else ("warn" if v < 1.1*L else "ok")
+
+    def _make_status_tv(parent, title):
+        lf = ttk.LabelFrame(parent, text=title, padding=4)
+        lf.pack(fill="both", expand=True, padx=4, pady=4)
+        cols = ("metric","value","limit","note")
+        tv = ttk.Treeview(lf, columns=cols, show="headings", height=6)
+        for c, w in zip(cols, (200, 120, 120, 220)):
+            tv.heading(c, text=c.capitalize())
+            tv.column(c, width=w, anchor="w" if c in ("metric","note") else "center")
+        tv.pack(fill="both", expand=True)
+        for tag, bg in [("ok","#d9f2d9"),("warn","#fff2cc"),("bad","#f8d7da"),("na","#efefef")]:
+            tv.tag_configure(tag, background=bg)
+        return tv
+
+    status_scroll = ttk.Frame(tab_status_out)
+    status_scroll.grid(row=0, column=0, sticky="nsew")
+    status_scroll.columnconfigure(0, weight=1)
+
+    batt_table    = _make_status_tv(status_scroll, "Battery Status")
+    motor_table   = _make_status_tv(status_scroll, "Motor / ESC Status")
+    prop_table_tv = _make_status_tv(status_scroll, "Propeller Status")
+
+    def _clear_status_tables():
+        for tv in (batt_table, motor_table, prop_table_tv):
+            for iid in tv.get_children(): tv.delete(iid)
+
+    def _insert_status_row(tv, metric, val_str, lim_str, tag, note=""):
+        tv.insert("", "end", values=(metric, val_str, lim_str, note), tags=(tag,))
+
+    def update_status_tables_from_metrics(config: DroneConfig, metrics: dict):
+        _clear_status_tables()
+        Ipack = float(metrics.get("pack_current_A", 0.0))
+        Vload = float(metrics.get("v_load_V", 0.0))
+        Ptot  = float(metrics.get("total_power_W", 0.0))
+
+        Vmin = float(getattr(config.battery, "vmin_pack", 0.0))
+        tag_v = _status_color_tag(Vload, Vmin, "min") if Vmin > 0 else "na"
+        _insert_status_row(batt_table, "Pack voltage (loaded)", f"{Vload:.2f} V", f">= {Vmin:.2f} V", tag_v)
+
+        if getattr(config, 'max_tilt_deg', None) is not None and metrics.get('tilt_required_deg') is not None:
+            tilt_req = float(metrics['tilt_required_deg'])
+            tilt_lim = float(config.max_tilt_deg)
+            _insert_status_row(batt_table, "Tilt req vs max",
+                f"{tilt_req:.1f}° / {tilt_lim:.1f}°", f"<= {tilt_lim:.1f}°",
+                _status_color_tag(tilt_req, tilt_lim, 'max'))
+
+        Icont = float(getattr(config.battery, "discharge_cont_A", float("inf")))
+        Imax  = float(getattr(config.battery, "discharge_max_A",  float("inf")))
+        if math.isfinite(Icont):
+            _insert_status_row(batt_table, "Pack current", f"{Ipack:.2f} A",
+                f"<= {Icont:.2f} A (cont)", _status_color_tag(Ipack, Icont, "max"))
+        else:
+            _insert_status_row(batt_table, "Pack current", f"{Ipack:.2f} A", "cont: n/a", "na")
+        if math.isfinite(Imax):
+            _insert_status_row(batt_table, "Pack current (max)", f"{Ipack:.2f} A",
+                f"<= {Imax:.2f} A (max)", _status_color_tag(Ipack, Imax, "max"))
+        _insert_status_row(batt_table, "Total electrical power", f"{Ptot:.0f} W", "", "na")
+
+        Iesc      = float(metrics.get("motor_I_per_esc_A", 0.0))
+        Pmotor    = float(metrics.get("motor_power_W", 0.0))
+        Pmotor_pm = Pmotor / max(int(config.num_motors), 1)
+        _insert_status_row(motor_table, "Motor power / motor", f"{Pmotor_pm:.0f} W", "", "na")
+        if getattr(config.motor, "max_current", None) is not None:
+            _insert_status_row(motor_table, "Motor current / motor (est)", f"{Iesc:.2f} A",
+                f"<= {float(config.motor.max_current):.2f} A",
+                _status_color_tag(Iesc, float(config.motor.max_current), "max"))
+        if getattr(config.motor, "max_power", None) is not None:
+            _insert_status_row(motor_table, "Motor power / motor", f"{Pmotor_pm:.0f} W",
+                f"<= {float(config.motor.max_power):.0f} W",
+                _status_color_tag(Pmotor_pm, float(config.motor.max_power), "max"))
+        esc = getattr(config, "esc", None)
+        if esc is not None:
+            _insert_status_row(motor_table, "ESC current (cont)", f"{Iesc:.2f} A",
+                f"<= {float(esc.continuous_rating_A):.2f} A",
+                _status_color_tag(Iesc, float(esc.continuous_rating_A), "max"))
+            _insert_status_row(motor_table, "ESC current (max)", f"{Iesc:.2f} A",
+                f"<= {float(esc.max_current_A):.2f} A",
+                _status_color_tag(Iesc, float(esc.max_current_A), "max"))
+            _insert_status_row(motor_table, "ESC loss (total)",
+                f"{float(metrics.get('esc_loss_W',0)):.0f} W", "", "na")
+
+        thrust_pm_N = float(metrics.get("thrust_per_motor_N", 0.0))
+        thrust_pm_g = thrust_pm_N * 1000.0 / 9.81
+        max_thr_g   = float(getattr(config.propeller, "max_thrust_g", 0.0))
+        if max_thr_g > 0:
+            _insert_status_row(prop_table_tv, "Thrust / motor", f"{thrust_pm_g:.0f} g",
+                f"<= {max_thr_g:.0f} g", _status_color_tag(thrust_pm_g, max_thr_g, "max"))
+        else:
+            _insert_status_row(prop_table_tv, "Thrust / motor", f"{thrust_pm_g:.0f} g", "n/a", "na")
+        rpm = metrics.get("prop_rpm", None)
+        mr  = getattr(config.propeller, "max_rpm", None)
+        if rpm is not None and float(rpm) > 0 and mr is not None:
+            _insert_status_row(prop_table_tv, "Prop RPM (est)", f"{float(rpm):.0f} rpm",
+                f"<= {float(mr):.0f} rpm", _status_color_tag(float(rpm), float(mr), "max"))
+        else:
+            _insert_status_row(prop_table_tv, "Prop RPM (est)", "n/a",
+                f"<= {float(mr):.0f} rpm" if mr else "n/a", "na")
+
+    # ---- Metrics panel ----
+    metrics_container = ttk.Frame(tab_metrics_out, padding=4)
     metrics_container.grid(row=0, column=0, sticky="nsew")
     metrics_container.columnconfigure(0, weight=1)
     metrics_container.rowconfigure(0, weight=1)
 
-    metrics_tv = ttk.Treeview(metrics_container, columns=("metric", "value"), show="headings", height=18)
+    metrics_tv = ttk.Treeview(metrics_container, columns=("metric","value"),
+                               show="headings", height=28)
     metrics_tv.heading("metric", text="Metric")
-    metrics_tv.heading("value", text="Value")
+    metrics_tv.heading("value",  text="Value")
     metrics_tv.column("metric", width=280, anchor="w")
-    metrics_tv.column("value", width=260, anchor="w")
-
+    metrics_tv.column("value",  width=260, anchor="w")
     metrics_sb = ttk.Scrollbar(metrics_container, orient="vertical", command=metrics_tv.yview)
     metrics_tv.configure(yscrollcommand=metrics_sb.set)
-
     metrics_tv.grid(row=0, column=0, sticky="nsew")
     metrics_sb.grid(row=0, column=1, sticky="ns")
-
-    # Section header styling
     try:
-        _mstyle = ttk.Style()
-        _mstyle.configure("Metrics.Treeview", rowheight=24)
+        ttk.Style().configure("Metrics.Treeview", rowheight=24)
         metrics_tv.configure(style="Metrics.Treeview")
-        metrics_tv.tag_configure("section", font=("TkDefaultFont", 11, "bold"))
+        metrics_tv.tag_configure("section", font=("TkDefaultFont", 10, "bold"))
     except Exception:
         pass
 
-    def _metrics_clear() -> None:
-        for _iid in metrics_tv.get_children():
-            metrics_tv.delete(_iid)
+    def _metrics_clear():
+        for iid in metrics_tv.get_children(): metrics_tv.delete(iid)
 
-    def _metrics_add_section(title: str) -> None:
-        metrics_tv.insert("", "end", values=(title, ""), tags=("section",))
+    def _metrics_add_section(title: str):
+        metrics_tv.insert("", "end", values=(f"── {title} ──", ""), tags=("section",))
 
-    def _metrics_add(metric: str, value: str) -> None:
+    def _metrics_add(metric: str, value: str):
         metrics_tv.insert("", "end", values=(metric, value))
 
-    def update_metrics_tab(drone: DroneConfig, metrics: dict, speed_mps: float, orientation: str) -> None:
-        """Populate the Metrics tab for the last single-point run."""
+    def update_metrics_tab(drone: DroneConfig, metrics: dict, speed_mps: float, orientation: str):
         _metrics_clear()
-
         def fmt(x, nd=2):
-            try:
-                return f"{float(x):.{nd}f}"
-            except Exception:
-                return "n/a"
+            try: return f"{float(x):.{nd}f}"
+            except Exception: return "n/a"
 
         batt = drone.battery
-        nm = max(int(drone.num_motors), 1)
-        g0 = 9.80665
+        nm   = max(int(drone.num_motors), 1)
+        g0   = 9.80665
 
-        v_load = float(metrics.get("v_load_V", float("nan")))
-        I_pack = float(metrics.get("pack_current_A", float("nan")))
-        P_total = float(metrics.get("total_power_W", float("nan")))
-        P_motor_total = float(metrics.get("motor_power_W", 0.0))
-        P_periph = float(metrics.get("periph_power_W", 0.0))
-        P_esc_loss = float(metrics.get("esc_loss_W", 0.0))
+        v_load       = float(metrics.get("v_load_V",         float("nan")))
+        I_pack       = float(metrics.get("pack_current_A",   float("nan")))
+        P_total      = float(metrics.get("total_power_W",    float("nan")))
+        P_motor_total= float(metrics.get("motor_power_W",    0.0))
+        P_periph     = float(metrics.get("periph_power_W",   0.0))
+        P_esc_loss   = float(metrics.get("esc_loss_W",       0.0))
 
-        # Battery
-        cap_mAh = float(batt.pack_capacity_mAh) if batt.pack_capacity_mAh is not None else float(batt.capacity_mAh)
-        cap_Ah = cap_mAh / 1000.0 if cap_mAh else 0.0
-        usable_frac = max(0.0, min(1.0, float(getattr(batt, "discharge_percent", 100.0)) / 100.0))
-        usable_mAh = cap_mAh * usable_frac
-        usable_Wh = float(batt.capacity_Wh) * usable_frac
-        load_C = (I_pack / cap_Ah) if cap_Ah > 0 else float("nan")
+        cap_mAh     = float(batt.pack_capacity_mAh) if batt.pack_capacity_mAh is not None else float(batt.capacity_mAh)
+        cap_Ah      = cap_mAh / 1000.0 if cap_mAh else 0.0
+        usable_frac = max(0.0, min(1.0, float(getattr(batt,"discharge_percent",100.0)) / 100.0))
+        usable_mAh  = cap_mAh * usable_frac
+        usable_Wh   = float(batt.capacity_Wh) * usable_frac
+        load_C      = (I_pack / cap_Ah) if cap_Ah > 0 else float("nan")
 
-        # Flight time + range at this point
-        t_min = estimate_flight_time_minutes(drone, speed_mps, orientation=orientation)
+        t_min   = estimate_flight_time_minutes(drone, speed_mps, orientation=orientation)
         range_m = (t_min * 60.0) * float(speed_mps)
-        range_mi = (range_m / 1000.0) * 0.621371
+        range_mi= (range_m / 1000.0) * 0.621371
 
-        # Motor estimates per motor
         I_motor = float(metrics.get("motor_I_per_esc_A", float("nan")))
-        rpm = metrics.get("prop_rpm", None)
-        rpm = float(rpm) if rpm is not None else float("nan")
-        kv = getattr(drone.motor, "kv", None)
-        Rm = float(getattr(drone.motor, "resistance", 0.0))
-        I0 = float(getattr(drone.motor, "idle_current", 0.0))
+        rpm     = metrics.get("prop_rpm", None)
+        rpm     = float(rpm) if rpm is not None else float("nan")
+        kv      = getattr(drone.motor, "kv", None)
+        Rm      = float(getattr(drone.motor, "resistance", 0.0))
+        I0      = float(getattr(drone.motor, "idle_current", 0.0))
 
         V_emf = float("nan")
         if kv and kv > 0 and rpm == rpm:
@@ -2181,797 +2505,349 @@ def launch_gui():
         P_mech_motor = float("nan")
         if V_emf == V_emf and I_motor == I_motor:
             P_mech_motor = V_emf * max(0.0, I_motor - I0)
-        motor_eff = (P_mech_motor / P_elec_motor) if (P_mech_motor == P_mech_motor and P_elec_motor == P_elec_motor and P_elec_motor > 0) else float("nan")
+        motor_eff = (P_mech_motor / P_elec_motor) if (P_mech_motor==P_mech_motor and P_elec_motor==P_elec_motor and P_elec_motor > 0) else float("nan")
 
-        # Very rough temperature estimate
         T_est = float("nan")
         try:
             Imax = float(getattr(drone.motor, "max_current", 0.0))
             if Imax > 0 and I_motor == I_motor:
-                copper = (I_motor ** 2) * Rm
-                copper_max = (Imax ** 2) * Rm
-                T_amb = float(getattr(drone, "temperature_C", 25.0))
-                T_est = T_amb + 20.0 * (copper / max(1e-6, copper_max))
-        except Exception:
-            pass
+                copper = (I_motor**2) * Rm
+                T_est  = 25.0 + 20.0 * (copper / max(1e-6, (Imax**2) * Rm))
+        except Exception: pass
 
-        # Thrust / ratios
-        thrust_total_N = float(metrics.get("thrust_total_N", float("nan")))
-        thrust_pm_N = float(metrics.get("thrust_per_motor_N", float("nan")))
-        weight_kg = float(drone.weight_kg)
-        twr = (thrust_total_N / (weight_kg * g0)) if weight_kg > 0 else float("nan")
+        thrust_total_N = float(metrics.get("thrust_total_N",    float("nan")))
+        thrust_pm_N    = float(metrics.get("thrust_per_motor_N",float("nan")))
+        weight_kg      = float(drone.drone_weight_g) / 1000.0
+        twr            = (thrust_total_N / (weight_kg * g0)) if weight_kg > 0 else float("nan")
+        thrust_pm_g    = (thrust_pm_N / g0) * 1000.0 if thrust_pm_N == thrust_pm_N else float("nan")
+        spec_thrust    = (thrust_pm_g / P_elec_motor) if (P_elec_motor == P_elec_motor and P_elec_motor > 0 and thrust_pm_g == thrust_pm_g) else float("nan")
 
-        thrust_pm_g = (thrust_pm_N / g0) * 1000.0 if thrust_pm_N == thrust_pm_N else float("nan")
-        spec_thrust = (thrust_pm_g / P_elec_motor) if (P_elec_motor == P_elec_motor and P_elec_motor > 0 and thrust_pm_g == thrust_pm_g) else float("nan")
-
-        # Drive weight (motors + ESCs + props)
         drive_g = 0.0
-        if getattr(drone.motor, "weight_g", None) is not None:
-            drive_g += float(drone.motor.weight_g) * nm
-        if getattr(drone, "esc", None) is not None and getattr(drone.esc, "weight_g", None) is not None:
-            drive_g += float(drone.esc.weight_g) * nm
-        if getattr(drone.prop, "weight_g", None) is not None:
-            drive_g += float(drone.prop.weight_g) * nm
+        if getattr(drone.motor, "weight_g", None): drive_g += float(drone.motor.weight_g) * nm
+        if getattr(drone, "esc", None) and getattr(drone.esc,"weight_g",None): drive_g += float(drone.esc.weight_g) * nm
+        if getattr(drone.propeller, "weight_g", None): drive_g += float(drone.propeller.weight_g) * nm
 
-        # Total disc area
-        D_in = float(getattr(drone.prop, "diameter_in", 0.0))
-        D_m = D_in * 0.0254
-        A_disk = math.pi * (D_m / 2.0) ** 2
-        A_total_m2 = A_disk * nm
-        A_total_cm2 = A_total_m2 * 1e4
-        A_total_in2 = A_total_m2 / (0.0254 ** 2)
+        D_m = float(getattr(drone.propeller,"diameter_in",0.0)) * 0.0254
+        A_total = math.pi * (D_m/2)**2 * nm
 
-        # Total efficiencies / power-to-weight
         p2w_Wkg = (P_total / weight_kg) if weight_kg > 0 else float("nan")
-        P_out = max(0.0, P_total - P_esc_loss - P_periph)
-        eff_total = (P_out / P_total) if P_total > 0 else float("nan")
+        P_out   = max(0.0, P_total - P_esc_loss - P_periph)
+        eff_tot = (P_out / P_total) if P_total > 0 else float("nan")
+        tilt    = float(metrics.get("tilt_required_deg", float("nan")))
 
-        # Speed conversions
-        v_kmh = speed_mps * 3.6
-        v_mph = v_kmh * 0.621371
-
-        # Tilt
-        tilt = float(metrics.get("tilt_required_deg", float("nan")))
-        tilt_lim = metrics.get("tilt_limit_deg", None)
-
-        # Max additional payload from thrust margin
-        max_payload_kg = (thrust_total_N / g0) - weight_kg if thrust_total_N == thrust_total_N else float("nan")
-        max_payload_g = max_payload_kg * 1000.0 if max_payload_kg == max_payload_kg else float("nan")
-
-        # ---- Populate table ----
         _metrics_add_section("Battery")
-        _metrics_add("Load", f"{fmt(load_C, 2)} C")
-        _metrics_add("Voltage", f"{fmt(v_load, 2)} V")
-        _metrics_add("Rated Voltage", f"{fmt(batt.vmax_pack, 2)} V")
-        _metrics_add("Energy (usable)", f"{fmt(usable_Wh, 1)} Wh")
-        _metrics_add("Energy (total)", f"{fmt(float(batt.capacity_Wh), 1)} Wh")
-        _metrics_add("Total Capacity", f"{fmt(cap_mAh, 0)} mAh")
-        _metrics_add("Usable Capacity", f"{fmt(usable_mAh, 0)} mAh")
-        _metrics_add("Flight Time (this point)", f"{fmt(t_min, 2)} min")
-        _metrics_add("Battery Weight", f"{fmt(batt.weight_g, 0)} g")
+        _metrics_add("Load",              f"{fmt(load_C,2)} C")
+        _metrics_add("Voltage (loaded)",  f"{fmt(v_load,2)} V")
+        _metrics_add("Rated Voltage",     f"{fmt(batt.vmax_pack,2)} V")
+        _metrics_add("Energy (usable)",   f"{fmt(usable_Wh,1)} Wh")
+        _metrics_add("Energy (total)",    f"{fmt(float(batt.capacity_Wh),1)} Wh")
+        _metrics_add("Total Capacity",    f"{fmt(cap_mAh,0)} mAh")
+        _metrics_add("Usable Capacity",   f"{fmt(usable_mAh,0)} mAh")
+        _metrics_add("Flight Time",       f"{fmt(t_min,2)} min")
+        _metrics_add("Battery Weight",    f"{fmt(batt.weight_g,0)} g")
 
         _metrics_add_section("Motor @ Operating Point")
-        _metrics_add("Current", f"{fmt(I_motor, 2)} A")
-        _metrics_add("Voltage", f"{fmt(V_motor, 2)} V")
-        _metrics_add("RPM", f"{fmt(rpm, 0)} rpm")
-        _metrics_add("Thrust (per motor)", f"{fmt(thrust_pm_g, 0)} g")
-        _metrics_add("Thrust (total)", f"{fmt((thrust_total_N/g0)*1000.0, 0)} g")
-        _metrics_add("Electric Power", f"{fmt(P_elec_motor, 1)} W")
-        _metrics_add("Mechanical Power", f"{fmt(P_mech_motor, 1)} W")
-        _metrics_add("Throttle (log)", f"{fmt(throttle_log*100.0, 0)} %")
-        _metrics_add("Throttle (linear)", f"{fmt(throttle_linear*100.0, 0)} %")
-        if getattr(drone.motor, "weight_g", None):
-            _metrics_add("Power/Weight", f"{fmt(P_elec_motor / max(1e-6, (float(drone.motor.weight_g)/1000.0)), 1)} W/kg")
-        else:
-            _metrics_add("Power/Weight", "n/a")
-        _metrics_add("Efficiency", f"{fmt(motor_eff*100.0, 1)} %")
-        _metrics_add("Resistance (Rm)", f"{fmt(Rm*1000.0, 1)} mΩ")
-        _metrics_add("Specific Thrust", f"{fmt(spec_thrust, 2)} g/W")
-        _metrics_add("Est. Temperature", f"{fmt(T_est, 0)} °C")
+        _metrics_add("Current",            f"{fmt(I_motor,2)} A")
+        _metrics_add("Voltage",            f"{fmt(V_motor,2)} V")
+        _metrics_add("RPM",                f"{fmt(rpm,0)} rpm")
+        _metrics_add("Thrust (per motor)", f"{fmt(thrust_pm_g,0)} g")
+        _metrics_add("Thrust (total)",     f"{fmt((thrust_total_N/g0)*1000,0)} g")
+        _metrics_add("Electric Power",     f"{fmt(P_elec_motor,1)} W")
+        _metrics_add("Mechanical Power",   f"{fmt(P_mech_motor,1)} W")
+        _metrics_add("Throttle (log)",     f"{fmt(throttle_log*100,0)} %")
+        _metrics_add("Throttle (linear)",  f"{fmt(throttle_linear*100,0)} %")
+        _metrics_add("Efficiency",         f"{fmt(motor_eff*100,1)} %")
+        _metrics_add("Resistance Rm",      f"{fmt(Rm*1000,1)} mΩ")
+        _metrics_add("Specific Thrust",    f"{fmt(spec_thrust,2)} g/W")
+        _metrics_add("Est. Temperature",   f"{fmt(T_est,0)} °C")
 
         _metrics_add_section("Total Drive")
-        _metrics_add("Drive Weight", f"{fmt(drive_g, 0)} g")
-        _metrics_add("Thrust-Weight", f"{fmt(twr, 2)} : 1")
-        _metrics_add("Total Current", f"{fmt(I_pack, 2)} A")
-        _metrics_add("P(in)", f"{fmt(P_total, 1)} W")
-        _metrics_add("P(out)", f"{fmt(P_out, 1)} W")
-        _metrics_add("Total Efficiency", f"{fmt(eff_total*100.0, 1)} %")
-        _metrics_add("Total Power/Weight", f"{fmt(p2w_Wkg, 1)} W/kg")
+        _metrics_add("Drive Weight",       f"{fmt(drive_g,0)} g")
+        _metrics_add("Thrust-Weight Ratio",f"{fmt(twr,2)} : 1")
+        _metrics_add("Total Current",      f"{fmt(I_pack,2)} A")
+        _metrics_add("P(in)",              f"{fmt(P_total,1)} W")
+        _metrics_add("P(out)",             f"{fmt(P_out,1)} W")
+        _metrics_add("Total Efficiency",   f"{fmt(eff_tot*100,1)} %")
+        _metrics_add("Power / Weight",     f"{fmt(p2w_Wkg,1)} W/kg")
 
         _metrics_add_section("Multicopter")
-        _metrics_add("Vehicle Weight", f"{fmt(weight_kg*1000.0, 0)} g")
-        if tilt_lim is not None:
-            _metrics_add("Tilt required vs max", f"{fmt(tilt, 1)}° / {fmt(tilt_lim, 1)}°")
-        else:
-            _metrics_add("Tilt required", f"{fmt(tilt, 1)}°")
-        _metrics_add("Speed", f"{fmt(v_kmh, 0)} km/h  ({fmt(v_mph, 0)} mph)")
-        _metrics_add("Estimated Range", f"{fmt(range_m, 0)} m  ({fmt(range_mi, 2)} mi)")
-        _metrics_add("Total Disc Area", f"{fmt(A_total_cm2, 0)} cm²  ({fmt(A_total_in2, 0)} in²)")
-        _metrics_add("Max additional payload", f"{fmt(max_payload_g, 0)} g")
-    # ---------- Mission Plots tab (time-series over mission) ----------
-    mission_container = ttk.Frame(tab_mission_plots_out, padding=6)
+        _metrics_add("Vehicle Weight",     f"{fmt(weight_kg*1000,0)} g")
+        _metrics_add("Tilt Angle",         f"{fmt(tilt,1)} °")
+        _metrics_add("Speed",              f"{fmt(speed_mps*3.6,1)} km/h  ({fmt(speed_mps*2.237,1)} mph)")
+        _metrics_add("Estimated Range",    f"{fmt(range_m,0)} m  ({fmt(range_mi,2)} mi)")
+        _metrics_add("Total Disc Area",    f"{fmt(A_total*1e4,0)} cm²  ({fmt(A_total/(0.0254**2),0)} in²)")
+        max_pay_g = (thrust_total_N/g0 - weight_kg)*1000 if thrust_total_N==thrust_total_N else float("nan")
+        _metrics_add("Max Extra Payload",  f"{fmt(max_pay_g,0)} g")
+
+    # ---- Mission Plots panel ----
+    mission_container = ttk.Frame(tab_mission_plots_out, padding=4)
     mission_container.grid(row=0, column=0, sticky="nsew")
     mission_container.columnconfigure(0, weight=0)
     mission_container.columnconfigure(1, weight=1)
     mission_container.rowconfigure(0, weight=1)
 
-    mission_controls = ttk.LabelFrame(mission_container, text="Y-axis variables", padding=6)
-    mission_controls.grid(row=0, column=0, sticky="ns", padx=(0, 8))
-    mission_plot_frame = ttk.LabelFrame(mission_container, text="Mission plot", padding=6)
+    mission_controls  = ttk.LabelFrame(mission_container, text="Y-axis variables", padding=4)
+    mission_controls.grid(row=0, column=0, sticky="ns", padx=(0,8))
+    mission_plot_frame= ttk.LabelFrame(mission_container, text="Mission plot", padding=4)
     mission_plot_frame.grid(row=0, column=1, sticky="nsew")
     mission_plot_frame.columnconfigure(0, weight=1)
     mission_plot_frame.rowconfigure(0, weight=1)
 
-    ttk.Label(mission_controls, text="Select one or more variables to plot vs mission time.").grid(row=0, column=0, sticky="w")
-
+    ttk.Label(mission_controls, text="Select variables to plot vs mission time.").grid(
+        row=0, column=0, sticky="w")
     mission_var_list = tk.Listbox(mission_controls, selectmode="extended", height=16, exportselection=False)
-    mission_var_list.grid(row=1, column=0, sticky="nsew", pady=(6, 6))
+    mission_var_list.grid(row=1, column=0, sticky="nsew", pady=(4,4))
     mission_controls.rowconfigure(1, weight=1)
     mission_controls.columnconfigure(0, weight=1)
-
-    mission_list_sb = ttk.Scrollbar(mission_controls, orient="vertical", command=mission_var_list.yview)
-    mission_list_sb.grid(row=1, column=1, sticky="ns", pady=(6, 6))
-    mission_var_list.configure(yscrollcommand=mission_list_sb.set)
+    ml_sb = ttk.Scrollbar(mission_controls, orient="vertical", command=mission_var_list.yview)
+    ml_sb.grid(row=1, column=1, sticky="ns", pady=(4,4))
+    mission_var_list.configure(yscrollcommand=ml_sb.set)
 
     mission_btns = ttk.Frame(mission_controls)
     mission_btns.grid(row=2, column=0, columnspan=2, sticky="ew")
-    ttk.Button(mission_btns, text="Plot selected", command=lambda: update_mission_plot()).grid(row=0, column=0, padx=(0, 6))
-    ttk.Button(mission_btns, text="Clear", command=lambda: clear_mission_plot()).grid(row=0, column=1)
+    ttk.Button(mission_btns, text="Plot selected", command=lambda: _update_mission_plot()).grid(row=0, column=0, padx=(0,4))
+    ttk.Button(mission_btns, text="Clear", command=lambda: _clear_mission_plot()).grid(row=0, column=1)
 
-    # mission plot canvas state
-    mission_canvas = None
-    mission_fig = None
-    last_mission_series = None
+    mission_canvas_ref = [None]
+    last_mission_series = [None]
 
     MISSION_VARS = [
-        ("airspeed_mps", "Vehicle airspeed", "m/s"),
-        ("groundspeed_mps", "Ground speed", "m/s"),
-        ("distance_km", "Distance traveled", "km"),
-        ("altitude_m", "Altitude", "m"),
-        ("tilt_deg", "Tilt angle", "deg"),
-        ("battery_voltage_V", "Battery voltage (loaded)", "V"),
-        ("battery_current_A", "Battery current", "A"),
-        ("battery_energy_Wh", "Battery energy remaining", "Wh"),
-        ("battery_capacity_mAh", "Battery capacity remaining", "mAh"),
-        ("total_power_W", "Total power", "W"),
-        ("motor_power_W", "Motor power (total)", "W"),
-        ("motor_power_per_motor_W", "Motor power (per motor)", "W"),
-        ("motor_current_A", "Motor/ESC current (per ESC)", "A"),
-        ("motor_rpm", "Motor RPM", "rpm"),
-        ("motor_thrust_N", "Motor thrust (per motor)", "N"),
-        ("thrust_total_N", "Total thrust", "N"),
-        ("periph_power_W", "Avionics/peripherals power", "W"),
-        ("esc_loss_W", "ESC loss power", "W"),
+        ("airspeed_mps",        "Vehicle airspeed",              "m/s"),
+        ("groundspeed_mps",     "Ground speed",                  "m/s"),
+        ("distance_km",         "Distance traveled",             "km"),
+        ("altitude_m",          "Altitude",                      "m"),
+        ("tilt_deg",            "Tilt angle",                    "deg"),
+        ("battery_voltage_V",   "Battery voltage (loaded)",      "V"),
+        ("battery_current_A",   "Battery current",               "A"),
+        ("battery_energy_Wh",   "Battery energy remaining",      "Wh"),
+        ("battery_capacity_mAh","Battery capacity remaining",    "mAh"),
+        ("total_power_W",       "Total power",                   "W"),
+        ("motor_power_W",       "Motor power (total)",           "W"),
+        ("motor_power_per_motor_W","Motor power (per motor)",    "W"),
+        ("motor_current_A",     "Motor/ESC current (per ESC)",   "A"),
+        ("motor_rpm",           "Motor RPM",                     "rpm"),
+        ("motor_thrust_N",      "Motor thrust (per motor)",      "N"),
+        ("thrust_total_N",      "Total thrust",                  "N"),
+        ("periph_power_W",      "Avionics/peripherals power",    "W"),
+        ("esc_loss_W",          "ESC loss power",                "W"),
     ]
-
-    _mission_display_items = []  # parallel to listbox indices: (key,label,unit)
+    _mission_items = []
     for k, lbl, unit in MISSION_VARS:
         mission_var_list.insert(tk.END, f"{lbl} ({unit})")
-        _mission_display_items.append((k, lbl, unit))
+        _mission_items.append((k, lbl, unit))
 
-    def clear_mission_plot():
-        nonlocal mission_canvas, mission_fig
-        for w in mission_plot_frame.winfo_children():
-            w.destroy()
-        mission_canvas = None
-        mission_fig = None
+    def _clear_mission_plot():
+        for w in mission_plot_frame.winfo_children(): w.destroy()
+        mission_canvas_ref[0] = None
 
-    def show_mission_figure(fig):
-        nonlocal mission_canvas, mission_fig
-        for w in mission_plot_frame.winfo_children():
-            w.destroy()
-        mission_fig = fig
-        mission_canvas = FigureCanvasTkAgg(fig, master=mission_plot_frame)
-        try:
-            _apply_matplotlib_scale_to_fig(fig, float(ui_scale.get()))
-        except Exception:
-            pass
-        mission_canvas.draw()
-        mission_canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-
-    def update_mission_plot():
-        nonlocal last_mission_series
-        if last_mission_series is None:
-            messagebox.showinfo("Mission plot", "Run a mission simulation first to generate mission time series.")
-            return
+    def _update_mission_plot():
+        ms = last_mission_series[0]
+        if ms is None:
+            messagebox.showinfo("Mission plot", "Run a mission first."); return
         sel = list(mission_var_list.curselection())
         if not sel:
-            messagebox.showinfo("Mission plot", "Select one or more variables to plot.")
-            return
+            messagebox.showinfo("Mission plot", "Select at least one variable."); return
 
-        # Build figure with multiple y-axes (grouped by unit)
-        import matplotlib.pyplot as plt
-        fig = plt.Figure(figsize=(7.5, 4.5), dpi=100)
+        t_min = [x/60.0 for x in ms.get('t_s', [])]
+        if not t_min: return
+
+        import matplotlib.pyplot as _plt
+        fig = _plt.Figure(figsize=(7.5, 4.5), dpi=100)
         ax0 = fig.add_subplot(111)
-
-        t_min = [x / 60.0 for x in last_mission_series.get('t_s', [])]
-        if not t_min:
-            messagebox.showinfo("Mission plot", "Mission time series is empty.")
-            return
-
-        # Group selected variables by unit
-        selected_items = [_mission_display_items[i] for i in sel]
+        selected = [_mission_items[i] for i in sel]
         by_unit = {}
-        for key, lbl, unit in selected_items:
-            by_unit.setdefault(unit, []).append((key, lbl))
+        for k, lbl, unit in selected:
+            by_unit.setdefault(unit, []).append((k, lbl))
 
-        axes = []
-        unit_list = list(by_unit.keys())
-        if not unit_list:
-            return
-
-        # First unit on left axis
-        first_unit = unit_list[0]
-        axes.append((ax0, first_unit))
-        ax0.set_ylabel(first_unit)
-
-        # Additional units on right axes
-        for ui, unit in enumerate(unit_list[1:], start=1):
+        axes = [(ax0, list(by_unit.keys())[0])]
+        ax0.set_ylabel(list(by_unit.keys())[0])
+        for ui, unit in enumerate(list(by_unit.keys())[1:], 1):
             axn = ax0.twinx()
-            # offset spines so multiple y-axes don't overlap
-            axn.spines['right'].set_position(('outward', 55 * (ui - 0)))
+            axn.spines['right'].set_position(('outward', 55*(ui-0)))
             axn.set_ylabel(unit)
             axes.append((axn, unit))
 
-        # Plot each unit group
-        lines = []
-        labels = []
+        lines, labels = [], []
         for ax, unit in axes:
             for key, lbl in by_unit.get(unit, []):
-                y = last_mission_series.get(key, [])
-                if y is None:
-                    continue
-                # Replace NaN RPMs with None to avoid breaking autoscale
+                y = ms.get(key, [])
+                if y is None: continue
                 yy = []
                 for v in y:
-                    try:
-                        if isinstance(v, float) and (v != v):
-                            yy.append(float('nan'))
-                        else:
-                            yy.append(float(v))
-                    except Exception:
-                        yy.append(float('nan'))
+                    try: yy.append(float("nan") if isinstance(v,float) and v!=v else float(v))
+                    except Exception: yy.append(float("nan"))
                 ln, = ax.plot(t_min, yy, label=lbl)
-                lines.append(ln)
-                labels.append(lbl)
+                lines.append(ln); labels.append(lbl)
 
-        ax0.set_xlabel('Mission time (min)')
+        ax0.set_xlabel("Mission time (min)")
         ax0.grid(True)
-        fig.suptitle('Mission variables vs time')
-        if lines:
-            ax0.legend(lines, labels, loc='best')
+        fig.suptitle("Mission variables vs time")
+        if lines: ax0.legend(lines, labels, loc="best")
 
-        show_mission_figure(fig)
+        for w in mission_plot_frame.winfo_children(): w.destroy()
+        mc = FigureCanvasTkAgg(fig, master=mission_plot_frame)
+        mc.draw()
+        mc.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        mission_canvas_ref[0] = mc
 
-    # Scroll wheel for listbox
-    def _on_list_wheel(event):
-        if event.delta:
-            mission_var_list.yview_scroll(int(-1 * (event.delta / 120)), 'units')
-        return 'break'
-    mission_var_list.bind('<MouseWheel>', _on_list_wheel)
+    def _on_list_wheel(evt):
+        if evt.delta: mission_var_list.yview_scroll(int(-1*(evt.delta/120)), "units")
+        return "break"
+    mission_var_list.bind("<MouseWheel>", _on_list_wheel)
 
-    out_frame = ttk.LabelFrame(right, text="Output", padding=6)
-    out_frame.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+    # ---- Output text ----
+    out_frame = ttk.LabelFrame(right, text="Output", padding=4)
+    out_frame.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
     out_frame.columnconfigure(0, weight=1)
     out_frame.rowconfigure(0, weight=1)
 
-    out = tk.Text(out_frame, height=10, wrap="word", state="disabled")
-    out.grid(row=0, column=0, sticky="nsew")
-    sb = ttk.Scrollbar(out_frame, orient="vertical", command=out.yview)
-    sb.grid(row=0, column=1, sticky="ns")
-    out.configure(yscrollcommand=sb.set)
+    out_text = tk.Text(out_frame, height=8, wrap="word", state="disabled")
+    out_text.grid(row=0, column=0, sticky="nsew")
+    out_sb = ttk.Scrollbar(out_frame, orient="vertical", command=out_text.yview)
+    out_sb.grid(row=0, column=1, sticky="ns")
+    out_text.configure(yscrollcommand=out_sb.set)
 
-    # ---------- Status tab (color-coded limit tables) ----------
-    status_container = ttk.Frame(tab_status_out, padding=8)
-    status_container.grid(row=0, column=0, sticky="nsew")
-    status_container.columnconfigure(0, weight=1)
-    status_container.rowconfigure(0, weight=1)
-    status_container.rowconfigure(1, weight=1)
-    status_container.rowconfigure(2, weight=1)
+    def out_print(msg: str):
+        out_text.configure(state="normal")
+        out_text.delete("1.0", "end")
+        out_text.insert("end", msg)
+        out_text.configure(state="disabled")
 
-    # Treeview styling / row tags
-    style = ttk.Style()
-    try:
-        style.theme_use(style.theme_use())
-    except Exception:
-        pass
+    def out_append(msg: str):
+        out_text.configure(state="normal")
+        out_text.insert("end", msg + "\n")
+        out_text.see("end")
+        out_text.configure(state="disabled")
 
-    def _status_color_tag(value: float, limit: float, kind: str) -> str:
-        """Return tag name for status based on proximity to a max/min limit.
+    def clear_log():
+        out_text.configure(state="normal")
+        out_text.delete("1.0", "end")
+        out_text.configure(state="disabled")
 
-        kind: "max" or "min". Yellow when within 10% of the limit.
-        """
-        try:
-            v = float(value)
-            L = float(limit)
-        except Exception:
-            return "na"
-        if kind == "max":
-            if v > L:
-                return "bad"
-            if v > 0.9 * L:
-                return "warn"
-            return "ok"
-        else:  # min
-            if v < L:
-                return "bad"
-            if v < 1.1 * L:
-                return "warn"
-            return "ok"
-
-    def _apply_tree_tags(tv: ttk.Treeview):
-        # Tkinter Treeview row background colors are set via tags.
-        tv.tag_configure("ok", background="#d9f2d9")     # light green
-        tv.tag_configure("warn", background="#fff2cc")   # light yellow
-        tv.tag_configure("bad", background="#f8d7da")    # light red
-        tv.tag_configure("na", background="#efefef")     # light gray
-
-    def _make_status_table(parent, title: str) -> ttk.Treeview:
-        lf = ttk.LabelFrame(parent, text=title, padding=6)
-        lf.grid(sticky="nsew", padx=0, pady=(0, 8))
-        lf.columnconfigure(0, weight=1)
-        lf.rowconfigure(0, weight=1)
-
-        cols = ("metric", "value", "limit", "note")
-        tv = ttk.Treeview(lf, columns=cols, show="headings", height=6)
-        tv.heading("metric", text="Metric")
-        tv.heading("value", text="Value")
-        tv.heading("limit", text="Limit")
-        tv.heading("note", text="Notes")
-        tv.column("metric", width=180, anchor="w")
-        tv.column("value", width=110, anchor="center")
-        tv.column("limit", width=110, anchor="center")
-        tv.column("note", width=220, anchor="w")
-        tv.grid(row=0, column=0, sticky="nsew")
-
-        sbv = ttk.Scrollbar(lf, orient="vertical", command=tv.yview)
-        sbv.grid(row=0, column=1, sticky="ns")
-        tv.configure(yscrollcommand=sbv.set)
-        _apply_tree_tags(tv)
-        return tv
-
-    batt_table = _make_status_table(status_container, "Battery Status")
-    status_container.rowconfigure(0, weight=1)
-    batt_table.master.grid(row=0, column=0, sticky="nsew")
-
-    motor_table = _make_status_table(status_container, "Motor/ESC Status")
-    status_container.rowconfigure(1, weight=1)
-    motor_table.master.grid(row=1, column=0, sticky="nsew")
-
-    prop_table_tv = _make_status_table(status_container, "Propeller Status")
-    status_container.rowconfigure(2, weight=1)
-    prop_table_tv.master.grid(row=2, column=0, sticky="nsew")
-
-    def _clear_status_tables():
-        for tv in (batt_table, motor_table, prop_table_tv):
-            for iid in tv.get_children():
-                tv.delete(iid)
-
-    def _insert_status_row(tv: ttk.Treeview, metric: str, value_str: str, limit_str: str, tag: str, note: str = ""):
-        tv.insert("", "end", values=(metric, value_str, limit_str, note), tags=(tag,))
-
-    def update_status_tables_from_metrics(config: DroneConfig, metrics: dict):
-        """Populate the Status tab tables based on computed metrics at the last run.
-
-        metrics should include keys like:
-          pack_current_A, v_load_V, total_power_W, motor_I_per_esc_A, esc_loss_W,
-          thrust_total_N, thrust_per_motor_N, prop_rpm (optional)
-        """
-        _clear_status_tables()
-
-        # ---- Battery ----
-        Ipack = float(metrics.get("pack_current_A", 0.0))
-        Vload = float(metrics.get("v_load_V", 0.0))
-        Ptot = float(metrics.get("total_power_W", 0.0))
-
-        # Voltage min check
-        Vmin = float(getattr(config.battery, "vmin_pack", 0.0))
-        tag_v = _status_color_tag(Vload, Vmin, "min") if Vmin > 0 else "na"
-        _insert_status_row(batt_table, "Pack voltage (loaded)", f"{Vload:.2f} V", f">= {Vmin:.2f} V", tag_v)
-
-        # Max tilt check (forward flight). If no limit, omit.
-        if getattr(config, 'max_tilt_deg', None) is not None and metrics.get('tilt_required_deg', None) is not None:
-            tilt_req = float(metrics.get('tilt_required_deg', 0.0))
-            tilt_lim = float(config.max_tilt_deg)
-            tag_t = _status_color_tag(tilt_req, tilt_lim, 'max')
-            _insert_status_row(
-                batt_table,
-                "Tilt required vs max tilt",
-                f"{tilt_req:.1f}° / {tilt_lim:.1f}°",
-                f"<= {tilt_lim:.1f}°",
-                tag_t,
-            )
-
-        # Continuous and max discharge checks (if finite)
-        Icont = float(getattr(config.battery, "discharge_cont_A", float("inf")))
-        Imax = float(getattr(config.battery, "discharge_max_A", float("inf")))
-        if math.isfinite(Icont):
-            tag_c = _status_color_tag(Ipack, Icont, "max")
-            _insert_status_row(batt_table, "Pack current", f"{Ipack:.2f} A", f"<= {Icont:.2f} A (cont)", tag_c)
-        else:
-            _insert_status_row(batt_table, "Pack current", f"{Ipack:.2f} A", "cont: n/a", "na")
-        if math.isfinite(Imax):
-            tag_m = _status_color_tag(Ipack, Imax, "max")
-            _insert_status_row(batt_table, "Pack current (max)", f"{Ipack:.2f} A", f"<= {Imax:.2f} A (max)", tag_m)
-        else:
-            _insert_status_row(batt_table, "Pack current (max)", f"{Ipack:.2f} A", "max: n/a", "na")
-
-        _insert_status_row(batt_table, "Total electrical power", f"{Ptot:.0f} W", "", "na")
-
-        # Optional battery metric limits if user added them (checked dynamically)
-        # Convention: any attribute on battery named like "max_<something>" / "min_<something>" with a matching metric in dict.
-        for k, v in sorted(metrics.items()):
-            if not isinstance(k, str):
-                continue
-            if k.startswith("battery_"):
-                # allow user to pass extra battery metrics (battery_temp_C, etc.)
-                base = k[len("battery_"):]
-                max_attr = f"max_{base}"
-                min_attr = f"min_{base}"
-                if hasattr(config.battery, max_attr):
-                    L = getattr(config.battery, max_attr)
-                    if L is not None:
-                        tag = _status_color_tag(float(v), float(L), "max")
-                        _insert_status_row(batt_table, base, f"{float(v):.3g}", f"<= {float(L):.3g}", tag)
-                if hasattr(config.battery, min_attr):
-                    L = getattr(config.battery, min_attr)
-                    if L is not None:
-                        tag = _status_color_tag(float(v), float(L), "min")
-                        _insert_status_row(batt_table, base, f"{float(v):.3g}", f">= {float(L):.3g}", tag)
-
-        # ---- Motor / ESC ----
-        Iesc = float(metrics.get("motor_I_per_esc_A", 0.0))
-        Pmotor = float(metrics.get("motor_power_W", 0.0))
-        Pmotor_per = Pmotor / max(int(config.num_motors), 1)
-        _insert_status_row(motor_table, "Motor elec power / motor", f"{Pmotor_per:.0f} W", "", "na")
-
-        # Motor max current/power limits
-        if getattr(config.motor, "max_current", None) is not None:
-            tag = _status_color_tag(Iesc, float(config.motor.max_current), "max")
-            _insert_status_row(motor_table, "Motor current / motor (est)", f"{Iesc:.2f} A", f"<= {float(config.motor.max_current):.2f} A", tag)
-        else:
-            _insert_status_row(motor_table, "Motor current / motor (est)", f"{Iesc:.2f} A", "n/a", "na")
-        if getattr(config.motor, "max_power", None) is not None:
-            tag = _status_color_tag(Pmotor_per, float(config.motor.max_power), "max")
-            _insert_status_row(motor_table, "Motor power / motor", f"{Pmotor_per:.0f} W", f"<= {float(config.motor.max_power):.0f} W", tag)
-        else:
-            _insert_status_row(motor_table, "Motor power / motor", f"{Pmotor_per:.0f} W", "n/a", "na")
-
-        # ESC checks
-        esc = getattr(config, "esc", None)
-        if esc is not None:
-            tag_ec = _status_color_tag(Iesc, float(esc.continuous_rating_A), "max")
-            _insert_status_row(motor_table, "ESC current / ESC", f"{Iesc:.2f} A", f"<= {float(esc.continuous_rating_A):.2f} A (cont)", tag_ec)
-            tag_em = _status_color_tag(Iesc, float(esc.max_current_A), "max")
-            _insert_status_row(motor_table, "ESC current / ESC (max)", f"{Iesc:.2f} A", f"<= {float(esc.max_current_A):.2f} A (max)", tag_em)
-            Pesc_loss = float(metrics.get("esc_loss_W", 0.0))
-            _insert_status_row(motor_table, "ESC loss (total)", f"{Pesc_loss:.0f} W", "", "na")
-            note = str(metrics.get("esc_note", ""))
-            if note.strip():
-                _insert_status_row(motor_table, "ESC note", "", "", "na", note=note)
-
-        # ---- Propeller ----
-        thrust_per_N = float(metrics.get("thrust_per_motor_N", 0.0))
-        thrust_per_g = thrust_per_N * 1000.0 / 9.81
-        max_thrust_g = float(getattr(config.propeller, "max_thrust_g", 0.0))
-        if max_thrust_g > 0:
-            tag = _status_color_tag(thrust_per_g, max_thrust_g, "max")
-            _insert_status_row(prop_table_tv, "Thrust / motor", f"{thrust_per_g:.0f} g", f"<= {max_thrust_g:.0f} g", tag)
-        else:
-            _insert_status_row(prop_table_tv, "Thrust / motor", f"{thrust_per_g:.0f} g", "n/a", "na")
-
-        rpm = metrics.get("prop_rpm", None)
-        if rpm is not None and float(rpm) > 0 and getattr(config.propeller, "max_rpm", None) is not None:
-            tag = _status_color_tag(float(rpm), float(config.propeller.max_rpm), "max")
-            _insert_status_row(prop_table_tv, "Prop RPM (est)", f"{float(rpm):.0f} rpm", f"<= {float(config.propeller.max_rpm):.0f} rpm", tag)
-        else:
-            # show max RPM anyway
-            mr = getattr(config.propeller, "max_rpm", None)
-            _insert_status_row(prop_table_tv, "Prop RPM (est)", "n/a", f"<= {float(mr):.0f} rpm" if mr is not None else "n/a", "na")
-
-        # Any additional prop metrics user provided (dynamic)
-        for k, v in sorted(metrics.items()):
-            if not isinstance(k, str):
-                continue
-            if k.startswith("prop_"):
-                base = k[len("prop_"):]
-                max_attr = f"max_{base}"
-                min_attr = f"min_{base}"
-                if hasattr(config.propeller, max_attr):
-                    L = getattr(config.propeller, max_attr)
-                    if L is not None:
-                        tag = _status_color_tag(float(v), float(L), "max")
-                        _insert_status_row(prop_table_tv, base, f"{float(v):.3g}", f"<= {float(L):.3g}", tag)
-                if hasattr(config.propeller, min_attr):
-                    L = getattr(config.propeller, min_attr)
-                    if L is not None:
-                        tag = _status_color_tag(float(v), float(L), "min")
-                        _insert_status_row(prop_table_tv, base, f"{float(v):.3g}", f">= {float(L):.3g}", tag)
-
-
-    # ---------- Save/Load Configuration ----------
-    # Collect all Tk variables named v_* so we can persist/restore the GUI state.
-    config_vars = {k: v for k, v in locals().items() if k.startswith("v_") and isinstance(v, tk.Variable)}
-
-    def _extract_avionics_rails_from_table() -> list[dict]:
-        rails: list[dict] = []
-        for iid in avionics_tree.get_children():
-            v_str, i_str, e_str = avionics_tree.item(iid, "values")
-            try:
-                rails.append({
-                    "voltage": float(v_str),
-                    "current": float(i_str),
-                    "eff": float(e_str),
-                })
-            except Exception:
-                continue
-        rails.sort(key=lambda r: r["voltage"])
-        return rails
-
-    def _populate_avionics_table_from_rails(rails: list[dict]) -> None:
-        for iid in avionics_tree.get_children():
-            avionics_tree.delete(iid)
-        for r in sorted(rails, key=lambda x: float(x.get("voltage", 0.0))):
-            try:
-                v = float(r.get("voltage"))
-                i = float(r.get("current"))
-                e = float(r.get("eff"))
-            except Exception:
-                continue
-            avionics_tree.insert("", "end", values=(f"{v:g}", f"{i:g}", f"{e:g}"))
-        try:
-            _sync_voltage_tree_var_from_table()
-        except Exception:
-            pass
-
-    def save_config_to_file(path: str) -> None:
-        data = {
-            "schema": "multicopter_power_sim_gui_config",
-            "version": 1,
-            "vars": {k: v.get() for k, v in config_vars.items()},
-            "avionics_rails": _extract_avionics_rails_from_table(),
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-
-    def load_config_from_file(path: str) -> None:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        vars_block = data.get("vars", {}) if isinstance(data, dict) else {}
-        if isinstance(vars_block, dict):
-            for k, val in vars_block.items():
-                if k in config_vars:
-                    try:
-                        config_vars[k].set("" if val is None else str(val))
-                    except Exception:
-                        pass
-
-        rails = data.get("avionics_rails", None) if isinstance(data, dict) else None
-        if isinstance(rails, list):
-            _populate_avionics_table_from_rails(rails)
-        else:
-            try:
-                d = parse_avionics_voltage_tree(v_avionics_voltage_tree.get().strip())
-                _populate_avionics_table_from_rails(
-                    [{"voltage": v, "current": ci[0], "eff": ci[1]} for v, ci in d.items()]
-                )
-            except Exception:
-                pass
-
-        try:
-            on_unit_mode_change()
-        except Exception:
-            pass
-
-    def prompt_save_config():
-        path = filedialog.asksaveasfilename(
-            title="Save configuration",
-            defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
-        )
-        if not path:
-            return
-        try:
-            save_config_to_file(path)
-            messagebox.showinfo("Saved", f"Saved configuration to:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Error saving config", str(e))
-
-    def prompt_load_config():
-        path = filedialog.askopenfilename(
-            title="Load configuration",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
-        )
-        if not path:
-            return
-        try:
-            load_config_from_file(path)
-            messagebox.showinfo("Loaded", f"Loaded configuration from:\n{path}")
-        except Exception as e:
-            messagebox.showerror("Error loading config", str(e))
-
-    # Wire menu items (File -> Load/Save)
-    try:
-        file_menu.add_command(label="Load Config...", command=prompt_load_config)
-        file_menu.add_command(label="Save Config...", command=prompt_save_config)
-        file_menu.add_separator()
-    except Exception:
-        pass
-
-    # Buttons
-    btns = ttk.Frame(main)
-    btns.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-    btns.columnconfigure(0, weight=1)
-
-    # Matplotlib canvas placeholder
-    canvas = None
-    current_canvas = None
-    current_fig = None
-
+    # ================================================================== #
+    #  BUILD CONFIG FROM GUI                                              #
+    # ================================================================== #
     def build_config_from_gui() -> DroneConfig:
-        # Battery
         batt = BatteryConfig(
-            chemistry=v_batt_chem.get().strip() or None,
-            operating_voltage_min=parse_float("Vmin/cell", v_batt_vmin.get()),
-            operating_voltage_nominal=parse_float("Vnom/cell", v_batt_vnom.get()),
-            operating_voltage_max=parse_float("Vmax/cell", v_batt_vmax.get()),
-            cell_capacity_mAh=parse_float("Cell capacity", v_batt_cell_capacity.get()),
-            pack_capacity_mAh=parse_float("Pack capacity", v_batt_pack_capacity.get()),
-            cell_weight_g=parse_float("Cell weight", v_batt_cell_weight.get()),
-            pack_weight_g=parse_float("Pack weight", v_batt_pack_weight.get()),
-            unit_energy_density=parse_float("Energy density", v_batt_energy_density.get()),
-            charge_current_max=parse_float("Max charge current", v_batt_chg.get()),
-            discharge_cont_A=parse_float("Cont discharge current", v_batt_a_cont.get()),
-            discharge_max_A=parse_float("Max discharge current", v_batt_a_max.get()),
-            discharge_c_cont=parse_float("Cont C-rate", v_batt_c_cont.get()),
-            discharge_c_max=parse_float("Max C-rate", v_batt_c_max.get()),
-            discharge_percent=parse_float("Discharge usable %", v_batt_dischg_pct.get()),
-            resistance_cell_mOhm=parse_float("Rcell", v_batt_r.get()),
-            series_units=parse_int("Series units", v_batt_series.get()),
-            parallel_units=parse_int("Parallel units", v_batt_parallel.get()),
-            cells_series_per_unit=parse_int("Cells in series per unit", v_batt_cells_series.get()),
-            cells_parallel_per_unit=parse_int("Cells in parallel per unit", v_batt_cells_parallel.get()),
+            chemistry              = v_batt_chem.get().strip() or None,
+            operating_voltage_min  = parse_float("Vmin/cell", v_batt_vmin.get()),
+            operating_voltage_nominal = parse_float("Vnom/cell", v_batt_vnom.get()),
+            operating_voltage_max  = parse_float("Vmax/cell", v_batt_vmax.get()),
+            cell_capacity_mAh      = parse_float("Cell capacity", v_batt_cell_capacity.get()),
+            pack_capacity_mAh      = parse_float("Pack capacity", v_batt_pack_capacity.get()),
+            cell_weight_g          = parse_float("Cell weight", v_batt_cell_weight.get()),
+            pack_weight_g          = parse_float("Pack weight", v_batt_pack_weight.get()),
+            unit_energy_density    = parse_float("Energy density", v_batt_energy_density.get()),
+            charge_current_max     = parse_float("Max charge current", v_batt_chg.get()),
+            discharge_cont_A       = parse_float("Cont discharge", v_batt_a_cont.get()),
+            discharge_max_A        = parse_float("Max discharge", v_batt_a_max.get()),
+            discharge_c_cont       = parse_float("Cont C-rate", v_batt_c_cont.get()),
+            discharge_c_max        = parse_float("Max C-rate", v_batt_c_max.get()),
+            discharge_percent      = parse_float("Discharge %", v_batt_dischg_pct.get()),
+            resistance_cell_mOhm   = parse_float("Rcell", v_batt_r.get()),
+            series_units           = parse_int("Series units", v_batt_series.get()),
+            parallel_units         = parse_int("Parallel units", v_batt_parallel.get()),
+            cells_series_per_unit  = parse_int("Cells series/unit", v_batt_cells_series.get()),
+            cells_parallel_per_unit= parse_int("Cells parallel/unit", v_batt_cells_parallel.get()),
         )
-
-        # Motor
         motor = MotorConfig(
-            kv=parse_float("Kv", v_motor_kv.get()),
-            idle_current=parse_float("Idle current", v_motor_i0.get()),
-            idle_voltage=parse_float("Idle voltage", v_motor_v0.get()),
-            rated_voltage=parse_int("Rated voltage", v_motor_rated_v.get()),
-            resistance=parse_float("Motor resistance", v_motor_r.get()),
-            max_current=parse_float("Motor max current", v_motor_imax.get()),
-            max_power=parse_float("Motor max power", v_motor_pmax.get()),
-            pole_count=parse_int("Motor pole count", v_motor_pole_count.get()),
-            weight_g=parse_float("Motor weight", v_motor_weight.get()),
-            size_mm=v_motor_size.get().strip() or None,
+            kv            = parse_float("Kv", v_motor_kv.get()),
+            idle_current  = parse_float("Idle current", v_motor_i0.get()),
+            idle_voltage  = parse_float("Idle voltage", v_motor_v0.get()),
+            rated_voltage = parse_int("Rated voltage", v_motor_rated_v.get()),
+            resistance    = parse_float("Motor resistance", v_motor_r.get()),
+            max_current   = parse_float("Motor max current", v_motor_imax.get()),
+            max_power     = parse_float("Motor max power", v_motor_pmax.get()),
+            pole_count    = parse_int("Pole count", v_motor_pole_count.get()),
+            weight_g      = parse_float("Motor weight", v_motor_weight.get()),
+            size_mm       = v_motor_size.get().strip() or None,
         )
-
-        # ESC (optional)
         esc = None
-        _esc_fields = [
-            v_esc_voltage_rating.get().strip(),
-            v_esc_cont_current.get().strip(),
-            v_esc_max_current.get().strip(),
-            v_esc_idle_current.get().strip(),
-            v_esc_r.get().strip(),
-            v_esc_weight.get().strip(),
-        ]
-        if any(_esc_fields):
+        _ef = [v_esc_voltage_rating.get().strip(), v_esc_cont_current.get().strip(),
+               v_esc_max_current.get().strip(), v_esc_idle_current.get().strip(),
+               v_esc_r.get().strip(), v_esc_weight.get().strip()]
+        if any(_ef):
             esc = ESCConfig(
-                voltage_rating=parse_int("ESC voltage rating (S)", v_esc_voltage_rating.get()),
-                continuous_current_A=parse_float("ESC continuous current", v_esc_cont_current.get()),
-                max_current_A=parse_float("ESC max current", v_esc_max_current.get()),
-                idle_current_A=parse_float("ESC idle current", v_esc_idle_current.get()),
-                resistance=parse_float("ESC resistance", v_esc_r.get()),
-                weight_g=parse_float("ESC weight", v_esc_weight.get()),
+                voltage_rating       = parse_int("ESC voltage rating", v_esc_voltage_rating.get()),
+                continuous_current_A = parse_float("ESC cont current", v_esc_cont_current.get()),
+                max_current_A        = parse_float("ESC max current", v_esc_max_current.get()),
+                idle_current_A       = parse_float("ESC idle current", v_esc_idle_current.get()),
+                resistance           = parse_float("ESC resistance", v_esc_r.get()),
+                weight_g             = parse_float("ESC weight", v_esc_weight.get()),
             )
+        avionics = AvionicsConfig(voltage_tree=_get_voltage_tree_from_table())
 
-        # Avionics
-        avionics = AvionicsConfig(
-            voltage_tree=_get_voltage_tree_from_table(),
-        )
-
-        # Prop
-        prop_table = v_prop_table.get().strip() or None
-        tconst = v_prop_tconst.get().strip()
-        pconst = v_prop_pconst.get().strip()
+        prop_table_path = v_prop_table.get().strip() or None
+        tc = v_prop_tconst.get().strip(); pc = v_prop_pconst.get().strip()
         prop = PropellerConfig(
-            diameter_in=parse_float("Prop diameter", v_prop_d.get()),
-            pitch_in=parse_float("Prop pitch", v_prop_pitch.get()),
-            max_rpm=parse_float("Prop max RPM", v_prop_max_rpm.get()),
-            max_thrust_g=parse_float("Prop max thrust", v_prop_max_thrust.get()),
-            blades=parse_int("Prop blades", v_prop_blades.get()),
-            table_csv=prop_table,
-            TConst=float(tconst) if tconst else None,
-            PConst=float(pconst) if pconst else None,
-            weight_g=parse_float("Prop weight", v_prop_weight.get()),
+            diameter_in  = parse_float("Prop diameter", v_prop_d.get()),
+            pitch_in     = parse_float("Prop pitch", v_prop_pitch.get()),
+            max_rpm      = parse_float("Prop max RPM", v_prop_max_rpm.get()),
+            max_thrust_g = parse_float("Prop max thrust", v_prop_max_thrust.get()),
+            blades       = parse_int("Prop blades", v_prop_blades.get()),
+            table_csv    = prop_table_path,
+            TConst       = float(tc) if tc else None,
+            PConst       = float(pc) if pc else None,
+            weight_g     = parse_float("Prop weight", v_prop_weight.get()),
         )
-
         drone = DroneConfig(
-            num_motors=parse_int("Num motors", v_num_motors.get()),
-            battery=batt,
-            motor=motor,
-            propeller=prop,
-            drone_weight_g=parse_float("Weight", v_weight.get()),
-            profile_drag_coefficient=(parse_float("Profile Cd", v_profile_drag.get()) if v_profile_drag.get().strip() else 0.0),
-            profile_area=(parse_float("Profile area", v_profile_area.get()) if v_profile_area.get().strip() else 0.0),
-            parasite_drag_coefficient=(parse_float("Parasite Cd", v_parasite_drag.get()) if v_parasite_drag.get().strip() else 0.0),
-            parasite_area=(parse_float("Parasite area", v_parasite_area.get()) if v_parasite_area.get().strip() else 0.0),
-            frontal_area=(parse_float("Frontal area", v_area.get()) if v_area.get().strip() else 0.0),
-            cruise_speed=parse_float("Cruise speed", v_speed.get()),
-            periph_current=parse_float("Peripheral current", v_periph_current.get()),
-            esc=esc,
-            avionics=avionics,
-            air_density=AIR_DENSITY,
-            body_length_m=(parse_float("Body length", v_body_length_m.get()) if v_body_length_m.get().strip() else None),
-            body_width_m=(parse_float("Body width", v_body_width_m.get()) if v_body_width_m.get().strip() else None),
-            body_height_m=(parse_float("Body height", v_body_height_m.get()) if v_body_height_m.get().strip() else None),
-            arm_length_m=(parse_float("Arm length", v_arm_length_m.get()) if v_arm_length_m.get().strip() else None),
-            arm_width_m=(parse_float("Arm width", v_arm_width_m.get()) if v_arm_width_m.get().strip() else None),
-            coaxial_spacing_m=(parse_float("Coaxial spacing", v_coaxial_spacing_m.get()) if v_coaxial_spacing_m.get().strip() else None),
-            max_tilt_deg=(parse_float("Max tilt", v_max_tilt_deg.get()) if v_max_tilt_deg.get().strip() else None),
-            motor_configuration=(v_motor_configuration.get().strip().lower() or "flat"),
+            num_motors               = parse_int("Num motors", v_num_motors.get()),
+            battery                  = batt,
+            motor                    = motor,
+            propeller                = prop,
+            drone_weight_g           = parse_float("Weight", v_weight.get()),
+            profile_drag_coefficient = (parse_float("Profile Cd", v_profile_drag.get()) if v_profile_drag.get().strip() else 0.0),
+            profile_area             = (parse_float("Profile area", v_profile_area.get()) if v_profile_area.get().strip() else 0.0),
+            parasite_drag_coefficient= (parse_float("Parasite Cd", v_parasite_drag.get()) if v_parasite_drag.get().strip() else 0.0),
+            parasite_area            = (parse_float("Parasite area", v_parasite_area.get()) if v_parasite_area.get().strip() else 0.0),
+            frontal_area             = (parse_float("Frontal area", v_area.get()) if v_area.get().strip() else 0.0),
+            cruise_speed             = parse_float("Cruise speed", v_speed.get()),
+            periph_current           = parse_float("Peripheral current", v_periph_current.get()),
+            esc                      = esc,
+            avionics                 = avionics,
+            air_density              = AIR_DENSITY,
+            body_length_m            = (parse_float("Body length", v_body_length_m.get()) if v_body_length_m.get().strip() else None),
+            body_width_m             = (parse_float("Body width", v_body_width_m.get()) if v_body_width_m.get().strip() else None),
+            body_height_m            = (parse_float("Body height", v_body_height_m.get()) if v_body_height_m.get().strip() else None),
+            arm_length_m             = (parse_float("Arm length", v_arm_length_m.get()) if v_arm_length_m.get().strip() else None),
+            arm_width_m              = (parse_float("Arm width", v_arm_width_m.get()) if v_arm_width_m.get().strip() else None),
+            coaxial_spacing_m        = (parse_float("Coaxial spacing", v_coaxial_spacing_m.get()) if v_coaxial_spacing_m.get().strip() else None),
+            max_tilt_deg             = (parse_float("Max tilt", v_max_tilt_deg.get()) if v_max_tilt_deg.get().strip() else None),
+            motor_configuration      = (v_motor_configuration.get().strip().lower() or "flat"),
         )
-
-        # Env initial density
-        alt = parse_float("Altitude", v_alt.get())
+        alt  = parse_float("Altitude", v_alt.get())
         temp = v_temp.get().strip()
         pres = v_press.get().strip()
         drone.air_density = compute_air_density(
-            altitude_m=alt,
-            temperature_C=float(temp) if temp else None,
-            pressure_Pa=float(pres) if pres else None,
+            altitude_m    = alt,
+            temperature_C = float(temp) if temp else None,
+            pressure_Pa   = float(pres) if pres else None,
         )
         return drone
 
-    def show_figure(fig):
-        nonlocal canvas
-        # Clear old
-        for w in plot_frame.winfo_children():
-            w.destroy()
-        nonlocal current_canvas, current_fig
-        current_fig = fig
-        canvas = FigureCanvasTkAgg(fig, master=plot_frame)
-        current_canvas = canvas
-        try:
-            _apply_matplotlib_scale_to_fig(fig, float(ui_scale.get()))
-        except Exception:
-            pass
-        canvas.draw()
-        canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-
-
-    def _estimate_prop_rpm_if_possible(drone: DroneConfig, thrust_per_motor_N: float) -> Optional[float]:
-        """Estimate prop RPM if we have TConst available (same model used in motor_power_from_params).
-
-        Returns None if not computable.
-        """
+    # ================================================================== #
+    #  OPERATING METRICS                                                  #
+    # ================================================================== #
+    def _estimate_prop_rpm(drone: DroneConfig, thrust_per_motor_N: float) -> Optional[float]:
         try:
             if not (drone.propeller.TConst and drone.propeller.PConst):
                 return None
-            D = drone.propeller.diameter_in * 0.0254
+            D   = drone.propeller.diameter_in * 0.0254
             rho = drone.air_density
-            low, high = 100.0, 40000.0
-            rpm_solution = None
+            lo, hi = 100.0, 40000.0
+            sol = None
             for _ in range(40):
-                mid = 0.5 * (low + high)
-                n = mid / 60.0
-                thrust = float(drone.propeller.TConst) * rho * (n**2) * (D**4)
-                if thrust < thrust_per_motor_N:
-                    low = mid
-                else:
-                    high = mid
-                    rpm_solution = mid
-            return float(rpm_solution) if rpm_solution is not None else None
+                mid = 0.5*(lo+hi)
+                n   = mid/60.0
+                T   = float(drone.propeller.TConst)*rho*(n**2)*(D**4)
+                if T < thrust_per_motor_N: lo = mid
+                else: hi = mid; sol = mid
+            return float(sol) if sol is not None else None
         except Exception:
             return None
 
     def compute_operating_metrics(drone: DroneConfig, speed_mps: float, orientation: str, wind_mps: float = 0.0) -> dict:
-        """Compute a consistent set of metrics for status/limit checking at an operating point."""
         airspeed = float(speed_mps)
-        # simple wind model: +wind is headwind -> higher airspeed for same groundspeed
         if orientation == "forward":
             airspeed = max(0.0, float(speed_mps) + float(wind_mps))
         motor_power_W = power_required(drone, airspeed, orientation)
@@ -2979,80 +2855,73 @@ def launch_gui():
         if periph_power_W <= 0.0:
             periph_power_W = drone.battery.vnom_pack * max(drone.periph_current, 0.0)
         total_power_W, v_load, pack_current_A, esc_note, motor_I_esc_A = total_power_with_esc(
-            drone,
-            motor_power_W=motor_power_W,
-            periph_power_W=periph_power_W,
-        )
-        total_thrust_N = thrust_required(drone, airspeed, orientation)
+            drone, motor_power_W=motor_power_W, periph_power_W=periph_power_W)
+        total_thrust_N     = thrust_required(drone, airspeed, orientation)
         thrust_per_motor_N = total_thrust_N / max(int(drone.num_motors), 1)
-        # ESC loss is total_power - motor - periph
-        esc_loss_W = max(0.0, float(total_power_W) - float(motor_power_W) - float(periph_power_W))
-        rpm_est = _estimate_prop_rpm_if_possible(drone, thrust_per_motor_N)
-
+        esc_loss_W  = max(0.0, float(total_power_W) - float(motor_power_W) - float(periph_power_W))
+        rpm_est     = _estimate_prop_rpm(drone, thrust_per_motor_N)
         motor_table = None
-
         if getattr(drone, 'propeller', None) is not None and drone.propeller.table is not None:
-
             try:
-
                 motor_table = interpolate_motor_point(drone, thrust_per_motor_N)
-
-                if 'RPM' in motor_table:
-
-                    rpm_est = float(motor_table['RPM'])
-
-            except Exception:
-
-                motor_table = None
+                if 'RPM' in motor_table: rpm_est = float(motor_table['RPM'])
+            except Exception: motor_table = None
         tilt_req = required_tilt_deg(drone, airspeed, orientation)
         return {
-            "airspeed_mps": float(airspeed),
-            "tilt_required_deg": float(tilt_req),
-            "tilt_limit_deg": (float(drone.max_tilt_deg) if getattr(drone, 'max_tilt_deg', None) is not None else None),
-            "motor_power_W": float(motor_power_W),
-            "periph_power_W": float(periph_power_W),
-            "total_power_W": float(total_power_W),
-            "v_load_V": float(v_load),
-            "pack_current_A": float(pack_current_A),
-            "esc_loss_W": float(esc_loss_W),
-            "esc_note": str(esc_note),
-            "motor_I_per_esc_A": float(motor_I_esc_A),
-            "thrust_total_N": float(total_thrust_N),
-            "thrust_per_motor_N": float(thrust_per_motor_N),
-            "prop_rpm": (float(rpm_est) if rpm_est is not None else None),
+            "airspeed_mps":        float(airspeed),
+            "tilt_required_deg":   float(tilt_req),
+            "tilt_limit_deg":      (float(drone.max_tilt_deg) if getattr(drone,'max_tilt_deg',None) is not None else None),
+            "motor_power_W":       float(motor_power_W),
+            "periph_power_W":      float(periph_power_W),
+            "total_power_W":       float(total_power_W),
+            "v_load_V":            float(v_load),
+            "pack_current_A":      float(pack_current_A),
+            "esc_loss_W":          float(esc_loss_W),
+            "esc_note":            str(esc_note),
+            "motor_I_per_esc_A":   float(motor_I_esc_A),
+            "thrust_total_N":      float(total_thrust_N),
+            "thrust_per_motor_N":  float(thrust_per_motor_N),
+            "prop_rpm":            (float(rpm_est) if rpm_est is not None else None),
             "motor_table_throttle_pct": (float(motor_table["Throttle_pct"]) if motor_table and "Throttle_pct" in motor_table else None),
-            "motor_table_eff_gW": (float(motor_table["Efficiency_gW"]) if motor_table and "Efficiency_gW" in motor_table else None),
-            "motor_table_temp_C": (float(motor_table["Temp_C"]) if motor_table and "Temp_C" in motor_table else None),
-            "motor_table_voltage_V": (float(motor_table["Voltage_V"]) if motor_table and "Voltage_V" in motor_table else None),
-            "motor_table_current_A": (float(motor_table["Current_A"]) if motor_table and "Current_A" in motor_table else None),
+            "motor_table_eff_gW":  (float(motor_table["Efficiency_gW"])    if motor_table and "Efficiency_gW" in motor_table else None),
+            "motor_table_temp_C":  (float(motor_table["Temp_C"])           if motor_table and "Temp_C" in motor_table else None),
         }
-    
 
+    # ================================================================== #
+    #  RUN CALLBACKS                                                      #
+    # ================================================================== #
     def run_single_point():
         clear_log()
         try:
-            drone = build_config_from_gui()
+            drone       = build_config_from_gui()
             orientation = v_orientation.get().strip().lower()
-            if orientation not in ("hover", "forward"):
+            if orientation not in ("hover","forward"):
                 raise ValueError("Orientation must be 'hover' or 'forward'.")
-
-            speed = parse_float("Speed", v_speed.get())
-            t_min = estimate_flight_time_minutes(drone, speed, orientation=orientation)
-            d_km = estimate_flight_distance_km(drone, speed, orientation=orientation)
+            speed   = parse_float("Speed", v_speed.get())
+            t_min   = estimate_flight_time_minutes(drone, speed, orientation=orientation)
+            d_km    = estimate_flight_distance_km(drone, speed, orientation=orientation)
             be_v, be_min, br_v, br_km = find_optimal_speeds(drone)
-
-            log(f"Air density: {drone.air_density:.3f} kg/m^3")
-            log(f"At {speed:.2f} m/s ({orientation}): time={t_min:.2f} min, distance={d_km:.2f} km")
-            log(f"Best endurance (forward): {be_v:.2f} m/s -> {be_min:.2f} min")
-            log(f"Best range (forward): {br_v:.2f} m/s -> {br_km:.2f} km")
-
-            metrics = compute_operating_metrics(drone, speed_mps=speed, orientation=orientation, wind_mps=0.0)
+            metrics = compute_operating_metrics(drone, speed_mps=speed, orientation=orientation)
             update_status_tables_from_metrics(drone, metrics)
             update_metrics_tab(drone, metrics, speed_mps=speed, orientation=orientation)
 
-            fig = make_performance_figure(drone, max_speed=parse_float("Max speed plot", v_max_speed_plot.get()))
-            show_figure(fig)
+            max_spd = parse_float("Max speed plot", v_max_speed_plot.get())
+            _last_run["drone"]   = drone
+            _last_run["max_spd"] = max_spd
+            fig = make_performance_figure(
+                drone, max_speed=max_spd,
+                figsize=(_view["plot_w"], _view["plot_h"]))
+            _show_figure(fig)
+            display_nb.select(tab_plot_out)
 
+            out_print(
+                f"=== Single-Point Run @ {speed:.1f} m/s ({orientation}) ===\n"
+                f"Air density     : {drone.air_density:.3f} kg/m³\n"
+                f"Flight time     : {t_min:.2f} min\n"
+                f"Flight distance : {d_km:.2f} km\n"
+                f"Best endurance  : {be_v:.2f} m/s → {be_min:.2f} min\n"
+                f"Best range      : {br_v:.2f} m/s → {br_km:.2f} km\n"
+            )
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
@@ -3061,76 +2930,133 @@ def launch_gui():
         try:
             mission_path = v_mission.get().strip()
             if not mission_path:
-                raise ValueError("Select a mission JSON file (or switch to 'Single-point' run).")
-
-            drone = build_config_from_gui()
+                raise ValueError("Select a mission JSON file first (Mission/Env tab).")
+            drone       = build_config_from_gui()
             orientation = v_orientation.get().strip().lower()
-            if orientation not in ("hover", "forward"):
+            if orientation not in ("hover","forward"):
                 raise ValueError("Orientation must be 'hover' or 'forward'.")
-
             temp = v_temp.get().strip()
             pres = v_press.get().strip()
             wind = parse_float("Wind", v_wind.get())
 
             mission = MissionProfile.from_json(mission_path)
             results, worst_metrics, mission_series = simulate_mission(
-                drone,
-                mission,
-                orientation=orientation,
-                temperature_C=float(temp) if temp else None,
-                pressure_Pa=float(pres) if pres else None,
-                wind_mps=wind,
+                drone, mission, orientation=orientation,
+                temperature_C = float(temp) if temp else None,
+                pressure_Pa   = float(pres) if pres else None,
+                wind_mps      = wind,
             )
+            last_mission_series[0] = mission_series
 
-            log(f"Mission: {os.path.basename(mission_path)}")
-            log(f"Orientation: {orientation} | Wind: {wind:.2f} m/s")
-            log("")
-            total_time = 0.0
-            total_dist = 0.0
+            lines = [f"=== Mission: {os.path.basename(mission_path)} ===",
+                     f"Orientation: {orientation}  |  Wind: {wind:.2f} m/s", ""]
+            total_t = total_d = 0.0
             for name, t_min, d_km, status in results:
-                total_time += t_min
-                total_dist += d_km
-                log(f"{name}: {t_min:.2f} min, {d_km:.2f} km, {status}")
-
-            log("")
-            log(f"TOTAL: {total_time:.2f} min, {total_dist:.2f} km")
+                total_t += t_min; total_d += d_km
+                lines.append(f"  {name}: {t_min:.2f} min, {d_km:.2f} km  [{status}]")
+            lines += ["", f"TOTAL: {total_t:.2f} min, {total_d:.2f} km"]
+            out_print("\n".join(lines))
 
             if worst_metrics is not None:
                 update_status_tables_from_metrics(drone, worst_metrics)
 
-            # Store mission time series for Mission Plots tab
-            try:
-                nonlocal last_mission_series
-                last_mission_series = mission_series
-            except Exception:
-                pass
-
-            fig = make_performance_figure(drone, max_speed=parse_float("Max speed plot", v_max_speed_plot.get()))
-            show_figure(fig)
-
+            max_spd = parse_float("Max speed plot", v_max_speed_plot.get())
+            _last_run["drone"]   = drone
+            _last_run["max_spd"] = max_spd
+            fig = make_performance_figure(
+                drone, max_speed=max_spd,
+                figsize=(_view["plot_w"], _view["plot_h"]))
+            _show_figure(fig)
+            display_nb.select(tab_plot_out)
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
-    ttk.Button(btns, text="Run single-point + plot", command=run_single_point).grid(row=0, column=0, padx=6, pady=2, sticky="w")
-    ttk.Button(btns, text="Run mission (JSON) + plot", command=run_mission).grid(row=0, column=1, padx=6, pady=2, sticky="w")
-    ttk.Button(btns, text="Load config", command=prompt_load_config).grid(row=0, column=2, padx=6, pady=2, sticky="w")
-    ttk.Button(btns, text="Save config", command=prompt_save_config).grid(row=0, column=3, padx=6, pady=2, sticky="w")
-    ttk.Button(btns, text="Clear output", command=clear_log).grid(row=0, column=4, padx=6, pady=2, sticky="w")
-    ttk.Button(btns, text="Quit", command=exit_app).grid(row=0, column=5, padx=6, pady=2, sticky="e")
+    # ================================================================== #
+    #  SAVE / LOAD CONFIG                                                 #
+    # ================================================================== #
+    def _extract_avionics_rails() -> list:
+        rails = []
+        for iid in avionics_tree.get_children():
+            v_s, i_s, e_s = avionics_tree.item(iid, "values")
+            try:
+                rails.append({"voltage": float(v_s), "current": float(i_s), "eff": float(e_s)})
+            except Exception: continue
+        rails.sort(key=lambda r: r["voltage"])
+        return rails
+
+    def save_config_to_file(path: str) -> None:
+        data = {
+            "schema": "multicopter_power_sim_gui_config",
+            "version": 1,
+            "vars": {k: v.get() for k, v in config_vars.items()},
+            "avionics_rails": _extract_avionics_rails(),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+
+    def load_config_from_file(path: str) -> None:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k, val in data.get("vars", {}).items():
+            if k in config_vars:
+                try: config_vars[k].set("" if val is None else str(val))
+                except Exception: pass
+        rails = data.get("avionics_rails", None)
+        if isinstance(rails, list) and rails:
+            _av_load_rows(rails)
+        else:
+            try:
+                d = parse_voltage_tree(v_avionics_voltage_tree.get().strip())
+                _av_load_rows([{"voltage": v, "current": ci[0], "eff": ci[1]}
+                               for v, ci in d.items()])
+            except Exception: pass
+        on_unit_mode_change()
+
+    def prompt_save_config():
+        path = filedialog.asksaveasfilename(
+            title="Save configuration", defaultextension=".json",
+            filetypes=[("JSON files","*.json"),("All files","*.*")])
+        if not path: return
+        try:
+            save_config_to_file(path)
+            messagebox.showinfo("Saved", f"Saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error saving config", str(e))
+
+    def prompt_load_config():
+        path = filedialog.askopenfilename(
+            title="Load configuration",
+            filetypes=[("JSON files","*.json"),("All files","*.*")])
+        if not path: return
+        try:
+            load_config_from_file(path)
+            messagebox.showinfo("Loaded", f"Loaded from:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Error loading config", str(e))
+
+    file_menu.add_command(label="Load Config…", command=prompt_load_config)
+    file_menu.add_command(label="Save Config…", command=prompt_save_config)
+    file_menu.add_separator()
+    file_menu.add_command(label="Exit", command=exit_app)
+
+    # ================================================================== #
+    #  BUTTON ROW                                                         #
+    # ================================================================== #
+    btn_frame = ttk.Frame(main)
+    btn_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+    btn_frame.columnconfigure(1, weight=1)
+
+    ttk.Button(btn_frame, text="▶  Run Single-Point",
+               command=run_single_point).grid(row=0, column=0, padx=(0, 6), pady=4)
+    ttk.Button(btn_frame, text="📋  Run Mission (JSON)",
+               command=run_mission).grid(row=0, column=1, padx=(0, 6), pady=4, sticky="w")
+    ttk.Button(btn_frame, text="💾  Save Config",
+               command=prompt_save_config).grid(row=0, column=2, padx=4, pady=4)
+    ttk.Button(btn_frame, text="📂  Load Config",
+               command=prompt_load_config).grid(row=0, column=3, padx=4, pady=4)
 
     root.protocol("WM_DELETE_WINDOW", exit_app)
-
-    # initial empty fig
-    try:
-        drone0 = build_config_from_gui()
-        fig0 = make_performance_figure(drone0, max_speed=30)
-        show_figure(fig0)
-    except Exception:
-        pass
-
-    root.minsize(1050, 650)
     root.mainloop()
-
 
 # -------------------------------
 # CLI
