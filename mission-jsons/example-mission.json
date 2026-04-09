@@ -1,0 +1,55 @@
+{
+  "mission_name": "Example Survey Mission",
+  "description": "Takeoff, climb, cruise survey, loiter, and return",
+
+  "phases": [
+    {
+      "name": "Takeoff",
+      "speed": 5.0,
+      "duration": 20,
+      "altitude": 10
+    },
+    {
+      "name": "Climb",
+      "speed": 12.0,
+      "duration": 60,
+      "altitude": 100
+    },
+    {
+      "name": "Cruise Out",
+      "speed": 18.0,
+      "distance": 1500,
+      "altitude": 100
+    },
+    {
+      "name": "Survey Grid",
+      "speed": 15.0,
+      "duration": 300,
+      "altitude": 100
+    },
+    {
+      "name": "Loiter",
+      "speed": 12.0,
+      "duration": 120,
+      "altitude": 100
+    },
+    {
+      "name": "Return",
+      "speed": 20.0,
+      "distance": 1500,
+      "altitude": 100
+    },
+    {
+      "name": "Descent",
+      "speed": 10.0,
+      "duration": 60,
+      "altitude": 20
+    },
+    {
+      "name": "Landing",
+      "speed": 5.0,
+      "duration": 30,
+      "altitude": 0
+    }
+  ]
+}
