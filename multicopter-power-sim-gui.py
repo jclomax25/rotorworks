@@ -45,6 +45,7 @@ import sys
 from typing import Optional, List, Tuple
 
 import pandas as pd
+import numpy as np
 import matplotlib.pyplot as plt
 
 # -------------------------------
@@ -98,9 +99,13 @@ class BatteryConfig:
         self.operating_voltage_min = float(operating_voltage_min)
         self.operating_voltage_nominal = float(operating_voltage_nominal)
         self.operating_voltage_max = float(operating_voltage_max)
-        self.unit_mode = unit_mode
+        self.unit_mode = str(unit_mode).strip().lower() if unit_mode is not None else "cell"
         self.series_units = int(series_units)
         self.parallel_units = int(parallel_units)
+
+        if self.unit_mode not in ("cell", "pack"):
+            # Fallback if the GUI or args provide a non-standard string.
+            self.unit_mode = "pack" if pack_weight_g is not None else "cell"
 
         if self.unit_mode == "cell":
             cells_series_per_unit = 1
@@ -131,7 +136,7 @@ class BatteryConfig:
         if unit_mode == "cell":
             self.capacity_mAh = (self.cell_capacity_mAh or 0.0) * self.parallel_cells
         elif unit_mode == "pack":
-            self.capacity_mAh = (self.pack_capacity_mAh or 0.0) * self.parallel_units
+            self.capacity_mAh = (self.pack_capacity_mAh or 0.0) * self.parallel_units * self.series_units
         else:
             self.capacity_mAh = 0.0
         self.capacity_Ah = self.capacity_mAh / 1000.0
@@ -782,6 +787,91 @@ def thrust_required(config: DroneConfig, speed_mps: float, orientation: str) -> 
 # -------------------------------
 # Power Models
 # -------------------------------
+def _fit_propeller_curve(thrust_g_data: np.ndarray, y_data: np.ndarray, degree: int = 2) -> tuple:
+    """Fit a polynomial to propeller data for extrapolation.
+    
+    Args:
+        thrust_g_data: Thrust values in grams (x-axis)
+        y_data: Property values (Power_W, Current_A, etc.)
+        degree: Polynomial degree (1 or 2 recommended)
+    
+    Returns:
+        (coeffs, min_thrust, max_thrust) where coeffs are polyfit coefficients
+    """
+    # Filter out NaN values
+    valid_idx = ~(np.isnan(thrust_g_data) | np.isnan(y_data))
+    if valid_idx.sum() < degree + 1:
+        # Not enough valid points, return None
+        return None
+    
+    x_valid = thrust_g_data[valid_idx]
+    y_valid = y_data[valid_idx]
+    
+    try:
+        # Fit polynomial (highest degree first)
+        coeffs = np.polyfit(x_valid, y_valid, degree)
+        return (coeffs, x_valid.min(), x_valid.max())
+    except:
+        return None
+
+
+def _eval_poly(coeffs: np.ndarray, x: float) -> float:
+    """Evaluate polynomial with coefficients from np.polyfit at point x."""
+    if coeffs is None:
+        return None
+    result = 0.0
+    for i, c in enumerate(coeffs):
+        result += c * (x ** (len(coeffs) - 1 - i))
+    return result
+
+
+def _extrapolate_motor_value(df: pd.DataFrame, thrust_g: float, column: str) -> Optional[float]:
+    """Extrapolate a motor property value using fitted curve if thrust is below minimum.
+    
+    Args:
+        df: Propeller table dataframe
+        thrust_g: Target thrust in grams
+        column: Column name to extrapolate (Power_W, Current_A, etc.)
+    
+    Returns:
+        Extrapolated value or None if not available
+    """
+    if column not in df.columns:
+        return None
+    
+    thrust_g_data = df["Thrust_g"].values
+    try:
+        y_data = pd.to_numeric(df[column], errors='coerce').values
+    except:
+        return None
+    
+    min_thrust = thrust_g_data.min()
+    
+    # If we're within data range, don't extrapolate
+    if thrust_g >= min_thrust:
+        return None
+    
+    # Fit a 2nd degree polynomial to the data
+    fit_result = _fit_propeller_curve(thrust_g_data, y_data, degree=2)
+    if fit_result is None:
+        return None
+    
+    coeffs, _, _ = fit_result
+    extrapolated = _eval_poly(coeffs, thrust_g)
+    
+    # For some properties, clamp to minimum reasonable values
+    if column == "Current_A" and extrapolated is not None:
+        extrapolated = max(extrapolated, 0.0)
+    elif column == "Power_W" and extrapolated is not None:
+        extrapolated = max(extrapolated, 0.0)
+    elif column == "Efficiency_gW" and extrapolated is not None:
+        extrapolated = max(extrapolated, 0.0)
+    elif column == "RPM" and extrapolated is not None:
+        extrapolated = max(extrapolated, 0.0)
+    
+    return extrapolated
+
+
 def interpolate_motor_point(config: DroneConfig, thrust_per_motor_N: float) -> dict:
     """Interpolate a full operating point from a motor/prop test table.
 
@@ -799,14 +889,25 @@ def interpolate_motor_point(config: DroneConfig, thrust_per_motor_N: float) -> d
     if "Thrust_g" not in df.columns or "Power_W" not in df.columns:
         raise ValueError("prop_table CSV must have columns: Thrust_g, Power_W (after parsing)")
 
-    # clamp
-    if thrust_g <= float(df["Thrust_g"].min()):
-        row = df.iloc[0]
-        return {k: float(row[k]) for k in df.columns if k in (
-            "Thrust_g","Power_W","RPM","Current_A","Voltage_V","Throttle_pct","Efficiency_gW","Temp_C","Torque_Nm"
-        ) and pd.notna(row[k])}
+    min_thrust = float(df["Thrust_g"].min())
+    max_thrust = float(df["Thrust_g"].max())
+    
+    # Handle below minimum: extrapolate using curve fit
+    if thrust_g < min_thrust:
+        out = {}
+        for col in ("Power_W","RPM","Current_A","Voltage_V","Throttle_pct","Efficiency_gW","Temp_C","Torque_Nm"):
+            # Try to extrapolate
+            extrapolated = _extrapolate_motor_value(df, thrust_g, col)
+            if extrapolated is not None:
+                out[col] = extrapolated
+            elif col in df.columns:
+                # Fall back to first row value
+                row = df.iloc[0]
+                if pd.notna(row[col]):
+                    out[col] = float(row[col])
+        return out
 
-    if thrust_g >= float(df["Thrust_g"].max()):
+    if thrust_g >= max_thrust:
         row = df.iloc[-1]
         return {k: float(row[k]) for k in df.columns if k in (
             "Thrust_g","Power_W","RPM","Current_A","Voltage_V","Throttle_pct","Efficiency_gW","Temp_C","Torque_Nm"
@@ -1343,6 +1444,106 @@ def plot_performance(config: DroneConfig, max_speed: float = 30.0):
     plt.show()
 
 
+def make_motor_operating_point_figure(config: DroneConfig, metrics: dict, figsize: tuple = (12, 8)):
+    """
+    Create a figure showing motor/propeller operating curves with the current operating point marked.
+    Uses propeller table data if available.
+    
+    Two subplots:
+      1. Thrust vs Power (left), Thrust vs Current (right) on same plot
+      2. Thrust vs Efficiency g/W (left), Thrust vs RPM (right) on same plot
+    """
+    if config.propeller.table is None:
+        # Return empty figure if no propeller table
+        fig, ax = plt.subplots(1, 1, figsize=figsize)
+        ax.text(0.5, 0.5, "Propeller table not available\nCannot plot operating curves",
+                ha="center", va="center", transform=ax.transAxes, fontsize=12)
+        ax.axis("off")
+        return fig
+    
+    df = config.propeller.table
+    thrust_pm_N = float(metrics.get("thrust_per_motor_N", 0.0))
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+    
+    # Get data from propeller table
+    thrust_g = df["Thrust_g"].values if "Thrust_g" in df.columns else []
+    
+    # Subplot 1: Thrust vs Power & Thrust vs Current
+    ax1_1 = ax1
+    ax1_2 = None
+    if "Power_W" in df.columns and len(thrust_g) > 0:
+        power_W = df["Power_W"].values
+        ax1_1.plot(thrust_g, power_W, "b-", linewidth=2, label="Power")
+        ax1_1.set_xlabel("Thrust per motor (gf)", fontsize=10)
+        ax1_1.set_ylabel("Power (W)", fontsize=10, color="b")
+        ax1_1.tick_params(axis="y", labelcolor="b")
+        ax1_1.grid(True, alpha=0.3)
+    
+    if "Current_A" in df.columns and len(thrust_g) > 0:
+        current_A = df["Current_A"].values
+        ax1_2 = ax1.twinx()
+        ax1_2.plot(thrust_g, current_A, "r--", linewidth=2, label="Current")
+        ax1_2.set_ylabel("Current (A)", fontsize=10, color="r")
+        ax1_2.tick_params(axis="y", labelcolor="r")
+    
+    # Mark operating point on subplot 1 (both y-axes)
+    thrust_g_op = thrust_pm_N * 1000.0 / 9.81
+    point = interpolate_motor_point(config, thrust_pm_N)
+    
+    if "Power_W" in df.columns and len(thrust_g) > 0:
+        power_op = point.get("Power_W", 0.0)
+        ax1_1.plot(thrust_g_op, power_op, "b*", markersize=15, label=f"Pow: {power_op:.1f}W", markeredgewidth=0.5, markeredgecolor="darkblue")
+    
+    if "Current_A" in df.columns and len(thrust_g) > 0 and ax1_2:
+        current_op = point.get("Current_A", 0.0)
+        ax1_2.plot(thrust_g_op, current_op, "r*", markersize=15, label=f"Cur: {current_op:.2f}A", markeredgewidth=0.5, markeredgecolor="darkred")
+    
+    ax1.set_title("Thrust vs Power & Current", fontsize=11, fontweight="bold")
+    # Combine legends from both axes
+    lines1, labels1 = ax1_1.get_legend_handles_labels()
+    lines2, labels2 = (ax1_2.get_legend_handles_labels() if ax1_2 else ([], []))
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=9)
+    
+    # Subplot 2: Thrust vs Efficiency & Thrust vs RPM
+    ax2_1 = ax2
+    ax2_2 = None
+    if "Efficiency_gW" in df.columns and len(thrust_g) > 0:
+        eff_gW = df["Efficiency_gW"].values
+        ax2_1.plot(thrust_g, eff_gW, "g-", linewidth=2, label="Efficiency")
+        ax2_1.set_xlabel("Thrust per motor (gf)", fontsize=10)
+        ax2_1.set_ylabel("Efficiency (g/W)", fontsize=10, color="g")
+        ax2_1.tick_params(axis="y", labelcolor="g")
+        ax2_1.grid(True, alpha=0.3)
+    
+    if "RPM" in df.columns and len(thrust_g) > 0:
+        rpm = df["RPM"].values
+        ax2_2 = ax2.twinx()
+        ax2_2.plot(thrust_g, rpm, "m--", linewidth=2, label="RPM")
+        ax2_2.set_ylabel("RPM", fontsize=10, color="m")
+        ax2_2.tick_params(axis="y", labelcolor="m")
+    
+    # Mark operating point on subplot 2 (both y-axes)
+    if "Efficiency_gW" in df.columns and len(thrust_g) > 0:
+        eff_op = point.get("Efficiency_gW", 0.0)
+        ax2_1.plot(thrust_g_op, eff_op, "g*", markersize=15, label=f"Eff: {eff_op:.2f}g/W", markeredgewidth=0.5, markeredgecolor="darkgreen")
+    
+    if "RPM" in df.columns and len(thrust_g) > 0 and ax2_2:
+        rpm_op = point.get("RPM", 0.0)
+        ax2_2.plot(thrust_g_op, rpm_op, "m*", markersize=15, label=f"RPM: {rpm_op:.0f}", markeredgewidth=0.5, markeredgecolor="darkmagenta")
+    
+    ax2.set_title("Thrust vs Efficiency & RPM", fontsize=11, fontweight="bold")
+    # Combine legends from both axes
+    lines1, labels1 = ax2_1.get_legend_handles_labels()
+    lines2, labels2 = (ax2_2.get_legend_handles_labels() if ax2_2 else ([], []))
+    ax2.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=9)
+    
+    fig.suptitle(f"Motor/Propeller Operating Curves (Thrust/Motor: {thrust_g_op:.0f}g)", 
+                 fontsize=12, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+
 # -------------------------------
 # Config builders
 # -------------------------------
@@ -1463,6 +1664,229 @@ def build_drone_from_args(args) -> DroneConfig:
 # -------------------------------
 # GUI
 # -------------------------------
+# ============================================================
+# SHARED REPORTING / EXPORT UTILITIES
+# ============================================================
+import csv as _csv
+import io  as _io
+import datetime as _dt
+import tempfile as _tmpfile
+
+def _fmt_g(x, nd=2):
+    try:    return f"{float(x):.{nd}f}"
+    except: return "n/a"
+
+def _extract_weight_budget(cfg) -> list:
+    rows = []
+    total_g = float(getattr(cfg, "drone_weight_g",
+                    getattr(cfg, "aircraft_weight_g", 0.0)))
+    num_motors = int(getattr(cfg, "num_motors",
+                    getattr(getattr(cfg, "airframe", None), "num_motors", 1)))
+    batt  = getattr(cfg, "battery",   None)
+    motor = getattr(cfg, "motor",     None)
+    esc   = getattr(cfg, "esc",       None)
+    prop  = getattr(cfg, "propeller", None)
+    accounted = 0.0
+    # Battery: weight_g already includes all series/parallel units
+    if batt:
+        w = float(getattr(batt, "weight_g", 0.0) or 0.0)
+        rows.append(("Battery", w, 1, w)); accounted += w
+    # Motor: per-motor weight, multiply by num_motors
+    if motor:
+        w = float(getattr(motor, "weight_g", 0.0) or 0.0)
+        rows.append(("Motor", w, num_motors, w * num_motors)); accounted += w * num_motors
+    # ESC: per-ESC weight, multiply by num_motors
+    if esc:
+        w = float(getattr(esc, "weight_g", 0.0) or 0.0)
+        rows.append(("ESC", w, num_motors, w * num_motors)); accounted += w * num_motors
+    # Propeller: per-propeller weight, multiply by num_motors
+    if prop:
+        w = float(getattr(prop, "weight_g", 0.0) or 0.0)
+        rows.append(("Propeller", w, num_motors, w * num_motors)); accounted += w * num_motors
+    airframe_g = max(0.0, total_g - accounted)
+    rows.append(("Airframe / Structure", airframe_g, 1, airframe_g))
+    rows.append(("TOTAL", total_g, 1, total_g))
+    return rows
+
+def _export_csv_file(path: str, sweep: dict, metrics: list) -> None:
+    import csv
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["[Performance Sweep]"])
+        if sweep:
+            headers = list(sweep.keys())
+            w.writerow(headers)
+            n = max(len(v) for v in sweep.values())
+            for i in range(n):
+                w.writerow([sweep[h][i] if i < len(sweep[h]) else "" for h in headers])
+        w.writerow([])
+        w.writerow(["[Metrics]"])
+        w.writerow(["Metric", "Value"])
+        for label, value in metrics:
+            w.writerow([label, value])
+
+def _export_excel_file(path: str, sweep: dict, metrics: list, weight_budget: list) -> None:
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    wb = Workbook()
+    ws = wb.active; ws.title = "Performance Sweep"
+    if sweep:
+        headers = list(sweep.keys())
+        for ci, h in enumerate(headers, 1):
+            c = ws.cell(row=1, column=ci, value=h)
+            c.font = Font(bold=True, color="FFFFFF")
+            c.fill = PatternFill("solid", fgColor="1F3864")
+        n = max(len(v) for v in sweep.values())
+        for ri in range(n):
+            for ci, h in enumerate(headers, 1):
+                ws.cell(row=ri+2, column=ci, value=sweep[h][ri] if ri < len(sweep[h]) else None)
+    ws2 = wb.create_sheet("Metrics")
+    ws2.append(["Metric", "Value"])
+    for r in [ws2["A1"], ws2["B1"]]: r.font = Font(bold=True)
+    for label, value in metrics: ws2.append([label, value])
+    ws3 = wb.create_sheet("Weight Budget")
+    ws3.append(["Component", "Unit Weight (g)", "Count", "Total Weight (g)", "% of Total"])
+    for c in ws3[1]: c.font = Font(bold=True)
+    total_g = weight_budget[-1][3] if weight_budget else 1.0
+    for label, uw, cnt, tw in weight_budget[:-1]:
+        pct = round(tw/total_g*100, 1) if total_g > 0 else 0
+        ws3.append([label, round(uw,1), cnt, round(tw,1), pct])
+    if weight_budget:
+        label, uw, cnt, tw = weight_budget[-1]
+        ws3.append([label, "", "", round(tw,1), 100.0])
+        for c in list(ws3.rows)[-1]: c.font = Font(bold=True)
+    wb.save(path)
+
+def _generate_pdf_report(path: str, report_title: str,
+                          inputs_rows: list, metrics_rows: list,
+                          status_sections: list, log_text: str,
+                          figures: list, weight_budget: list) -> None:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
+                                    Table, TableStyle, PageBreak, Image,
+                                    HRFlowable)
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units  import cm
+    from reportlab.lib        import colors
+    from reportlab.lib.enums  import TA_CENTER
+    import io
+    PAGE_W, PAGE_H = A4
+    doc = SimpleDocTemplate(path, pagesize=A4,
+                            leftMargin=1.8*cm, rightMargin=1.8*cm,
+                            topMargin=2.0*cm,  bottomMargin=2.0*cm)
+    styles = getSampleStyleSheet()
+    story  = []
+    NAVY  = colors.HexColor("#1F3864")
+    TEAL  = colors.HexColor("#2E75B6")
+    LGREY = colors.HexColor("#F2F2F2")
+    DGREY = colors.HexColor("#595959")
+    sTitle = ParagraphStyle("rTitle", fontSize=22, textColor=NAVY,
+                             spaceAfter=6, alignment=TA_CENTER, fontName="Helvetica-Bold")
+    sSub   = ParagraphStyle("rSub", fontSize=11, textColor=DGREY,
+                             spaceAfter=20, alignment=TA_CENTER, fontName="Helvetica")
+    sH1    = ParagraphStyle("rH1", fontSize=13, textColor=NAVY,
+                             spaceBefore=12, spaceAfter=4, fontName="Helvetica-Bold")
+    def _ts(header_bg=TEAL):
+        return TableStyle([
+            ("BACKGROUND",    (0,0),(-1,0), header_bg),
+            ("TEXTCOLOR",     (0,0),(-1,0), colors.white),
+            ("FONTNAME",      (0,0),(-1,0), "Helvetica-Bold"),
+            ("FONTSIZE",      (0,0),(-1,-1), 8),
+            ("ROWBACKGROUNDS",(0,1),(-1,-1),[colors.white, LGREY]),
+            ("GRID",          (0,0),(-1,-1), 0.3, colors.lightgrey),
+            ("LEFTPADDING",   (0,0),(-1,-1), 4),
+            ("RIGHTPADDING",  (0,0),(-1,-1), 4),
+            ("TOPPADDING",    (0,0),(-1,-1), 2),
+            ("BOTTOMPADDING", (0,0),(-1,-1), 2),
+            ("VALIGN",        (0,0),(-1,-1), "MIDDLE"),
+        ])
+    usable_w = PAGE_W - 3.6*cm
+    # Title page
+    story.append(Spacer(1, 3*cm))
+    story.append(Paragraph(report_title, sTitle))
+    story.append(Paragraph(
+        _dt.datetime.now().strftime("Generated %d %B %Y  %H:%M"), sSub))
+    story.append(HRFlowable(width="100%", thickness=1.5, color=TEAL, spaceAfter=12))
+    if weight_budget:
+        story.append(Paragraph("Component Weight Summary", sH1))
+        total_g = weight_budget[-1][3] if weight_budget else 1.0
+        wb_data = [["Component", "Unit (g)", "Qty", "Total (g)", "%"]]
+        for label, uw, cnt, tw in weight_budget[:-1]:
+            pct = f"{tw/total_g*100:.1f}" if total_g > 0 else "0"
+            wb_data.append([label, f"{uw:.1f}", str(cnt), f"{tw:.1f}", pct])
+        last = weight_budget[-1]
+        wb_data.append(["TOTAL", "", "", f"{last[3]:.1f}", "100.0"])
+        ts = _ts()
+        ts.add("FONTNAME",(0,len(wb_data)-1),(-1,len(wb_data)-1),"Helvetica-Bold")
+        t = Table(wb_data, colWidths=[usable_w*0.38, usable_w*0.15,
+                                       usable_w*0.1, usable_w*0.17, usable_w*0.1])
+        t.setStyle(ts); story.append(t)
+    story.append(PageBreak())
+    # Inputs
+    if inputs_rows:
+        story.append(Paragraph("Design Inputs", sH1))
+        mid = (len(inputs_rows)+1)//2
+        left = inputs_rows[:mid]; right = inputs_rows[mid:]
+        while len(right) < len(left): right.append(("",""))
+        rows_data = [["Parameter","Value","Parameter","Value"]]
+        for (la,va),(lb,vb) in zip(left,right): rows_data.append([la,va,lb,vb])
+        col_w = usable_w/4
+        t = Table(rows_data, colWidths=[col_w*1.4,col_w*0.6]*2)
+        t.setStyle(_ts()); story.append(t)
+    story.append(PageBreak())
+    # Metrics
+    if metrics_rows:
+        story.append(Paragraph("Performance Metrics", sH1))
+        mid = (len(metrics_rows)+1)//2
+        left = metrics_rows[:mid]; right = metrics_rows[mid:]
+        while len(right) < len(left): right.append(("",""))
+        rows_data = [["Metric","Value","Metric","Value"]]
+        for (la,va),(lb,vb) in zip(left,right): rows_data.append([la,va,lb,vb])
+        col_w = usable_w/4
+        t = Table(rows_data, colWidths=[col_w*1.4,col_w*0.6]*2)
+        t.setStyle(_ts()); story.append(t)
+    story.append(PageBreak())
+    # Status
+    if status_sections:
+        story.append(Paragraph("Status Checks", sH1))
+        for sec_title, sec_rows in status_sections:
+            story.append(Paragraph(sec_title, ParagraphStyle("secH", fontSize=10,
+                textColor=TEAL, spaceBefore=6, spaceAfter=2, fontName="Helvetica-Bold")))
+            tdata = [["Metric","Value","Limit","Notes"]]
+            ts = _ts()
+            for ri,(metric,val,lim,note,tag) in enumerate(sec_rows,1):
+                tdata.append([metric,val,lim,note])
+                bg = {"ok":colors.HexColor("#D9F2D9"),"warn":colors.HexColor("#FFF2CC"),
+                      "bad":colors.HexColor("#F8D7DA")}.get(tag, colors.white)
+                ts.add("BACKGROUND",(0,ri),(-1,ri),bg)
+            cw = [usable_w*0.28,usable_w*0.20,usable_w*0.20,usable_w*0.32]
+            t = Table(tdata, colWidths=cw); t.setStyle(ts); story.append(t)
+            story.append(Spacer(1,4))
+    story.append(PageBreak())
+    # Plots
+    if figures:
+        story.append(Paragraph("Performance Plots", sH1))
+        for fig in figures:
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=120, bbox_inches="tight")
+            buf.seek(0)
+            img_w = usable_w
+            img_h = img_w * (fig.get_figheight() / max(fig.get_figwidth(), 0.01))
+            max_h = PAGE_H - 5*cm
+            if img_h > max_h:
+                img_h = max_h
+                img_w = img_h * (fig.get_figwidth() / max(fig.get_figheight(), 0.01))
+            story.append(Image(buf, width=img_w, height=img_h))
+            story.append(Spacer(1, 8)); story.append(PageBreak())
+    # Log
+    if log_text.strip():
+        story.append(Paragraph("Simulation Output Log", sH1))
+        mono = ParagraphStyle("mono", fontName="Courier", fontSize=7.5, leading=10, spaceAfter=2)
+        for line in log_text.splitlines():
+            safe = line.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+            story.append(Paragraph(safe or " ", mono))
+    doc.build(story)
+
 def launch_gui():
     """
     Tkinter GUI — styled to match the fixed-wing simulator:
@@ -1589,12 +2013,24 @@ def launch_gui():
         try:
             drone   = _last_run["drone"]
             max_spd = _last_run["max_spd"]
+            metrics = _last_run.get("metrics", {})
             fig = make_performance_figure(
                 drone,
                 max_speed=max_spd,
                 figsize=(_view["plot_w"], _view["plot_h"]),
             )
-            _show_figure(fig)
+            # Generate motor operating point figure if available
+            motor_fig = None
+            if drone.propeller.table is not None and metrics:
+                try:
+                    motor_fig = make_motor_operating_point_figure(drone, metrics, figsize=(_view["plot_w"], 6))
+                except Exception:
+                    pass
+            # Display both figures
+            if motor_fig:
+                _show_figure([fig, motor_fig])
+            else:
+                _show_figure(fig)
         except Exception:
             pass
 
@@ -2294,6 +2730,11 @@ def launch_gui():
     display_nb.add(tab_status_out,        text="Status")
     display_nb.add(tab_metrics_out,       text="Metrics")
     display_nb.add(tab_mission_plots_out, text="Mission Plots")
+    tab_weight_budget_out = ttk.Frame(display_nb, padding=0)
+    tab_weight_budget_out.columnconfigure(0, weight=1)
+    tab_weight_budget_out.rowconfigure(0, weight=1)
+    display_nb.add(tab_weight_budget_out, text="Weight Budget")
+
 
     # ---- Plots panel ----
     plot_frame = ttk.LabelFrame(tab_plot_out, text="Performance Plots", padding=4)
@@ -2301,16 +2742,150 @@ def launch_gui():
     plot_frame.columnconfigure(0, weight=1)
     plot_frame.rowconfigure(0, weight=1)
 
-    _canvas_widget = [None]
+    plot_canvas = tk.Canvas(plot_frame, highlightthickness=0)
+    plot_canvas.grid(row=0, column=0, sticky="nsew")
+    plot_scroll = ttk.Scrollbar(plot_frame, orient="vertical", command=plot_canvas.yview)
+    plot_scroll.grid(row=0, column=1, sticky="ns")
+    plot_canvas.configure(yscrollcommand=plot_scroll.set)
 
-    def _show_figure(fig):
-        if _canvas_widget[0] is not None:
-            _canvas_widget[0].get_tk_widget().destroy()
-        fc = FigureCanvasTkAgg(fig, master=plot_frame)
-        fc.draw()
-        fc.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-        _canvas_widget[0] = fc
-        plt.close(fig)
+    plot_inner = ttk.Frame(plot_canvas)
+    plot_inner_id = plot_canvas.create_window((0, 0), window=plot_inner, anchor="nw")
+    plot_inner.columnconfigure(0, weight=1)
+
+    def _update_plot_scrollregion(event=None):
+        plot_canvas.configure(scrollregion=plot_canvas.bbox("all"))
+
+    def _match_plot_inner_width(event):
+        plot_canvas.itemconfigure(plot_inner_id, width=event.width)
+
+    plot_inner.bind("<Configure>", lambda event: _update_plot_scrollregion(event))
+    plot_canvas.bind("<Configure>", lambda event: _match_plot_inner_width(event))
+    plot_inner.bind("<Enter>", lambda _: plot_canvas.bind_all("<MouseWheel>", _on_plot_mousewheel))
+    plot_inner.bind("<Leave>", lambda _: plot_canvas.unbind_all("<MouseWheel>"))
+
+    _plot_canvases = []  # Track multiple figure canvases
+    _current_plot_figs = []  # Track multiple figures
+
+    def _on_plot_mousewheel(evt):
+        plot_canvas.yview_scroll(int(-1 * (evt.delta / 120)), "units")
+        return "break"
+
+    plot_canvas.bind("<Enter>", lambda _: plot_canvas.bind_all("<MouseWheel>", _on_plot_mousewheel))
+    plot_canvas.bind("<Leave>", lambda _: plot_canvas.unbind_all("<MouseWheel>"))
+
+    def _show_figure(fig_or_figs):
+        """Display one or more figures in the scrollable plot area."""
+        # Clear previous figures
+        for canvas in _plot_canvases:
+            try:
+                canvas.get_tk_widget().destroy()
+            except:
+                pass
+        for fig in _current_plot_figs:
+            try:
+                plt.close(fig)
+            except:
+                pass
+        _plot_canvases.clear()
+        _current_plot_figs.clear()
+        
+        # Handle both single figure and list of figures
+        figures = fig_or_figs if isinstance(fig_or_figs, list) else [fig_or_figs]
+        
+        for idx, fig in enumerate(figures):
+            if fig is None:
+                continue
+            fc = FigureCanvasTkAgg(fig, master=plot_inner)
+            fc.draw()
+            fc.get_tk_widget().grid(row=idx, column=0, sticky="nsew")
+            _plot_canvases.append(fc)
+            _current_plot_figs.append(fig)
+        
+        # Update scroll region
+        plot_inner.update_idletasks()
+        plot_canvas.configure(scrollregion=plot_canvas.bbox("all"))
+
+
+    # Weight Budget panel
+    _wb_canvas_ref = [None]
+    def _draw_weight_chart(rows):
+        data_rows = [r for r in rows if r[0] != "TOTAL"]
+        if not data_rows: return
+        labels = [r[0] for r in data_rows]
+        totals = [r[3] for r in data_rows]
+        grand  = sum(totals)
+        COLORS = ["#2E75B6","#ED7D31","#A9D18E","#FFC000","#5B9BD5","#FF7F7F"]
+        fig, axes = plt.subplots(1, 2, figsize=(7, max(3, len(labels)*0.6+1)))
+        fig.patch.set_facecolor("white")
+        ax = axes[0]
+        left_ = 0.0
+        pcts = [t/grand*100 if grand>0 else 0 for t in totals]
+        for i,(lbl,pct) in enumerate(zip(labels,pcts)):
+            ax.barh(0, pct, left=left_, color=COLORS[i%len(COLORS)],
+                    label=lbl, edgecolor="white", linewidth=0.5)
+            if pct > 5:
+                ax.text(left_+pct/2, 0, f"{pct:.0f}%",
+                        ha="center", va="center", fontsize=7.5, color="white")
+            left_ += pct
+        ax.set_xlim(0,100); ax.set_yticks([])
+        ax.set_xlabel("% of total weight"); ax.set_title("Weight Distribution")
+        ax.legend(loc="upper center",bbox_to_anchor=(0.5,-0.18),ncol=2,fontsize=7,frameon=False)
+        ax.grid(axis="x",alpha=0.3)
+        ax2 = axes[1]
+        _,_, ats = ax2.pie(totals,labels=None,autopct="%1.0f%%",
+            colors=COLORS[:len(labels)],startangle=90,pctdistance=0.75,
+            wedgeprops=dict(edgecolor="white",linewidth=0.8))
+        for at in ats: at.set_fontsize(7)
+        ax2.set_title(f"Total: {grand:.0f} g")
+        ax2.legend(labels,loc="lower center",bbox_to_anchor=(0.5,-0.22),ncol=2,fontsize=7,frameon=False)
+        fig.tight_layout()
+        if _wb_canvas_ref[0]:
+            try: _wb_canvas_ref[0].get_tk_widget().destroy()
+            except Exception: pass
+        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        fc = FigureCanvasTkAgg(fig, master=wb_right)
+        fc.draw(); fc.get_tk_widget().grid(row=0,column=0,sticky="nsew")
+        _wb_canvas_ref[0] = fc; plt.close(fig)
+    # Weight Budget layout
+    wb_outer = ttk.Frame(tab_weight_budget_out, padding=4)
+    wb_outer.grid(row=0, column=0, sticky="nsew")
+    wb_outer.columnconfigure(0, weight=1); wb_outer.columnconfigure(1, weight=3)
+    wb_outer.rowconfigure(0, weight=1)
+    wb_left = ttk.LabelFrame(wb_outer, text="Component Weights", padding=4)
+    wb_left.grid(row=0, column=0, sticky="nsew", padx=(0,6))
+    wb_left.columnconfigure(0, weight=1); wb_left.rowconfigure(1, weight=1)
+    wb_ph = ttk.Label(wb_left, text="Run a simulation to populate.",
+                     foreground="#888888", wraplength=200)
+    wb_ph.grid(row=0, column=0, columnspan=2, sticky="w", padx=4, pady=(0,4))
+    _wb_tv_cols = ("component","unit_w","count","total_w","pct")
+    wb_tv = ttk.Treeview(wb_left, columns=_wb_tv_cols, show="headings", height=10)
+    for col, heading, width in [
+        ("component","Component",160),("unit_w","Unit (g)",70),
+        ("count","Qty",40),("total_w","Total (g)",75),("pct","% of Total",70)]:
+        wb_tv.heading(col, text=heading)
+        wb_tv.column(col, width=width,
+                     anchor="w" if col=="component" else "center", stretch=True)
+    wb_tv.grid(row=1, column=0, sticky="nsew")
+    wb_sb = ttk.Scrollbar(wb_left, orient="vertical", command=wb_tv.yview)
+    wb_sb.grid(row=1, column=1, sticky="ns")
+    wb_tv.configure(yscrollcommand=wb_sb.set)
+    wb_tv.tag_configure("total", font=("TkDefaultFont", 9, "bold"))
+    wb_right = ttk.LabelFrame(wb_outer, text="Weight Distribution", padding=4)
+    wb_right.grid(row=0, column=1, sticky="nsew")
+    wb_right.columnconfigure(0, weight=1); wb_right.rowconfigure(0, weight=1)
+    def update_weight_budget(cfg):
+        rows = _extract_weight_budget(cfg)
+        for iid in wb_tv.get_children(): wb_tv.delete(iid)
+        total_g = rows[-1][3] if rows else 1.0
+        for label, unit_w, count, total_w in rows[:-1]:
+            pct = f"{total_w/total_g*100:.1f}%" if total_g > 0 else "0%"
+            wb_tv.insert("","end",values=(label,f"{unit_w:.1f}",
+                         str(count),f"{total_w:.1f}",pct))
+        if rows:
+            label,unit_w,count,total_w = rows[-1]
+            wb_tv.insert("","end",values=(label,"","",
+                         f"{total_w:.1f}","100%"),tags=("total",))
+        _draw_weight_chart(rows)
 
     # ---- Status panel ----
     sty = ttk.Style()
@@ -2469,9 +3044,9 @@ def launch_gui():
         P_periph     = float(metrics.get("periph_power_W",   0.0))
         P_esc_loss   = float(metrics.get("esc_loss_W",       0.0))
 
-        cap_mAh     = float(batt.pack_capacity_mAh) if batt.pack_capacity_mAh is not None else float(batt.capacity_mAh)
+        cap_mAh     = float(batt.capacity_mAh)
         cap_Ah      = cap_mAh / 1000.0 if cap_mAh else 0.0
-        usable_frac = max(0.0, min(1.0, float(getattr(batt,"discharge_percent",100.0)) / 100.0))
+        usable_frac = max(0.0, min(1.0, float(getattr(batt, "discharge_percent", 100.0)) / 100.0))
         usable_mAh  = cap_mAh * usable_frac
         usable_Wh   = float(batt.capacity_Wh) * usable_frac
         load_C      = (I_pack / cap_Ah) if cap_Ah > 0 else float("nan")
@@ -2651,8 +3226,7 @@ def launch_gui():
         t_min = [x/60.0 for x in ms.get('t_s', [])]
         if not t_min: return
 
-        import matplotlib.pyplot as _plt
-        fig = _plt.Figure(figsize=(7.5, 4.5), dpi=100)
+        fig = plt.Figure(figsize=(7.5, 4.5), dpi=100)
         ax0 = fig.add_subplot(111)
         selected = [_mission_items[i] for i in sel]
         by_unit = {}
@@ -2745,6 +3319,7 @@ def launch_gui():
             discharge_c_max        = parse_float("Max C-rate", v_batt_c_max.get()),
             discharge_percent      = parse_float("Discharge %", v_batt_dischg_pct.get()),
             resistance_cell_mOhm   = parse_float("Rcell", v_batt_r.get()),
+            unit_mode              = v_batt_unit_mode.get().strip().lower(),
             series_units           = parse_int("Series units", v_batt_series.get()),
             parallel_units         = parse_int("Parallel units", v_batt_parallel.get()),
             cells_series_per_unit  = parse_int("Cells series/unit", v_batt_cells_series.get()),
@@ -2908,10 +3483,37 @@ def launch_gui():
             max_spd = parse_float("Max speed plot", v_max_speed_plot.get())
             _last_run["drone"]   = drone
             _last_run["max_spd"] = max_spd
+            # Capture sweep data for CSV/Excel export
+            _mc_v = [0.5 + (max_spd-0.5)*i/200 for i in range(201)]
+            _last_run_sweep.clear()
+            _last_run_sweep.update({
+                "Speed (m/s)": _mc_v,
+                "Flight Time (min)": [estimate_flight_time_minutes(drone,v,"forward") for v in _mc_v],
+                "Range (km)": [estimate_flight_distance_km(drone,v,"forward") for v in _mc_v],
+                "Power Fwd (W)": [power_required(drone,v,"forward") for v in _mc_v],
+                "Power Hov (W)": [power_required(drone,v,"hover") for v in _mc_v],
+                "Thrust Fwd (N)": [thrust_required(drone,v,"forward") for v in _mc_v],
+                "Thrust Hov (N)": [thrust_required(drone,v,"hover") for v in _mc_v],
+            })
+            _last_run_cfg[0] = drone
+            update_weight_budget(drone)
             fig = make_performance_figure(
                 drone, max_speed=max_spd,
                 figsize=(_view["plot_w"], _view["plot_h"]))
-            _show_figure(fig)
+            # Store metrics for regeneration during plot scale changes
+            _last_run["metrics"] = metrics
+            # Generate motor operating point figure if propeller table is available
+            motor_fig = None
+            if drone.propeller.table is not None:
+                try:
+                    motor_fig = make_motor_operating_point_figure(drone, metrics, figsize=(_view["plot_w"], 6))
+                except Exception:
+                    pass
+            # Display both figures
+            if motor_fig:
+                _show_figure([fig, motor_fig])
+            else:
+                _show_figure(fig)
             display_nb.select(tab_plot_out)
 
             out_print(
@@ -2963,6 +3565,8 @@ def launch_gui():
             max_spd = parse_float("Max speed plot", v_max_speed_plot.get())
             _last_run["drone"]   = drone
             _last_run["max_spd"] = max_spd
+            _last_run_cfg[0] = drone
+            update_weight_budget(drone)
             fig = make_performance_figure(
                 drone, max_speed=max_spd,
                 figsize=(_view["plot_w"], _view["plot_h"]))
@@ -3036,6 +3640,140 @@ def launch_gui():
 
     file_menu.add_command(label="Load Config…", command=prompt_load_config)
     file_menu.add_command(label="Save Config…", command=prompt_save_config)
+
+    _status_tv_pairs = [
+        (batt_table, "Battery Status"),
+        (motor_table, "Motor / ESC Status"),
+        (prop_table_tv, "Propeller Status"),
+    ]
+    _report_title = "Multicopter Power Simulator — Performance Analysis"
+
+    # ================================================================== #
+    # EXPORT & REPORT FUNCTIONS
+    # ================================================================== #
+    _last_run_sweep: dict = {}    # populated after each run
+    _last_run_cfg  = [None]       # populated after each run
+
+    def _get_metrics_rows() -> list:
+        """Read all rows from the metrics Treeview."""
+        rows = []
+        for iid in metrics_tv.get_children():
+            vals = metrics_tv.item(iid, "values")
+            if vals and len(vals) >= 2:
+                rows.append((str(vals[0]), str(vals[1])))
+        return rows
+
+    def _get_status_sections() -> list:
+        """Read all status Treeview tables as (title, [(metric,val,lim,note,tag),...])."""
+        result = []
+        for tv, title in _status_tv_pairs:
+            sec_rows = []
+            for iid in tv.get_children():
+                vals = tv.item(iid, "values")
+                tags = tv.item(iid, "tags")
+                tag  = tags[0] if tags else "na"
+                if vals and len(vals) >= 4:
+                    sec_rows.append((str(vals[0]), str(vals[1]),
+                                     str(vals[2]), str(vals[3]), str(tag)))
+                elif vals and len(vals) == 3:
+                    sec_rows.append((str(vals[0]), str(vals[1]),
+                                     str(vals[2]), "", "na"))
+            if sec_rows:
+                result.append((title, sec_rows))
+        return result
+
+    def _get_log_text() -> str:
+        try:
+            out_text.configure(state="normal")
+            t = out_text.get("1.0", "end")
+            out_text.configure(state="disabled")
+            return t
+        except Exception:
+            return ""
+
+    def _get_inputs_rows() -> list:
+        """Return all GUI input variables as (label, value) pairs."""
+        rows = []
+        for k, var in config_vars.items():
+            try:
+                val = var.get()
+                if val not in ("", None):
+                    rows.append((k.replace("_", " ").title(), str(val)))
+            except Exception:
+                pass
+        return rows
+
+    def _do_export_csv():
+        if not _last_run_sweep:
+            messagebox.showinfo("No data", "Run a simulation first to generate sweep data.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export CSV", defaultextension=".csv",
+            filetypes=[("CSV files","*.csv"),("All files","*.*")])
+        if not path: return
+        try:
+            _export_csv_file(path, _last_run_sweep, _get_metrics_rows())
+            messagebox.showinfo("Exported", f"CSV saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export error", str(e))
+
+    def _do_export_excel():
+        if not _last_run_sweep:
+            messagebox.showinfo("No data", "Run a simulation first to generate sweep data.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export Excel", defaultextension=".xlsx",
+            filetypes=[("Excel files","*.xlsx"),("All files","*.*")])
+        if not path: return
+        try:
+            cfg = _last_run_cfg[0]
+            wb  = _extract_weight_budget(cfg) if cfg else []
+            _export_excel_file(path, _last_run_sweep, _get_metrics_rows(), wb)
+            messagebox.showinfo("Exported", f"Excel saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export error", str(e))
+
+    def _do_generate_report():
+        if not _last_run_sweep and not _get_metrics_rows():
+            messagebox.showinfo("No data", "Run a simulation first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save PDF Report", defaultextension=".pdf",
+            filetypes=[("PDF files","*.pdf"),("All files","*.*")])
+        if not path: return
+        try:
+            cfg   = _last_run_cfg[0]
+            figs  = []
+            # Add all current plot figures from the scrollable area
+            figs.extend(_current_plot_figs)
+            if mission_canvas_ref[0] is not None:
+                figs.append(mission_canvas_ref[0].figure)
+            for num in plt.get_fignums():
+                fig = plt.figure(num)
+                if fig not in figs:
+                    figs.append(fig)
+            wb    = _extract_weight_budget(cfg) if cfg else []
+            _generate_pdf_report(
+                path         = path,
+                report_title = _report_title,
+                inputs_rows  = _get_inputs_rows(),
+                metrics_rows = _get_metrics_rows(),
+                status_sections = _get_status_sections(),
+                log_text     = _get_log_text(),
+                figures      = figs,
+                weight_budget = wb,
+            )
+            messagebox.showinfo("Report generated", f"PDF report saved to:\n{path}")
+        except Exception as e:
+            import traceback
+            messagebox.showerror("Report error", traceback.format_exc())
+
+    # Wire export menu items
+    file_menu.add_separator()
+    file_menu.add_command(label="Export CSV…",       command=_do_export_csv)
+    file_menu.add_command(label="Export Excel…",     command=_do_export_excel)
+    file_menu.add_command(label="Generate PDF Report…", command=_do_generate_report)
+
     file_menu.add_separator()
     file_menu.add_command(label="Exit", command=exit_app)
 
@@ -3054,6 +3792,12 @@ def launch_gui():
                command=prompt_save_config).grid(row=0, column=2, padx=4, pady=4)
     ttk.Button(btn_frame, text="📂  Load Config",
                command=prompt_load_config).grid(row=0, column=3, padx=4, pady=4)
+    ttk.Button(btn_frame, text="📊  Export CSV",
+               command=_do_export_csv).grid(row=0, column=4, padx=4, pady=4)
+    ttk.Button(btn_frame, text="📗  Export Excel",
+               command=_do_export_excel).grid(row=0, column=5, padx=4, pady=4)
+    ttk.Button(btn_frame, text="📄  Generate Report",
+               command=_do_generate_report).grid(row=0, column=6, padx=4, pady=4)
 
     root.protocol("WM_DELETE_WINDOW", exit_app)
     root.mainloop()
