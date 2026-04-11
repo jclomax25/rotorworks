@@ -599,7 +599,8 @@ class FixedWingConfig:
                  periph_current_A:  float   = 0.0,
                  esc:             Optional[ESCConfig]      = None,
                  avionics:        Optional[AvionicsConfig] = None,
-                 air_density:     float     = RHO0):
+                 air_density:     float     = RHO0,
+                 reference_altitude_m: float = 0.0):
         self.airframe          = airframe
         self.battery           = battery
         self.motor             = motor
@@ -610,6 +611,7 @@ class FixedWingConfig:
         self.esc               = esc
         self.avionics          = avionics
         self.air_density       = float(air_density)
+        self.reference_altitude_m = max(float(reference_altitude_m), 0.0)
         # Alias for shared code
         self.num_motors        = airframe.num_motors
 
@@ -882,14 +884,213 @@ def drag_N(config: FixedWingConfig, speed_mps: float) -> float:
 
     The drag equals the thrust required for level flight.
     """
+    _, _, total_drag = drag_components_N(config, speed_mps)
+    return total_drag
+
+
+def wing_loading_N_m2(config: FixedWingConfig) -> float:
+    """Wing loading W/S in N/m²."""
+    S = config.airframe.wing_area_m2
+    return config.weight_N / S if S > 0 else 0.0
+
+
+def wing_loading_kg_m2(config: FixedWingConfig) -> float:
+    """Wing loading in kg/m² (mass per wing area)."""
+    S = config.airframe.wing_area_m2
+    return (config.aircraft_weight_g / 1000.0) / S if S > 0 else 0.0
+
+
+def drag_components_N(config: FixedWingConfig, speed_mps: float) -> Tuple[float, float, float]:
+    """
+    Split level-flight drag into induced and parasitic components.
+    Returns (induced_drag_N, parasitic_drag_N, total_drag_N).
+    """
     af  = config.airframe
     rho = config.air_density
     W   = config.weight_N
     V   = max(speed_mps, 0.1)
     q   = 0.5 * rho * V ** 2
+    S   = af.wing_area_m2
     CL  = af.cl_at_speed(W, V, rho)
-    CD  = af.cd_at_cl(CL)
-    return q * af.wing_area_m2 * CD
+
+    cd_parasitic = af.CD0
+    cd_induced   = af.k * CL ** 2
+
+    d_parasitic = q * S * cd_parasitic
+    d_induced   = q * S * cd_induced
+    return d_induced, d_parasitic, d_induced + d_parasitic
+
+
+def glide_sink_rate_mps(config: FixedWingConfig, speed_mps: float) -> float:
+    """
+    Unpowered sink rate approximation:
+        sink = V * D/L = V / (L/D)
+    """
+    af  = config.airframe
+    rho = config.air_density
+    W   = config.weight_N
+    V   = max(speed_mps, 0.1)
+    CL  = af.cl_at_speed(W, V, rho)
+    LD  = af.ld_ratio(CL)
+    return V / LD if LD > 0 else float("inf")
+
+
+def minimum_sink_speed(config: FixedWingConfig,
+                       v_stall: float,
+                       v_max: float = 80.0,
+                       steps: int = 500) -> Tuple[float, float]:
+    """
+    Minimum sink speed for glide, numerically searched.
+    Returns (V_min_sink [m/s], sink_rate_min [m/s]).
+    """
+    v_lo = max(v_stall * 1.05, 1.0)
+    v_hi = min(v_max, v_lo + 40.0)
+    best_v = v_lo
+    best_sink = float("inf")
+    for i in range(steps + 1):
+        V = v_lo + (v_hi - v_lo) * i / steps
+        sink = glide_sink_rate_mps(config, V)
+        if sink < best_sink:
+            best_sink = sink
+            best_v = V
+    if not math.isfinite(best_sink):
+        return best_v, 0.0
+    return best_v, best_sink
+
+
+def _max_rate_of_climb_at_altitude_m(config: FixedWingConfig,
+                                     altitude_m: float,
+                                     v_max: float = 80.0) -> float:
+    """Maximum ROC at a given ISA altitude (helper for service ceiling)."""
+    rho_prev = config.air_density
+    try:
+        config.air_density = isa_density(altitude_m)
+        v_min = max(stall_speed(config) * 1.05, 1.0)
+        _, rc = max_rate_of_climb_mps(config, v_min=v_min, v_max=v_max, steps=180)
+        return rc
+    finally:
+        config.air_density = rho_prev
+
+
+def service_ceiling_m(config: FixedWingConfig,
+                      rc_threshold_mps: float = 0.508,
+                      max_alt_m: float = 12000.0,
+                      coarse_step_m: float = 250.0) -> float:
+    """
+    Service ceiling (ISA altitude ASL) where max rate of climb falls to
+    rc_threshold_mps (default 100 ft/min ≈ 0.508 m/s).
+    Returns +inf if threshold is still exceeded at max_alt_m.
+    """
+    # Cache by configuration state to avoid recomputing in sweeps.
+    cache = getattr(config, "_service_ceiling_cache", {})
+    cache_key = (
+        round(rc_threshold_mps, 4),
+        round(max_alt_m, 1),
+        round(coarse_step_m, 1),
+        round(config.reference_altitude_m, 1),
+        round(config.aircraft_weight_g, 2),
+        round(config.airframe.wing_area_m2, 5),
+        round(config.airframe.CD0, 5),
+        round(config.airframe.CL_max, 5),
+        round(config.airframe.oswald, 5),
+        round(config.airframe.prop_efficiency, 5),
+        round(float(config.motor.kv or 0.0), 3),
+        round(config.motor.max_power, 2),
+        round(config.propeller.diameter_in, 3),
+        round(config.propeller.pitch_in, 3),
+        int(config.num_motors),
+        bool(config.propeller.table is not None),
+    )
+    if cache_key in cache:
+        return cache[cache_key]
+
+    base_alt = max(config.reference_altitude_m, 0.0)
+    rc_base = _max_rate_of_climb_at_altitude_m(config, base_alt)
+    if rc_base < rc_threshold_mps:
+        cache[cache_key] = base_alt
+        setattr(config, "_service_ceiling_cache", cache)
+        return base_alt
+
+    lo = base_alt
+    hi = None
+    alt = base_alt + coarse_step_m
+    while alt <= max_alt_m:
+        rc_here = _max_rate_of_climb_at_altitude_m(config, alt)
+        if rc_here < rc_threshold_mps:
+            hi = alt
+            break
+        lo = alt
+        alt += coarse_step_m
+
+    if hi is None:
+        cache[cache_key] = float("inf")
+        setattr(config, "_service_ceiling_cache", cache)
+        return float("inf")
+
+    # Refine crossing with binary search.
+    for _ in range(12):
+        mid = 0.5 * (lo + hi)
+        rc_mid = _max_rate_of_climb_at_altitude_m(config, mid)
+        if rc_mid >= rc_threshold_mps:
+            lo = mid
+        else:
+            hi = mid
+    cache[cache_key] = lo
+    setattr(config, "_service_ceiling_cache", cache)
+    return lo
+
+
+def landing_distance_m(config: FixedWingConfig,
+                       obstacle_height_m: float = 15.0) -> float:
+    """
+    Simplified landing distance from 15 m obstacle:
+      total = approach + flare + rollout
+    """
+    af  = config.airframe
+    rho = config.air_density
+    W   = config.weight_N
+    S   = af.wing_area_m2
+    if S <= 0:
+        return float("inf")
+
+    V_stall = stall_speed(config)
+    V_app   = 1.30 * V_stall
+    V_td    = 1.15 * V_stall
+
+    CL_app  = af.cl_at_speed(W, V_app, rho)
+    LD_app  = max(af.ld_ratio(CL_app), 1e-3)
+    approach_dist = obstacle_height_m * LD_app
+
+    q_td    = 0.5 * rho * V_td ** 2
+    CL_land = min(max(af.CL_takeoff, 0.2), af.CL_max)
+    CD_land = af.cd_at_cl(CL_land)
+    D_land  = q_td * S * CD_land
+    L_land  = q_td * S * CL_land
+
+    # Use a higher effective friction than takeoff roll (braking applied).
+    mu_brake = max(af.mu_roll * 1.8, 0.08)
+    F_brake  = mu_brake * max(W - L_land, 0.0)
+    mass_kg  = max(W / G0, 1e-6)
+    decel    = (F_brake + D_land) / mass_kg
+    if decel <= 0:
+        return float("inf")
+
+    rollout = V_td ** 2 / (2.0 * decel)
+    flare   = 0.5 * V_td
+    return approach_dist + flare + rollout
+
+
+def cruise_efficiency(speed_mps: float, total_power_W: float) -> Tuple[float, float]:
+    """
+    Cruise efficiency at the operating point.
+    Returns (specific_range_m_per_Wh, specific_endurance_min_per_Wh).
+    """
+    P = max(total_power_W, 0.0)
+    if P <= 0:
+        return 0.0, 0.0
+    specific_range_m_per_Wh = max(speed_mps, 0.0) * 3600.0 / P
+    specific_endurance_min_per_Wh = 60.0 / P
+    return specific_range_m_per_Wh, specific_endurance_min_per_Wh
 
 
 def _fit_propeller_curve(thrust_g_data: np.ndarray, y_data: np.ndarray, degree: int = 2) -> tuple:
@@ -1213,7 +1414,7 @@ def compute_metrics(config: FixedWingConfig, speed_mps: float) -> dict:
     CL      = af.cl_at_speed(W, V, rho)
     CD      = af.cd_at_cl(CL)
     LD      = af.ld_ratio(CL)
-    D       = drag_N(config, V)
+    d_induced, d_parasitic, D = drag_components_N(config, V)
     P_prop  = power_required_W(config, V)         # shaft / propulsive power  [W]
     T_req   = D                                    # thrust required [N]
     T_avail = thrust_available_N(config)
@@ -1242,12 +1443,16 @@ def compute_metrics(config: FixedWingConfig, speed_mps: float) -> dict:
     rc_at_V         = rate_of_climb_mps(config, V)
     v_gamma, gamma  = best_angle_of_climb_speed(config)
     S_to            = takeoff_distance_m(config)
+    S_ld            = landing_distance_m(config)
     aoa             = af.aoa_deg(CL)
     Re              = af.reynolds_number(V, rho)
     V_tip           = tip_speed_mps(config, rpm_est)
     V_pitch         = pitch_speed_mps(config, rpm_est)
     spec_thrust     = specific_thrust(config)
     max_prop_P      = motor.max_power * config.num_motors
+    wing_load_N_m2  = wing_loading_N_m2(config)
+    wing_load_kg_m2 = wing_loading_kg_m2(config)
+    V_min_sink, sink_min = minimum_sink_speed(config, V_stall)
 
     # Flight time at current speed
     if P_total > 0 and pack_I <= batt.discharge_max_A and V_load >= batt.vmin_pack:
@@ -1257,6 +1462,15 @@ def compute_metrics(config: FixedWingConfig, speed_mps: float) -> dict:
         t_min = 0.0
         d_km  = 0.0
 
+    specific_range_m_Wh, specific_endurance_min_Wh = cruise_efficiency(V, P_total)
+    service_ceiling_abs_m = service_ceiling_m(config)
+    if math.isfinite(service_ceiling_abs_m):
+        service_ceiling_agl_m = max(service_ceiling_abs_m - config.reference_altitude_m, 0.0)
+    else:
+        service_ceiling_agl_m = float("inf")
+    glide_ratio = LD
+    glide_dist_m = glide_ratio * max(config.reference_altitude_m, 0.0)
+
     return dict(
         # Speed
         airspeed_mps       = V,
@@ -1265,7 +1479,14 @@ def compute_metrics(config: FixedWingConfig, speed_mps: float) -> dict:
         CL                 = CL,
         CD                 = CD,
         LD_ratio           = LD,
+        glide_ratio        = glide_ratio,
+        glide_distance_m   = glide_dist_m,
+        glide_distance_km  = glide_dist_m / 1000.0,
+        induced_drag_N     = d_induced,
+        parasitic_drag_N   = d_parasitic,
         drag_N             = D,
+        wing_loading_N_m2  = wing_load_N_m2,
+        wing_loading_kg_m2 = wing_load_kg_m2,
         aoa_deg            = aoa,
         reynolds_number    = Re,
         # Thrust / power
@@ -1295,14 +1516,32 @@ def compute_metrics(config: FixedWingConfig, speed_mps: float) -> dict:
         best_endurance_speed_mps  = V_be,
         best_range_speed_mps      = V_br,
         best_ld_ratio             = LD_br,
+        min_sink_speed_mps        = V_min_sink,
+        min_sink_rate_mps         = sink_min,
+        service_ceiling_m         = service_ceiling_abs_m,
+        service_ceiling_agl_m     = service_ceiling_agl_m,
         # Ground
         takeoff_dist_m     = S_to,
+        landing_dist_m     = S_ld,
         # Duration
         flight_time_min    = t_min,
         flight_range_km    = d_km,
+        specific_range_m_per_Wh        = specific_range_m_Wh,
+        specific_range_km_per_kWh      = specific_range_m_Wh,
+        specific_endurance_min_per_Wh  = specific_endurance_min_Wh,
+        specific_endurance_h_per_kWh   = specific_endurance_min_Wh * (1000.0 / 60.0),
         # ESC note
         esc_note           = esc_note,
     )
+
+
+def _format_distance_m(value_m: float) -> str:
+    """Format distance in m or km for compact display."""
+    if not math.isfinite(value_m):
+        return "∞"
+    if abs(value_m) >= 1000.0:
+        return f"{value_m/1000.0:.2f} km"
+    return f"{value_m:.1f} m"
 
 
 # ============================================================
@@ -1356,7 +1595,7 @@ def make_performance_figure(config: FixedWingConfig,
       3. Power Required vs Available vs Speed
       4. Rate of Climb vs Speed
       5. Drag Polar  (CL vs CD)
-      6. L/D Ratio vs Speed
+      6. Induced vs Parasitic Drag vs Speed
     """
     V_stall = stall_speed(config)
     v_lo    = max(V_stall, 1.0)
@@ -1366,6 +1605,7 @@ def make_performance_figure(config: FixedWingConfig,
     times, ranges, drags, T_avail_v = [], [], [], []
     powers_req, powers_avail        = [], []
     rcs, CLs, CDs, LDs              = [], [], [], []
+    induced_drags, parasitic_drags  = [], []
 
     T_av = thrust_available_N(config)
     af   = config.airframe
@@ -1375,7 +1615,9 @@ def make_performance_figure(config: FixedWingConfig,
     for V in speeds:
         times.append(flight_time_min(config, V))
         ranges.append(flight_range_km(config, V))
-        D  = drag_N(config, V)
+        d_ind, d_par, D = drag_components_N(config, V)
+        induced_drags.append(d_ind)
+        parasitic_drags.append(d_par)
         drags.append(D)
         T_avail_v.append(T_av)
         powers_req.append(power_required_W(config, V))
@@ -1437,12 +1679,15 @@ def make_performance_figure(config: FixedWingConfig,
     ax.axhline(config.airframe.CL_max, color="red", linestyle=":", linewidth=1, label="CL_max")
     ax.grid(True, alpha=0.4); ax.legend(fontsize=8)
 
-    # ---- 6. L/D Ratio ----
+    # ---- 6. Induced vs Parasitic Drag ----
     ax = axes[1, 2]
-    ax.plot(speeds, LDs, color="darkorange")
-    ax.set_xlabel("Airspeed (m/s)"); ax.set_ylabel("L/D Ratio")
-    ax.set_title("Lift-to-Drag Ratio vs Airspeed")
+    ax.plot(speeds, induced_drags,   color="navy",      label="Induced Drag")
+    ax.plot(speeds, parasitic_drags, color="darkorange", label="Parasitic Drag")
+    ax.plot(speeds, drags, color="gray", linestyle="--", linewidth=1.0, label="Total Drag")
+    ax.set_xlabel("Airspeed (m/s)"); ax.set_ylabel("Drag (N)")
+    ax.set_title("Induced vs Parasitic Drag")
     ax.axvline(V_stall, color="red", linestyle=":", linewidth=1)
+    ax.legend(fontsize=8)
     ax.grid(True, alpha=0.4)
 
     fig.tight_layout(rect=[0, 0, 1, 0.95])
@@ -3328,6 +3573,7 @@ def launch_gui():
         _ins_metric("Total Weight",              f"{cfg.aircraft_weight_g:.0f} g  ({cfg.weight_N:.2f} N)")
         _ins_metric("Wing Span",                 f"{af.wing_span_m:.3f} m")
         _ins_metric("Wing Area",                 f"{af.wing_area_m2:.4f} m²")
+        _ins_metric("Wing Loading",              f"{m.get('wing_loading_N_m2',0):.1f} N/m²  ({m.get('wing_loading_kg_m2',0):.2f} kg/m²)")
         _ins_metric("Mean Chord",                f"{af.chord_m:.4f} m")
         _ins_metric("Aspect Ratio",              f"{af.aspect_ratio:.2f}")
         _ins_metric("Induced Drag Factor k",     f"{af.k:.5f}")
@@ -3340,6 +3586,10 @@ def launch_gui():
         _ins_metric("CL at Cruise",              f"{m.get('CL',0):.4f}")
         _ins_metric("CD at Cruise",              f"{m.get('CD',0):.5f}")
         _ins_metric("L/D Ratio",                 f"{m.get('LD_ratio',0):.2f}")
+        _ins_metric("Glide Ratio",               f"{m.get('glide_ratio',0):.2f}:1")
+        _ins_metric("Glide Distance (from alt)", f"{m.get('glide_distance_m',0):.1f} m")
+        _ins_metric("Induced Drag",              f"{m.get('induced_drag_N',0):.2f} N")
+        _ins_metric("Parasitic Drag",            f"{m.get('parasitic_drag_N',0):.2f} N")
         _ins_metric("Angle of Attack",           f"{m.get('aoa_deg',0):.2f} °")
         _ins_metric("Reynolds Number",           f"{m.get('reynolds_number',0):,.0f}")
 
@@ -3373,18 +3623,31 @@ def launch_gui():
         _ins_metric("Rate of Climb @ Cruise",    f"{m.get('rate_of_climb_mps',0)*60:.1f} m/min  ({m.get('rate_of_climb_mps',0):.2f} m/s)")
         _ins_metric("Max Rate of Climb",         f"{m.get('max_rc_mps',0)*60:.1f} m/min  @ {m.get('v_max_rc_mps',0):.1f} m/s")
         _ins_metric("Max Angle of Climb",        f"{m.get('max_aoc_deg',0):.1f} °  @ {m.get('v_max_aoc_mps',0):.1f} m/s")
+        _ins_metric("Service Ceiling (ASL)",     f"{m.get('service_ceiling_m', float('inf')):.0f} m"
+                    if math.isfinite(m.get('service_ceiling_m', float('inf')))
+                    else f"> {12000:.0f} m")
+        _ins_metric("Service Ceiling (AGL)",     f"{m.get('service_ceiling_agl_m', float('inf')):.0f} m"
+                    if math.isfinite(m.get('service_ceiling_agl_m', float('inf')))
+                    else f"> {12000:.0f} m")
         _ins_metric("Takeoff Ground Roll",       f"{m.get('takeoff_dist_m', float('inf')):.1f} m"
                     if math.isfinite(m.get('takeoff_dist_m', float('inf')))
                     else "∞ (T < rolling friction)")
+        _ins_metric("Landing Distance",          f"{m.get('landing_dist_m', float('inf')):.1f} m"
+                    if math.isfinite(m.get('landing_dist_m', float('inf')))
+                    else "∞ (insufficient braking)")
 
         _sep_metric("Optimal Speeds")
         _ins_metric("Best Endurance Speed",      f"{m.get('best_endurance_speed_mps',0):.1f} m/s  ({m.get('best_endurance_speed_mps',0)*3.6:.1f} km/h)")
         _ins_metric("Best Range Speed",          f"{m.get('best_range_speed_mps',0):.1f} m/s  ({m.get('best_range_speed_mps',0)*3.6:.1f} km/h)")
+        _ins_metric("Minimum Sink Speed",        f"{m.get('min_sink_speed_mps',0):.1f} m/s  ({m.get('min_sink_speed_mps',0)*3.6:.1f} km/h)")
+        _ins_metric("Minimum Sink Rate",         f"{m.get('min_sink_rate_mps',0):.2f} m/s")
         _ins_metric("Max L/D Ratio",             f"{m.get('best_ld_ratio',0):.2f}")
 
         _sep_metric("Endurance & Range @ Cruise")
         _ins_metric("Flight Time",               f"{m.get('flight_time_min',0):.1f} min")
         _ins_metric("Flight Range",              f"{m.get('flight_range_km',0):.2f} km")
+        _ins_metric("Specific Range",            f"{m.get('specific_range_m_per_Wh',0):.1f} m/Wh  ({m.get('specific_range_km_per_kWh',0):.2f} km/kWh)")
+        _ins_metric("Specific Endurance",        f"{m.get('specific_endurance_min_per_Wh',0):.3f} min/Wh  ({m.get('specific_endurance_h_per_kWh',0):.3f} h/kWh)")
 
     # ---- Output text ----
     out_frame = ttk.LabelFrame(right, text="Output", padding=4)
@@ -3501,6 +3764,7 @@ def launch_gui():
             esc                 = esc,
             avionics            = avionics,
             air_density         = rho,
+            reference_altitude_m= alt,
         )
 
     # ---- Run: single-point ----
@@ -3566,6 +3830,8 @@ def launch_gui():
                 "Range (km)":            [flight_range_km(cfg, v) for v in _sp_vs],
                 "Power Required (W)":    [power_required_W(cfg, v) for v in _sp_vs],
                 "Drag (N)":              [drag_N(cfg, v) for v in _sp_vs],
+                "Induced Drag (N)":      [drag_components_N(cfg, v)[0] for v in _sp_vs],
+                "Parasitic Drag (N)":    [drag_components_N(cfg, v)[1] for v in _sp_vs],
                 "Rate of Climb (m/s)":   [rate_of_climb_mps(cfg, v) for v in _sp_vs],
                 "L/D Ratio":             [cfg.airframe.ld_ratio(
                     cfg.airframe.cl_at_speed(cfg.weight_N, v, cfg.air_density))
@@ -3585,6 +3851,13 @@ def launch_gui():
             log(f"Max RC        : {m['max_rc_mps']*60:.0f} m/min  @ {m['v_max_rc_mps']:.1f} m/s")
             log(f"Best Endurance: {V_be:.1f} m/s  |  Best Range: {V_br:.1f} m/s")
             log(f"Takeoff Roll  : {m['takeoff_dist_m']:.1f} m")
+            log(f"Landing Dist. : {m['landing_dist_m']:.1f} m")
+            log(f"Min Sink Speed: {m['min_sink_speed_mps']:.1f} m/s  |  Sink: {m['min_sink_rate_mps']:.2f} m/s")
+            log(f"Specific Range: {m['specific_range_m_per_Wh']:.1f} m/Wh")
+            if math.isfinite(m["service_ceiling_m"]):
+                log(f"Service Ceiling: {m['service_ceiling_m']:.0f} m ASL")
+            else:
+                log("Service Ceiling: > 12000 m ASL")
         except Exception as e:
             import traceback
             messagebox.showerror("Simulation error", traceback.format_exc())
@@ -4021,6 +4294,7 @@ def main():
         cruise_speed_mps  = args.cruise_speed,
         periph_current_A  = args.periph_current,
         air_density       = rho,
+        reference_altitude_m = args.altitude,
     )
 
     V_cruise = args.cruise_speed
@@ -4033,10 +4307,14 @@ def main():
     print(f"  Chord / AR            : {af.chord_m:.3f} m / {af.aspect_ratio:.2f}")
     print(f"  Reynolds Number       : {m['reynolds_number']:,.0f}")
     print(f"  Stall Speed           : {m['stall_speed_mps']:.2f} m/s ({m['stall_speed_mps']*3.6:.1f} km/h)")
+    print(f"  Wing Loading          : {m['wing_loading_N_m2']:.1f} N/m² ({m['wing_loading_kg_m2']:.2f} kg/m²)")
     print(f"  CL / CD               : {m['CL']:.4f} / {m['CD']:.5f}")
     print(f"  L/D Ratio             : {m['LD_ratio']:.2f}")
+    print(f"  Glide Ratio           : {m['glide_ratio']:.2f}:1")
+    print(f"  Glide Distance        : {m['glide_distance_m']:.1f} m (from {args.altitude:.0f} m altitude)")
     print(f"  Angle of Attack       : {m['aoa_deg']:.2f} °")
     print(f"  Drag (thrust req)     : {m['drag_N']:.2f} N")
+    print(f"  Induced / Parasitic D : {m['induced_drag_N']:.2f} / {m['parasitic_drag_N']:.2f} N")
     print(f"  Thrust available      : {m['thrust_available_N']:.2f} N")
     print(f"  Specific Thrust (T/W) : {m['specific_thrust']:.3f}")
     print(f"  Tip Speed             : {m['tip_speed_mps']:.1f} m/s")
@@ -4047,11 +4325,20 @@ def main():
     print(f"  Rate of Climb         : {m['rate_of_climb_mps']*60:.1f} m/min")
     print(f"  Max Rate of Climb     : {m['max_rc_mps']*60:.1f} m/min @ {m['v_max_rc_mps']:.1f} m/s")
     print(f"  Max Angle of Climb    : {m['max_aoc_deg']:.1f} °  @ {m['v_max_aoc_mps']:.1f} m/s")
+    if math.isfinite(m['service_ceiling_m']):
+        print(f"  Service Ceiling       : {m['service_ceiling_m']:.0f} m ASL ({m['service_ceiling_agl_m']:.0f} m AGL)")
+    else:
+        print(f"  Service Ceiling       : > 12000 m ASL")
     print(f"  Takeoff Ground Roll   : {m['takeoff_dist_m']:.1f} m")
+    print(f"  Landing Distance      : {m['landing_dist_m']:.1f} m")
     print(f"  Best Endurance Speed  : {m['best_endurance_speed_mps']:.1f} m/s ({m['best_endurance_speed_mps']*3.6:.1f} km/h)")
     print(f"  Best Range Speed      : {m['best_range_speed_mps']:.1f} m/s ({m['best_range_speed_mps']*3.6:.1f} km/h)")
+    print(f"  Minimum Sink Speed    : {m['min_sink_speed_mps']:.1f} m/s")
+    print(f"  Minimum Sink Rate     : {m['min_sink_rate_mps']:.2f} m/s")
     print(f"  Flight Time           : {m['flight_time_min']:.1f} min")
     print(f"  Flight Range          : {m['flight_range_km']:.2f} km")
+    print(f"  Specific Range        : {m['specific_range_m_per_Wh']:.1f} m/Wh ({m['specific_range_km_per_kWh']:.1f} km/kWh)")
+    print(f"  Specific Endurance    : {m['specific_endurance_min_per_Wh']:.3f} min/Wh ({m['specific_endurance_h_per_kWh']:.3f} h/kWh)")
     print(f"{'='*55}\n")
 
     V_be, t_best, V_br, d_best = find_optimal_speeds(cfg)
