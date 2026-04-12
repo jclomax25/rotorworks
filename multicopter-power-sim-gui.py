@@ -53,6 +53,11 @@ import matplotlib.pyplot as plt
 # -------------------------------
 AIR_DENSITY = 1.225  # kg/m^3 (sea level ISA)
 
+# Default rotor inflow efficiency map in forward flight.
+# eta > 1.0 means translational lift improves rotor efficiency at that advance ratio.
+DEFAULT_INFLOW_MU_BP = [0.0, 0.08, 0.16, 0.24, 0.32, 0.40, 0.50]
+DEFAULT_INFLOW_EFF_BP = [1.00, 1.04, 1.08, 1.06, 1.00, 0.94, 0.88]
+
 # Gas constant / ISA params
 R = 287.05   # J/kg/K (specific gas constant for dry air)
 T0 = 288.15  # K (sea level standard temp, 15°C)
@@ -331,6 +336,26 @@ def parse_voltage_tree(spec: Optional[str]) -> dict:
         out[float(v)] = (float(i), float(eff))
 
     return out
+
+
+def parse_float_list(spec: Optional[object]) -> Optional[List[float]]:
+    """Parse comma-separated floats into a list; empty input returns None."""
+    if spec is None:
+        return None
+    if isinstance(spec, (list, tuple, np.ndarray)):
+        vals = [float(x) for x in spec]
+        return vals if vals else None
+    s = str(spec).strip()
+    if not s:
+        return None
+    vals: List[float] = []
+    for tok in s.split(","):
+        t = tok.strip()
+        if not t:
+            continue
+        vals.append(float(t))
+    return vals if vals else None
+
 def avionics_input_power_W(avionics: Optional[AvionicsConfig]) -> float:
     """Return total input power drawn from the battery to supply avionics rails (W).
 
@@ -574,7 +599,16 @@ class DroneConfig:
                  arm_width_m: Optional[float] = None,
                  coaxial_spacing_m: Optional[float] = None,
                  max_tilt_deg: Optional[float] = None,
-                 motor_configuration: str = "flat"  # "flat" or "coaxial"
+                 motor_configuration: str = "flat",  # "flat" or "coaxial"
+                 # --- Mission-transient dynamics ---
+                 transient_dt_s: float = 0.5,
+                 max_accel_mps2: float = 2.0,
+                 max_decel_mps2: float = 2.5,
+                 decel_regen_eff: float = 0.0,
+                 # --- Rotor inflow map ---
+                 inflow_map_enabled: bool = True,
+                 inflow_mu_bp: Optional[List[float]] = None,
+                 inflow_eff_bp: Optional[List[float]] = None,
                  ):
         self.num_motors = int(num_motors)
         self.battery = battery
@@ -606,6 +640,34 @@ class DroneConfig:
         self.motor_configuration = (motor_configuration or "flat").strip().lower()
         if self.motor_configuration not in ("flat", "coaxial"):
             self.motor_configuration = "flat"
+
+        # Transient acceleration/deceleration model used by mission simulation.
+        self.transient_dt_s = max(float(transient_dt_s), 0.05)
+        self.max_accel_mps2 = max(float(max_accel_mps2), 0.01)
+        self.max_decel_mps2 = max(float(max_decel_mps2), 0.01)
+        self.decel_regen_eff = min(max(float(decel_regen_eff), 0.0), 1.0)
+
+        # Rotor inflow / forward-flight efficiency map:
+        # mu (advance ratio) -> eta_inflow (dimensionless efficiency).
+        self.inflow_map_enabled = bool(inflow_map_enabled)
+        mu_raw = list(inflow_mu_bp) if inflow_mu_bp else list(DEFAULT_INFLOW_MU_BP)
+        eff_raw = list(inflow_eff_bp) if inflow_eff_bp else list(DEFAULT_INFLOW_EFF_BP)
+        if len(mu_raw) != len(eff_raw) or len(mu_raw) < 2:
+            mu_raw = list(DEFAULT_INFLOW_MU_BP)
+            eff_raw = list(DEFAULT_INFLOW_EFF_BP)
+        pairs = sorted((max(float(mu), 0.0), max(float(eta), 0.20))
+                       for mu, eta in zip(mu_raw, eff_raw))
+        self.inflow_mu_bp: List[float] = []
+        self.inflow_eff_bp: List[float] = []
+        for mu, eta in pairs:
+            if self.inflow_mu_bp and abs(mu - self.inflow_mu_bp[-1]) < 1e-9:
+                self.inflow_eff_bp[-1] = eta
+            else:
+                self.inflow_mu_bp.append(mu)
+                self.inflow_eff_bp.append(eta)
+        if len(self.inflow_mu_bp) < 2:
+            self.inflow_mu_bp = list(DEFAULT_INFLOW_MU_BP)
+            self.inflow_eff_bp = list(DEFAULT_INFLOW_EFF_BP)
 
         # Internal flag so we only derive drag once (unless user edits values)
         self._derived_drag_from_geometry = False
@@ -697,12 +759,20 @@ class MissionProfile:
                  reserve_percent: float = 20.0,
                  rth_reserve_Wh: float = 0.0,
                  diversion_reserve_Wh: float = 0.0,
-                 wind_direction_deg: float = 0.0):
+                 wind_direction_deg: float = 0.0,
+                 transient_dt_s: float = 0.5,
+                 max_accel_mps2: float = 2.0,
+                 max_decel_mps2: float = 2.5,
+                 decel_regen_eff: float = 0.0):
         self.phases = phases
         self.reserve_percent = float(reserve_percent)
         self.rth_reserve_Wh = float(rth_reserve_Wh)
         self.diversion_reserve_Wh = float(diversion_reserve_Wh)
         self.wind_direction_deg = float(wind_direction_deg)
+        self.transient_dt_s = max(float(transient_dt_s), 0.05)
+        self.max_accel_mps2 = max(float(max_accel_mps2), 0.01)
+        self.max_decel_mps2 = max(float(max_decel_mps2), 0.01)
+        self.decel_regen_eff = min(max(float(decel_regen_eff), 0.0), 1.0)
 
     @staticmethod
     def from_json(path: str) -> "MissionProfile":
@@ -727,6 +797,10 @@ class MissionProfile:
             rth_reserve_Wh=float(data.get("rth_reserve_Wh", 0.0)),
             diversion_reserve_Wh=float(data.get("diversion_reserve_Wh", 0.0)),
             wind_direction_deg=float(data.get("wind_direction_deg", 0.0)),
+            transient_dt_s=float(data.get("transient_dt_s", 0.5)),
+            max_accel_mps2=float(data.get("max_accel_mps2", 2.0)),
+            max_decel_mps2=float(data.get("max_decel_mps2", 2.5)),
+            decel_regen_eff=float(data.get("decel_regen_eff", 0.0)),
         )
 
 
@@ -783,6 +857,77 @@ def groundspeed_along_track_mps(airspeed_mps: float,
         return 0.0
     along_air = math.sqrt(max(v_air * v_air - xw * xw, 0.0))
     return max(along_air - float(headwind_mps), 0.0)
+
+
+def _interp_linear_clamped(x: float, xp: List[float], fp: List[float]) -> float:
+    """1D linear interpolation with endpoint clamping."""
+    if not xp or not fp or len(xp) != len(fp):
+        return 1.0
+    if x <= xp[0]:
+        return float(fp[0])
+    if x >= xp[-1]:
+        return float(fp[-1])
+    for i in range(1, len(xp)):
+        x0 = float(xp[i - 1]); x1 = float(xp[i])
+        if x <= x1:
+            y0 = float(fp[i - 1]); y1 = float(fp[i])
+            if abs(x1 - x0) < 1e-12:
+                return y1
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return float(fp[-1])
+
+
+def advance_ratio_mu(config: DroneConfig, airspeed_mps: float, rpm: Optional[float]) -> float:
+    """Rotor advance ratio mu = V / (Omega * R) for one rotor."""
+    if rpm is None:
+        return 0.0
+    try:
+        r_m = max(float(config.propeller.diameter_in) * 0.0254 / 2.0, 1e-9)
+        omega = max(2.0 * math.pi * float(rpm) / 60.0, 1e-9)
+        return max(float(airspeed_mps), 0.0) / (omega * r_m)
+    except Exception:
+        return 0.0
+
+
+def inflow_efficiency_from_mu(config: DroneConfig, mu: float, orientation: str) -> float:
+    """Inflow efficiency factor from configured mu map."""
+    if orientation != "forward":
+        return 1.0
+    if not bool(getattr(config, "inflow_map_enabled", True)):
+        return 1.0
+    mu_bp = list(getattr(config, "inflow_mu_bp", []) or DEFAULT_INFLOW_MU_BP)
+    eff_bp = list(getattr(config, "inflow_eff_bp", []) or DEFAULT_INFLOW_EFF_BP)
+    return max(_interp_linear_clamped(max(float(mu), 0.0), mu_bp, eff_bp), 0.2)
+
+
+def rotor_inflow_power_multiplier(config: DroneConfig,
+                                  airspeed_mps: float,
+                                  rpm: Optional[float],
+                                  orientation: str) -> Tuple[float, float, float]:
+    """Return (power_multiplier, mu, eta_inflow) for forward-flight inflow map."""
+    mu = advance_ratio_mu(config, airspeed_mps, rpm)
+    eta = inflow_efficiency_from_mu(config, mu, orientation)
+    # eta>1 reduces required power, eta<1 increases it.
+    multiplier = 1.0 / max(eta, 0.2)
+    return float(multiplier), float(mu), float(eta)
+
+
+def kinetic_power_term_W(weight_g: float, v_now_mps: float, v_next_mps: float, dt_s: float, regen_eff: float) -> float:
+    """
+    Kinetic energy rate [W] from speed change:
+      P = d(0.5*m*v^2)/dt
+    Positive values require extra power; negative values can be partially recovered.
+    """
+    if dt_s <= 1e-9:
+        return 0.0
+    m_kg = max(float(weight_g), 0.0) / 1000.0
+    e_now = 0.5 * m_kg * (max(float(v_now_mps), 0.0) ** 2)
+    e_next = 0.5 * m_kg * (max(float(v_next_mps), 0.0) ** 2)
+    p = (e_next - e_now) / float(dt_s)
+    if p >= 0.0:
+        return p
+    return p * min(max(float(regen_eff), 0.0), 1.0)
 
 
 def thermal_step(temp_c: float,
@@ -1235,7 +1380,10 @@ def motor_configuration_power_multiplier(config: DroneConfig, orientation: str) 
 
     return 1.0 + inc
 
-def power_required(config: DroneConfig, speed_mps: float, orientation: str) -> float:
+def power_required(config: DroneConfig,
+                   speed_mps: float,
+                   orientation: str,
+                   inflow_multiplier: Optional[float] = None) -> float:
     """
     Total electrical power for all motors (W), not including peripheral current.
     """
@@ -1253,6 +1401,9 @@ def power_required(config: DroneConfig, speed_mps: float, orientation: str) -> f
 
     # Apply motor-configuration penalty (e.g., coaxial interference)
     motor_power_W *= motor_configuration_power_multiplier(config, orientation)
+
+    if inflow_multiplier is not None:
+        motor_power_W *= max(float(inflow_multiplier), 0.2)
 
     return motor_power_W * config.num_motors
 
@@ -1272,6 +1423,7 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         airspeed = max(0.0, float(input_speed))
         groundspeed_mps = groundspeed_along_track_mps(airspeed, headwind_mps, crosswind_mps)
     drone.derive_drag_from_geometry_if_missing()
+    # First pass for RPM estimate (needed to compute mu for inflow map).
     motor_power_W = power_required(drone, airspeed, orientation)
     periph_power_W = avionics_input_power_W(getattr(drone, "avionics", None))
     if periph_power_W <= 0.0:
@@ -1308,6 +1460,16 @@ def _compute_operating_metrics_core(drone: DroneConfig,
                 rpm_est = float(motor_table['RPM'])
         except Exception:
             motor_table = None
+    inflow_mult, mu_adv, eta_inflow = rotor_inflow_power_multiplier(
+        drone, airspeed_mps=airspeed, rpm=rpm_est, orientation=orientation
+    )
+    if orientation == "forward":
+        # Recompute propulsion power with inflow multiplier applied.
+        motor_power_W = power_required(drone, airspeed, orientation, inflow_multiplier=inflow_mult)
+        total_power_W, v_load, pack_current_A, esc_note, motor_I_esc_A = total_power_with_esc(
+            drone, motor_power_W=motor_power_W, periph_power_W=periph_power_W
+        )
+        esc_loss_W = max(0.0, float(total_power_W) - float(motor_power_W) - float(periph_power_W))
     tilt_req = required_tilt_deg(drone, airspeed, orientation)
 
     hover_thrust_total_N = thrust_required(drone, 0.0, "hover")
@@ -1378,6 +1540,9 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         "total_disk_area_m2":  float(A_total),
         "tip_speed_mps":       (float(tip_speed) if tip_speed == tip_speed else None),
         "tip_mach":            (float(tip_mach) if tip_mach == tip_mach else None),
+        "advance_ratio_mu":    float(mu_adv),
+        "inflow_efficiency":   float(eta_inflow),
+        "inflow_power_multiplier": float(inflow_mult),
         "noise_significant":   bool(tip_mach == tip_mach and tip_mach > 0.6),
         "motor_copper_loss_W_per_motor": float(p_copper),
         "battery_loss_W":      float(battery_loss_W),
@@ -1529,10 +1694,32 @@ def simulate_mission(config: DroneConfig,
     esc_temp_c = ambient_c
     battery_temp_c = ambient_c
     prev_alt_m = float(mission.phases[0].altitude) if mission.phases else 0.0
+    current_speed_mps = 0.0
+
+    base_dt_s = max(
+        float(getattr(mission, "transient_dt_s", getattr(config, "transient_dt_s", 0.5))),
+        0.05
+    )
+    accel_up_mps2 = max(
+        float(getattr(mission, "max_accel_mps2", getattr(config, "max_accel_mps2", 2.0))),
+        0.01
+    )
+    accel_down_mps2 = max(
+        float(getattr(mission, "max_decel_mps2", getattr(config, "max_decel_mps2", 2.5))),
+        0.01
+    )
+    regen_eff = min(max(
+        float(getattr(mission, "decel_regen_eff", getattr(config, "decel_regen_eff", 0.0))),
+        0.0
+    ), 1.0)
+
     mission_series: dict = {
         't_s': [],
         'phase': [],
+        'segment_type': [],
         'airspeed_mps': [],
+        'commanded_airspeed_mps': [],
+        'accel_mps2': [],
         'groundspeed_mps': [],
         'headwind_mps': [],
         'crosswind_mps': [],
@@ -1543,6 +1730,7 @@ def simulate_mission(config: DroneConfig,
         'descent_rate_cmd_mps': [],
         'climb_power_add_W': [],
         'potential_power_W': [],
+        'kinetic_power_W': [],
         'battery_voltage_V': [],
         'battery_current_A': [],
         'battery_energy_Wh': [],
@@ -1563,6 +1751,9 @@ def simulate_mission(config: DroneConfig,
         'figure_of_merit': [],
         'disk_loading_N_m2': [],
         'tip_mach': [],
+        'advance_ratio_mu': [],
+        'inflow_efficiency': [],
+        'inflow_power_multiplier': [],
         'motor_temp_est_C': [],
         'esc_temp_est_C': [],
         'battery_temp_est_C': [],
@@ -1574,11 +1765,20 @@ def simulate_mission(config: DroneConfig,
     t_s = 0.0
     dist_km = 0.0
 
-    def _append_point(phase_name: str, phase_alt_m: float, m: dict, t_s_now: float, dist_km_now: float, remaining_wh_now: float, reserve_hit: bool):
-        # Note: many metrics are phase-steady; distance/energy change across the phase.
+    def _append_point(phase_name: str,
+                      phase_alt_m: float,
+                      segment_type: str,
+                      m: dict,
+                      t_s_now: float,
+                      dist_km_now: float,
+                      remaining_wh_now: float,
+                      reserve_hit: bool):
         mission_series['t_s'].append(float(t_s_now))
         mission_series['phase'].append(str(phase_name))
+        mission_series['segment_type'].append(str(segment_type))
         mission_series['airspeed_mps'].append(float(m.get('airspeed_mps', 0.0)))
+        mission_series['commanded_airspeed_mps'].append(float(m.get('commanded_airspeed_mps', 0.0)))
+        mission_series['accel_mps2'].append(float(m.get('accel_mps2', 0.0)))
         mission_series['groundspeed_mps'].append(float(m.get('groundspeed_mps', 0.0)))
         mission_series['headwind_mps'].append(float(m.get('wind_head_mps', 0.0)))
         mission_series['crosswind_mps'].append(float(m.get('wind_cross_mps', 0.0)))
@@ -1589,6 +1789,7 @@ def simulate_mission(config: DroneConfig,
         mission_series['descent_rate_cmd_mps'].append(float(m.get('descent_rate_cmd_mps', 0.0)))
         mission_series['climb_power_add_W'].append(float(m.get('climb_power_add_W', 0.0)))
         mission_series['potential_power_W'].append(float(m.get('potential_power_W', 0.0)))
+        mission_series['kinetic_power_W'].append(float(m.get('kinetic_power_W', 0.0)))
         mission_series['battery_voltage_V'].append(float(m.get('v_load_V', 0.0)))
         mission_series['battery_current_A'].append(float(m.get('pack_current_A', 0.0)))
         mission_series['battery_energy_Wh'].append(float(remaining_wh_now))
@@ -1611,6 +1812,9 @@ def simulate_mission(config: DroneConfig,
         mission_series['figure_of_merit'].append(float(m.get('figure_of_merit', 0.0)))
         mission_series['disk_loading_N_m2'].append(float(m.get('disk_loading_N_m2', 0.0)))
         mission_series['tip_mach'].append(float(m.get('tip_mach')) if m.get('tip_mach') is not None else float('nan'))
+        mission_series['advance_ratio_mu'].append(float(m.get('advance_ratio_mu', 0.0)))
+        mission_series['inflow_efficiency'].append(float(m.get('inflow_efficiency', 1.0)))
+        mission_series['inflow_power_multiplier'].append(float(m.get('inflow_power_multiplier', 1.0)))
         mission_series['motor_temp_est_C'].append(float(motor_temp_c))
         mission_series['esc_temp_est_C'].append(float(esc_temp_c))
         mission_series['battery_temp_est_C'].append(float(battery_temp_c))
@@ -1618,31 +1822,32 @@ def simulate_mission(config: DroneConfig,
         mission_series['hover_wind_resistance_mps'].append(float(m.get('hover_wind_resistance_mps', 0.0)))
         mission_series['prop_solidity_sigma'].append(float(m.get('prop_solidity_sigma', 0.0)))
 
-
     def _merge_worst(worst: Optional[dict], m: dict) -> dict:
         if worst is None:
             return dict(m)
-        # Max-style metrics
         for k in ("pack_current_A", "total_power_W", "motor_power_W", "periph_power_W",
                   "esc_loss_W", "motor_I_per_esc_A", "thrust_total_N", "thrust_per_motor_N",
-                  "motor_temp_est_C", "esc_temp_est_C", "battery_temp_est_C"):
+                  "motor_temp_est_C", "esc_temp_est_C", "battery_temp_est_C",
+                  "accel_mps2", "commanded_airspeed_mps", "advance_ratio_mu"):
             worst[k] = max(float(worst.get(k, 0.0)), float(m.get(k, 0.0)))
-        # Min-style metrics
         worst["v_load_V"] = min(float(worst.get("v_load_V", 1e9)), float(m.get("v_load_V", 1e9)))
         worst["reserve_margin_Wh"] = min(float(worst.get("reserve_margin_Wh", 1e9)),
                                          float(m.get("reserve_margin_Wh", 1e9)))
-        # RPM if available
         if worst.get("prop_rpm") is None:
             worst["prop_rpm"] = m.get("prop_rpm")
         elif m.get("prop_rpm") is not None:
             worst["prop_rpm"] = max(float(worst["prop_rpm"]), float(m["prop_rpm"]))
-        # Keep notes (best-effort)
         if str(m.get("esc_note", "")).strip():
             worst["esc_note"] = (str(worst.get("esc_note", "")) + "; " + str(m.get("esc_note", ""))).strip("; ")
         return worst
 
+    depleted = False
     for phase in mission.phases:
-        rho = compute_air_density(altitude_m=phase.altitude, temperature_C=temperature_C, pressure_Pa=pressure_Pa)
+        rho = compute_air_density(
+            altitude_m=phase.altitude,
+            temperature_C=temperature_C,
+            pressure_Pa=pressure_Pa
+        )
         config.air_density = rho
 
         headwind_mps, crosswind_mps = wind_components_mps(
@@ -1650,16 +1855,7 @@ def simulate_mission(config: DroneConfig,
             wind_direction_deg=float(mission.wind_direction_deg),
             course_deg=float(phase.course_deg),
         )
-        # Compute operating metrics for this phase, then fold into worst-case metrics.
-        m = compute_operating_metrics(
-            config,
-            speed_mps=float(phase.speed),
-            orientation=orientation,
-            wind_mps=wind_mps,
-            wind_direction_deg=float(mission.wind_direction_deg),
-            course_deg=float(phase.course_deg),
-            ambient_temp_C=ambient_c,
-        )
+
         climb_cmd = max(float(phase.climb_rate_mps or 0.0), 0.0)
         descent_cmd = max(float(phase.descent_rate_mps or 0.0), 0.0)
         if climb_cmd > 0 and descent_cmd > 0:
@@ -1672,131 +1868,238 @@ def simulate_mission(config: DroneConfig,
                     climb_cmd = est_vz
                 elif est_vz < 0:
                     descent_cmd = -est_vz
-        potential_power_w = (config.drone_weight_g * 9.81 / 1000.0) * (climb_cmd - descent_cmd)
-        base_total_power_w = float(m.get("total_power_W", 0.0))
-        total_power_w = max(base_total_power_w + potential_power_w, 0.0)
-        if base_total_power_w > 0:
-            scale = total_power_w / base_total_power_w
-            m["motor_power_W"] = float(m.get("motor_power_W", 0.0)) * scale
-            m["esc_loss_W"] = float(m.get("esc_loss_W", 0.0)) * scale
-        m["climb_rate_cmd_mps"] = climb_cmd
-        m["descent_rate_cmd_mps"] = descent_cmd
-        m["potential_power_W"] = potential_power_w
-        m["climb_power_add_W"] = potential_power_w
-        m["total_power_W"] = total_power_w
-        m["pack_current_A"] = total_power_w / max(float(config.battery.vnom_pack), 1.0)
-        m["v_load_V"] = battery_voltage_under_load(config.battery, m["pack_current_A"])
-        m["groundspeed_mps"] = groundspeed_along_track_mps(float(m.get("airspeed_mps", 0.0)), headwind_mps, crosswind_mps)
-        m["wind_head_mps"] = headwind_mps
-        m["wind_cross_mps"] = crosswind_mps
-        motor_esc_a = float(m.get("motor_I_per_esc_A", 0.0))
-        motor_copper_total_w = (motor_esc_a ** 2) * float(getattr(config.motor, "resistance", 0.0)) * max(int(config.num_motors), 1)
-        battery_loss_w = (float(m["pack_current_A"]) ** 2) * max(float(getattr(config.battery, "pack_resistance", 0.0)), 0.0)
-        m["battery_loss_W"] = battery_loss_w
-        m["motor_copper_loss_W"] = motor_copper_total_w
-        m["reserve_margin_Wh"] = remaining_wh - reserve_target_wh
-        worst_metrics = _merge_worst(worst_metrics, m)
 
-        # Append phase-start sample for mission plots
-        _append_point(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_wh, reserve_breached)
+        target_speed_mps = max(float(phase.speed), 0.0)
+        phase_elapsed_s = 0.0
+        phase_distance_m = 0.0
+        phase_status = "OK"
+        step_guard = 0
 
-        airspeed = float(m.get("airspeed_mps", 0.0))
-        total_power_W = float(m.get("total_power_W", 0.0))
-        pack_current_A = float(m.get("pack_current_A", 0.0))
-        v_load = float(m.get("v_load_V", 0.0))
-        motor_I_esc_A = float(m.get("motor_I_per_esc_A", 0.0))
-        esc_note = str(m.get("esc_note", "")).strip()
+        _append_point(
+            phase_name=phase.name,
+            phase_alt_m=float(phase.altitude),
+            segment_type="phase-start",
+            m={
+                "airspeed_mps": current_speed_mps,
+                "commanded_airspeed_mps": target_speed_mps,
+                "groundspeed_mps": groundspeed_along_track_mps(current_speed_mps, headwind_mps, crosswind_mps),
+                "wind_head_mps": headwind_mps,
+                "wind_cross_mps": crosswind_mps,
+                "accel_mps2": 0.0,
+                "climb_rate_cmd_mps": climb_cmd,
+                "descent_rate_cmd_mps": descent_cmd,
+                "potential_power_W": 0.0,
+                "climb_power_add_W": 0.0,
+                "kinetic_power_W": 0.0,
+                "advance_ratio_mu": 0.0,
+                "inflow_efficiency": 1.0,
+                "inflow_power_multiplier": 1.0,
+            },
+            t_s_now=t_s,
+            dist_km_now=dist_km,
+            remaining_wh_now=remaining_wh,
+            reserve_hit=reserve_breached,
+        )
 
-        if pack_current_A > config.battery.discharge_max_A:
-            results.append((phase.name, 0.0, 0.0, "Battery depleted (discharge limit exceeded)"))
-            break
-
-        if v_load < config.battery.vmin_pack:
-            results.append((phase.name, 0.0, 0.0, "Battery depleted (voltage under load)"))
-            break
-
-        if getattr(config, "esc", None) is not None and motor_I_esc_A > config.esc.max_current_A:
-            results.append((phase.name, 0.0, 0.0, f"ESC over max current: {motor_I_esc_A:.1f}A > {config.esc.max_current_A:.1f}A"))
-            break
-
-        status_ok = "OK"
-        if esc_note:
-            status_ok += f", {esc_note}"
-
-        if phase.duration is not None:
-            duration_s = float(phase.duration)
-            energy_used_Wh = total_power_W * (duration_s / 3600.0)
-            if energy_used_Wh > remaining_wh:
-                actual_time_min = (remaining_wh / total_power_W) * 60.0
-                actual_dist_km = float(m.get("groundspeed_mps", 0.0)) * (actual_time_min * 60.0) / 1000.0
-                # advance and append final point at depletion
-                t_s += actual_time_min * 60.0
-                dist_km += actual_dist_km
-                remaining_wh = 0.0
-                motor_temp_c = thermal_step(motor_temp_c, ambient_c, m.get("motor_copper_loss_W", 0.0), 0.35, 240.0, actual_time_min * 60.0)
-                esc_temp_c = thermal_step(esc_temp_c, ambient_c, m.get("esc_loss_W", 0.0), 0.75, 180.0, actual_time_min * 60.0)
-                battery_temp_c = thermal_step(battery_temp_c, ambient_c, m.get("battery_loss_W", 0.0), 0.25, 500.0, actual_time_min * 60.0)
-                _append_point(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_wh, True)
-                results.append((phase.name, actual_time_min, actual_dist_km, "Battery depleted"))
+        while True:
+            step_guard += 1
+            if step_guard > 200000:
+                phase_status = "Aborted: mission step limit reached"
                 break
-            remaining_wh -= energy_used_Wh
-            t_s += duration_s
-            dist_km += float(m.get("groundspeed_mps", 0.0)) * duration_s / 1000.0
+
+            if phase.duration is not None:
+                remain_s = float(phase.duration) - phase_elapsed_s
+                if remain_s <= 1e-9:
+                    break
+                dt_s = min(base_dt_s, remain_s)
+            elif phase.distance is not None:
+                remain_m = float(phase.distance) - phase_distance_m
+                if remain_m <= 1e-6:
+                    break
+                dt_s = base_dt_s
+            else:
+                phase_status = "Invalid: phase missing duration/distance"
+                break
+
+            dv_cmd = target_speed_mps - current_speed_mps
+            if dv_cmd >= 0.0:
+                dv = min(dv_cmd, accel_up_mps2 * dt_s)
+            else:
+                dv = max(dv_cmd, -accel_down_mps2 * dt_s)
+            v_next = max(0.0, current_speed_mps + dv)
+            accel_mps2 = dv / dt_s if dt_s > 0 else 0.0
+            v_eval = 0.5 * (current_speed_mps + v_next)
+            segment_type = "transient" if abs(accel_mps2) > 1e-4 else "steady"
+
+            m = compute_operating_metrics(
+                config,
+                speed_mps=v_eval,
+                orientation=orientation,
+                wind_mps=wind_mps,
+                wind_direction_deg=float(mission.wind_direction_deg),
+                course_deg=float(phase.course_deg),
+                ambient_temp_C=ambient_c,
+            )
+
+            potential_power_w = (config.drone_weight_g * 9.81 / 1000.0) * (climb_cmd - descent_cmd)
+            kinetic_power_w = kinetic_power_term_W(
+                config.drone_weight_g,
+                current_speed_mps,
+                v_next,
+                dt_s,
+                regen_eff,
+            )
+            base_total_power_w = float(m.get("total_power_W", 0.0))
+            total_power_w = max(base_total_power_w + potential_power_w + kinetic_power_w, 0.0)
+            scale = (total_power_w / base_total_power_w) if base_total_power_w > 1e-9 else 1.0
+            if base_total_power_w > 1e-9:
+                m["motor_power_W"] = float(m.get("motor_power_W", 0.0)) * scale
+                m["esc_loss_W"] = float(m.get("esc_loss_W", 0.0)) * scale
+                m["motor_I_per_esc_A"] = float(m.get("motor_I_per_esc_A", 0.0)) * max(scale, 0.0)
+            m["climb_rate_cmd_mps"] = climb_cmd
+            m["descent_rate_cmd_mps"] = descent_cmd
+            m["potential_power_W"] = potential_power_w
+            m["kinetic_power_W"] = kinetic_power_w
+            m["climb_power_add_W"] = potential_power_w + kinetic_power_w
+            m["total_power_W"] = total_power_w
+            m["pack_current_A"] = total_power_w / max(float(config.battery.vnom_pack), 1.0)
+            m["v_load_V"] = battery_voltage_under_load(config.battery, m["pack_current_A"])
+            gs_mps = groundspeed_along_track_mps(v_eval, headwind_mps, crosswind_mps)
+            m["airspeed_mps"] = v_eval
+            m["commanded_airspeed_mps"] = target_speed_mps
+            m["accel_mps2"] = accel_mps2
+            m["groundspeed_mps"] = gs_mps
+            m["wind_head_mps"] = headwind_mps
+            m["wind_cross_mps"] = crosswind_mps
+            m["reserve_margin_Wh"] = remaining_wh - reserve_target_wh
+
+            if phase.distance is not None:
+                remain_m = float(phase.distance) - phase_distance_m
+                step_dist_m = gs_mps * dt_s
+                if step_dist_m <= 1e-9 and remain_m > 1e-3:
+                    phase_status = "Invalid: zero groundspeed with distance phase"
+                    break
+                if step_dist_m > remain_m:
+                    frac = max(min(remain_m / max(step_dist_m, 1e-9), 1.0), 0.0)
+                    dt_s *= frac
+                    if dt_s <= 1e-9:
+                        break
+                    v_next = current_speed_mps + (v_next - current_speed_mps) * frac
+                    accel_mps2 = (v_next - current_speed_mps) / dt_s
+                    v_eval = 0.5 * (current_speed_mps + v_next)
+                    m = compute_operating_metrics(
+                        config,
+                        speed_mps=v_eval,
+                        orientation=orientation,
+                        wind_mps=wind_mps,
+                        wind_direction_deg=float(mission.wind_direction_deg),
+                        course_deg=float(phase.course_deg),
+                        ambient_temp_C=ambient_c,
+                    )
+                    kinetic_power_w = kinetic_power_term_W(
+                        config.drone_weight_g,
+                        current_speed_mps,
+                        v_next,
+                        dt_s,
+                        regen_eff,
+                    )
+                    base_total_power_w = float(m.get("total_power_W", 0.0))
+                    total_power_w = max(base_total_power_w + potential_power_w + kinetic_power_w, 0.0)
+                    scale = (total_power_w / base_total_power_w) if base_total_power_w > 1e-9 else 1.0
+                    if base_total_power_w > 1e-9:
+                        m["motor_power_W"] = float(m.get("motor_power_W", 0.0)) * scale
+                        m["esc_loss_W"] = float(m.get("esc_loss_W", 0.0)) * scale
+                        m["motor_I_per_esc_A"] = float(m.get("motor_I_per_esc_A", 0.0)) * max(scale, 0.0)
+                    m["climb_rate_cmd_mps"] = climb_cmd
+                    m["descent_rate_cmd_mps"] = descent_cmd
+                    m["potential_power_W"] = potential_power_w
+                    m["kinetic_power_W"] = kinetic_power_w
+                    m["climb_power_add_W"] = potential_power_w + kinetic_power_w
+                    m["total_power_W"] = total_power_w
+                    m["pack_current_A"] = total_power_w / max(float(config.battery.vnom_pack), 1.0)
+                    m["v_load_V"] = battery_voltage_under_load(config.battery, m["pack_current_A"])
+                    gs_mps = groundspeed_along_track_mps(v_eval, headwind_mps, crosswind_mps)
+                    m["airspeed_mps"] = v_eval
+                    m["commanded_airspeed_mps"] = target_speed_mps
+                    m["accel_mps2"] = accel_mps2
+                    m["groundspeed_mps"] = gs_mps
+                    m["wind_head_mps"] = headwind_mps
+                    m["wind_cross_mps"] = crosswind_mps
+                    m["reserve_margin_Wh"] = remaining_wh - reserve_target_wh
+
+            pack_current_A = float(m.get("pack_current_A", 0.0))
+            v_load = float(m.get("v_load_V", 0.0))
+            motor_I_esc_A = float(m.get("motor_I_per_esc_A", 0.0))
+            esc_note = str(m.get("esc_note", "")).strip()
+            if pack_current_A > config.battery.discharge_max_A:
+                phase_status = "Battery depleted (discharge limit exceeded)"
+                break
+            if v_load < config.battery.vmin_pack:
+                phase_status = "Battery depleted (voltage under load)"
+                break
+            if getattr(config, "esc", None) is not None and motor_I_esc_A > config.esc.max_current_A:
+                phase_status = f"ESC over max current: {motor_I_esc_A:.1f}A > {config.esc.max_current_A:.1f}A"
+                break
+
+            energy_used_Wh = total_power_w * (dt_s / 3600.0)
+            if energy_used_Wh > remaining_wh and total_power_w > 1e-9:
+                dt_s = (remaining_wh * 3600.0) / total_power_w
+                energy_used_Wh = remaining_wh
+                v_next = current_speed_mps + (v_next - current_speed_mps) * min(max(dt_s / max(base_dt_s, 1e-9), 0.0), 1.0)
+                gs_mps = groundspeed_along_track_mps(0.5 * (current_speed_mps + v_next), headwind_mps, crosswind_mps)
+                phase_status = "Battery depleted"
+                depleted = True
+
+            remaining_wh = max(remaining_wh - energy_used_Wh, 0.0)
             reserve_breached = reserve_breached or (remaining_wh < reserve_target_wh)
             reserve_min_wh = min(reserve_min_wh, remaining_wh)
-            motor_temp_c = thermal_step(motor_temp_c, ambient_c, m.get("motor_copper_loss_W", 0.0), 0.35, 240.0, duration_s)
-            esc_temp_c = thermal_step(esc_temp_c, ambient_c, m.get("esc_loss_W", 0.0), 0.75, 180.0, duration_s)
-            battery_temp_c = thermal_step(battery_temp_c, ambient_c, m.get("battery_loss_W", 0.0), 0.25, 500.0, duration_s)
+
+            step_distance_m = gs_mps * dt_s
+            phase_distance_m += step_distance_m
+            phase_elapsed_s += dt_s
+            t_s += dt_s
+            dist_km += step_distance_m / 1000.0
+
+            motor_copper_total_w = (motor_I_esc_A ** 2) * float(getattr(config.motor, "resistance", 0.0)) * max(int(config.num_motors), 1)
+            battery_loss_w = (pack_current_A ** 2) * max(float(getattr(config.battery, "pack_resistance", 0.0)), 0.0)
+            m["motor_copper_loss_W"] = motor_copper_total_w
+            m["battery_loss_W"] = battery_loss_w
+
+            motor_temp_c = thermal_step(motor_temp_c, ambient_c, m.get("motor_copper_loss_W", 0.0), 0.35, 240.0, dt_s)
+            esc_temp_c = thermal_step(esc_temp_c, ambient_c, m.get("esc_loss_W", 0.0), 0.75, 180.0, dt_s)
+            battery_temp_c = thermal_step(battery_temp_c, ambient_c, m.get("battery_loss_W", 0.0), 0.25, 500.0, dt_s)
             mt = max(motor_temp_c, esc_temp_c, battery_temp_c)
             m["motor_temp_est_C"] = motor_temp_c
             m["esc_temp_est_C"] = esc_temp_c
             m["battery_temp_est_C"] = battery_temp_c
             m["thermal_status"] = "OK" if mt < 95.0 else ("WARN" if mt < 115.0 else "HOT")
-            _append_point(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_wh, reserve_breached)
-            results.append((phase.name, duration_s / 60.0, airspeed * duration_s / 1000.0, status_ok))
+            m["reserve_margin_Wh"] = remaining_wh - reserve_target_wh
 
-        elif phase.distance is not None:
-            dist_m = float(phase.distance)
-            if airspeed <= 1e-9:
-                results.append((phase.name, 0.0, 0.0, "Invalid: zero airspeed with distance phase"))
+            worst_metrics = _merge_worst(worst_metrics, m)
+            _append_point(
+                phase_name=phase.name,
+                phase_alt_m=float(phase.altitude),
+                segment_type=segment_type,
+                m=m,
+                t_s_now=t_s,
+                dist_km_now=dist_km,
+                remaining_wh_now=remaining_wh,
+                reserve_hit=reserve_breached,
+            )
+
+            current_speed_mps = v_next
+            if depleted:
                 break
 
-            time_s = dist_m / airspeed
-            energy_used_Wh = total_power_W * (time_s / 3600.0)
-
-            if energy_used_Wh > remaining_wh:
-                actual_time_min = (remaining_wh / total_power_W) * 60.0
-                actual_dist_km = float(m.get("groundspeed_mps", 0.0)) * (actual_time_min * 60.0) / 1000.0
-                # advance and append final point at depletion
-                t_s += actual_time_min * 60.0
-                dist_km += actual_dist_km
-                remaining_wh = 0.0
-                motor_temp_c = thermal_step(motor_temp_c, ambient_c, m.get("motor_copper_loss_W", 0.0), 0.35, 240.0, actual_time_min * 60.0)
-                esc_temp_c = thermal_step(esc_temp_c, ambient_c, m.get("esc_loss_W", 0.0), 0.75, 180.0, actual_time_min * 60.0)
-                battery_temp_c = thermal_step(battery_temp_c, ambient_c, m.get("battery_loss_W", 0.0), 0.25, 500.0, actual_time_min * 60.0)
-                _append_point(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_wh, True)
-                results.append((phase.name, actual_time_min, actual_dist_km, "Battery depleted"))
-                break
-
-            remaining_wh -= energy_used_Wh
-            t_s += time_s
-            dist_km += dist_m / 1000.0
-            reserve_breached = reserve_breached or (remaining_wh < reserve_target_wh)
-            reserve_min_wh = min(reserve_min_wh, remaining_wh)
-            motor_temp_c = thermal_step(motor_temp_c, ambient_c, m.get("motor_copper_loss_W", 0.0), 0.35, 240.0, time_s)
-            esc_temp_c = thermal_step(esc_temp_c, ambient_c, m.get("esc_loss_W", 0.0), 0.75, 180.0, time_s)
-            battery_temp_c = thermal_step(battery_temp_c, ambient_c, m.get("battery_loss_W", 0.0), 0.25, 500.0, time_s)
-            mt = max(motor_temp_c, esc_temp_c, battery_temp_c)
-            m["motor_temp_est_C"] = motor_temp_c
-            m["esc_temp_est_C"] = esc_temp_c
-            m["battery_temp_est_C"] = battery_temp_c
-            m["thermal_status"] = "OK" if mt < 95.0 else ("WARN" if mt < 115.0 else "HOT")
-            _append_point(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_wh, reserve_breached)
-            results.append((phase.name, time_s / 60.0, dist_m / 1000.0, status_ok))
-        else:
-            results.append((phase.name, 0.0, 0.0, "Invalid: phase missing duration/distance"))
-            break
+        results.append((
+            phase.name,
+            phase_elapsed_s / 60.0,
+            phase_distance_m / 1000.0,
+            phase_status if phase_status else "OK"
+        ))
         prev_alt_m = float(phase.altitude)
+        if depleted or (phase_status and phase_status != "OK"):
+            break
 
     if worst_metrics is not None:
         worst_metrics["reserve_target_Wh"] = reserve_target_wh
@@ -1808,6 +2111,7 @@ def simulate_mission(config: DroneConfig,
         worst_metrics["battery_temp_est_C"] = battery_temp_c
         mt = max(motor_temp_c, esc_temp_c, battery_temp_c)
         worst_metrics["thermal_status"] = "OK" if mt < 95.0 else ("WARN" if mt < 115.0 else "HOT")
+        worst_metrics["segment_type"] = "worst-case"
 
     return results, worst_metrics, mission_series
 
@@ -2015,6 +2319,11 @@ def make_motor_operating_point_figure(config: DroneConfig, metrics: dict, figsiz
 # Config builders
 # -------------------------------
 def build_drone_from_args(args) -> DroneConfig:
+    inflow_mu_bp = parse_float_list(getattr(args, "inflow_mu_bp", None))
+    inflow_eff_bp = parse_float_list(getattr(args, "inflow_eff_bp", None))
+    inflow_map_enabled = bool(getattr(args, "inflow_map_enabled", True))
+    if bool(getattr(args, "disable_inflow_map", False)):
+        inflow_map_enabled = False
     battery = BatteryConfig(
         operating_voltage_min=args.battery_operating_voltage_min,
         operating_voltage_nominal=args.battery_operating_voltage_nominal,
@@ -2104,6 +2413,13 @@ def build_drone_from_args(args) -> DroneConfig:
         coaxial_spacing_m=args.coaxial_spacing_m,
         max_tilt_deg=args.max_tilt_deg,
         motor_configuration=args.motor_configuration,
+        transient_dt_s=float(getattr(args, "transient_dt_s", 0.5)),
+        max_accel_mps2=float(getattr(args, "max_accel_mps2", 2.0)),
+        max_decel_mps2=float(getattr(args, "max_decel_mps2", 2.5)),
+        decel_regen_eff=float(getattr(args, "decel_regen_eff", 0.0)),
+        inflow_map_enabled=inflow_map_enabled,
+        inflow_mu_bp=inflow_mu_bp,
+        inflow_eff_bp=inflow_eff_bp,
     )
 
     # Initialize air density at user-specified conditions
@@ -2686,6 +3002,13 @@ def launch_gui():
     v_reserve_percent   = sv(20)
     v_rth_reserve_Wh    = sv(0)
     v_div_reserve_Wh    = sv(0)
+    v_transient_dt_s    = sv(0.5)
+    v_max_accel_mps2    = sv(2.0)
+    v_max_decel_mps2    = sv(2.5)
+    v_decel_regen_eff   = sv(0.0)
+    v_inflow_map_enabled = sv("1")
+    v_inflow_mu_bp      = sv(",".join(f"{x:g}" for x in DEFAULT_INFLOW_MU_BP))
+    v_inflow_eff_bp     = sv(",".join(f"{x:g}" for x in DEFAULT_INFLOW_EFF_BP))
     v_orientation       = sv("forward")
     v_max_speed_plot    = sv(30)
 
@@ -3138,7 +3461,18 @@ def launch_gui():
     add_row(tab_mission, r, "Reserve percent (%)",        v_reserve_percent); r += 1
     add_row(tab_mission, r, "RTH reserve (Wh)",           v_rth_reserve_Wh);  r += 1
     add_row(tab_mission, r, "Diversion reserve (Wh)",     v_div_reserve_Wh);  r += 1
-    add_row(tab_mission, r, "Max Speed for Plot (m/s)",  v_max_speed_plot);  r += 1
+    ttk.Separator(tab_mission, orient="horizontal").grid(
+        row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
+    ttk.Label(tab_mission, text="── Transients & Inflow Map ──",
+              foreground="gray").grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
+    add_row(tab_mission, r, "Transient step dt (s)",      v_transient_dt_s);  r += 1
+    add_row(tab_mission, r, "Max accel (m/s²)",           v_max_accel_mps2);  r += 1
+    add_row(tab_mission, r, "Max decel (m/s²)",           v_max_decel_mps2);  r += 1
+    add_row(tab_mission, r, "Decel regen efficiency (0-1)", v_decel_regen_eff); r += 1
+    add_row(tab_mission, r, "Inflow map enabled (1/0)",   v_inflow_map_enabled); r += 1
+    add_row(tab_mission, r, "Inflow mu breakpoints",      v_inflow_mu_bp);    r += 1
+    add_row(tab_mission, r, "Inflow eta breakpoints",     v_inflow_eff_bp);   r += 1
+    add_row(tab_mission, r, "Max Speed for Plot (m/s)",   v_max_speed_plot);  r += 1
 
     # ------------------------------------------------------------------ #
     #  Collect config_vars for save/load                                  #
@@ -3180,6 +3514,10 @@ def launch_gui():
         "course_deg": v_course_deg, "climb_rate": v_climb_rate,
         "descent_rate": v_descent_rate, "reserve_percent": v_reserve_percent,
         "rth_reserve_Wh": v_rth_reserve_Wh, "diversion_reserve_Wh": v_div_reserve_Wh,
+        "transient_dt_s": v_transient_dt_s, "max_accel_mps2": v_max_accel_mps2,
+        "max_decel_mps2": v_max_decel_mps2, "decel_regen_eff": v_decel_regen_eff,
+        "inflow_map_enabled": v_inflow_map_enabled, "inflow_mu_bp": v_inflow_mu_bp,
+        "inflow_eff_bp": v_inflow_eff_bp,
         "orientation": v_orientation,
         "max_speed_plot": v_max_speed_plot,
     }
@@ -3650,8 +3988,15 @@ def launch_gui():
         _metrics_add("Wind Resistance (hover)", f"{fmt(metrics.get('hover_wind_resistance_mps', float('nan')),2)} m/s")
         _metrics_add("Prop Solidity σ",    f"{fmt(metrics.get('prop_solidity_sigma', float('nan')),3)}")
         _metrics_add("Blade Chord (est)",  f"{fmt(metrics.get('blade_chord_est_m', float('nan'))*1000.0,1)} mm")
+        _metrics_add("Advance Ratio μ",    f"{fmt(metrics.get('advance_ratio_mu', float('nan')),3)}")
+        _metrics_add("Inflow Efficiency η",f"{fmt(metrics.get('inflow_efficiency', float('nan')),3)}")
+        _metrics_add("Inflow Power Mult.", f"{fmt(metrics.get('inflow_power_multiplier', float('nan')),3)}")
+        _metrics_add("Commanded Airspeed", f"{fmt(metrics.get('commanded_airspeed_mps', float('nan')),2)} m/s")
+        _metrics_add("Acceleration",       f"{fmt(metrics.get('accel_mps2', float('nan')),2)} m/s²")
+        _metrics_add("Kinetic Power Term", f"{fmt(metrics.get('kinetic_power_W', float('nan')),1)} W")
         _metrics_add("Reserve Target/Margin", f"{fmt(metrics.get('reserve_target_Wh', float('nan')),1)} / {fmt(metrics.get('reserve_margin_Wh', float('nan')),1)} Wh")
         _metrics_add("Reserve Status",     "VIOLATION" if metrics.get("reserve_breached", False) else "OK")
+        _metrics_add("Transient Segment",  f"{metrics.get('segment_type', 'steady')}")
         _metrics_add("Thermal (M/ESC/Batt)", f"{fmt(metrics.get('motor_temp_est_C', float('nan')),1)} / {fmt(metrics.get('esc_temp_est_C', float('nan')),1)} / {fmt(metrics.get('battery_temp_est_C', float('nan')),1)} °C")
         max_pay_g = (thrust_total_N/g0 - weight_kg)*1000 if thrust_total_N==thrust_total_N else float("nan")
         _metrics_add("Max Extra Payload",  f"{fmt(max_pay_g,0)} g")
@@ -3689,7 +4034,10 @@ def launch_gui():
     last_mission_series = [None]
 
     MISSION_VARS = [
+        ("segment_type",        "Segment type",                  "—"),
         ("airspeed_mps",        "Vehicle airspeed",              "m/s"),
+        ("commanded_airspeed_mps","Commanded airspeed",          "m/s"),
+        ("accel_mps2",          "Acceleration",                  "m/s²"),
         ("groundspeed_mps",     "Ground speed",                  "m/s"),
         ("headwind_mps",        "Headwind",                      "m/s"),
         ("crosswind_mps",       "Crosswind",                     "m/s"),
@@ -3699,6 +4047,7 @@ def launch_gui():
         ("climb_rate_cmd_mps",  "Climb rate command",            "m/s"),
         ("descent_rate_cmd_mps","Descent rate command",          "m/s"),
         ("climb_power_add_W",   "Climb/descent power",           "W"),
+        ("kinetic_power_W",     "Kinetic power term",            "W"),
         ("battery_voltage_V",   "Battery voltage (loaded)",      "V"),
         ("battery_current_A",   "Battery current",               "A"),
         ("battery_energy_Wh",   "Battery energy remaining",      "Wh"),
@@ -3712,6 +4061,9 @@ def launch_gui():
         ("motor_current_A",     "Motor/ESC current (per ESC)",   "A"),
         ("motor_rpm",           "Motor RPM",                     "rpm"),
         ("tip_mach",            "Tip Mach",                      "—"),
+        ("advance_ratio_mu",    "Advance ratio (μ)",             "—"),
+        ("inflow_efficiency",   "Inflow efficiency (η)",         "—"),
+        ("inflow_power_multiplier", "Inflow power multiplier",   "—"),
         ("hover_efficiency_gW", "Hover efficiency",              "g/W"),
         ("figure_of_merit",     "Figure of merit",               "—"),
         ("disk_loading_N_m2",   "Disk loading",                  "N/m²"),
@@ -3874,6 +4226,10 @@ def launch_gui():
 
         prop_table_path = v_prop_table.get().strip() or None
         tc = v_prop_tconst.get().strip(); pc = v_prop_pconst.get().strip()
+        inflow_mu_bp = parse_float_list(v_inflow_mu_bp.get().strip())
+        inflow_eff_bp = parse_float_list(v_inflow_eff_bp.get().strip())
+        inflow_enabled_raw = v_inflow_map_enabled.get().strip().lower()
+        inflow_map_enabled = inflow_enabled_raw not in ("0", "false", "no", "off", "")
         prop = PropellerConfig(
             diameter_in  = parse_float("Prop diameter", v_prop_d.get()),
             pitch_in     = parse_float("Prop pitch", v_prop_pitch.get()),
@@ -3909,6 +4265,13 @@ def launch_gui():
             coaxial_spacing_m        = (parse_float("Coaxial spacing", v_coaxial_spacing_m.get()) if v_coaxial_spacing_m.get().strip() else None),
             max_tilt_deg             = (parse_float("Max tilt", v_max_tilt_deg.get()) if v_max_tilt_deg.get().strip() else None),
             motor_configuration      = (v_motor_configuration.get().strip().lower() or "flat"),
+            transient_dt_s           = parse_float("Transient dt", v_transient_dt_s.get()),
+            max_accel_mps2           = parse_float("Max accel", v_max_accel_mps2.get()),
+            max_decel_mps2           = parse_float("Max decel", v_max_decel_mps2.get()),
+            decel_regen_eff          = parse_float("Decel regen efficiency", v_decel_regen_eff.get()),
+            inflow_map_enabled       = inflow_map_enabled,
+            inflow_mu_bp             = inflow_mu_bp,
+            inflow_eff_bp            = inflow_eff_bp,
         )
         alt  = parse_float("Altitude", v_alt.get())
         temp = v_temp.get().strip()
@@ -4071,6 +4434,10 @@ def launch_gui():
             mission.rth_reserve_Wh = parse_float("RTH reserve", v_rth_reserve_Wh.get())
             mission.diversion_reserve_Wh = parse_float("Diversion reserve", v_div_reserve_Wh.get())
             mission.wind_direction_deg = wind_dir
+            mission.transient_dt_s = parse_float("Transient step dt", v_transient_dt_s.get())
+            mission.max_accel_mps2 = parse_float("Max accel", v_max_accel_mps2.get())
+            mission.max_decel_mps2 = parse_float("Max decel", v_max_decel_mps2.get())
+            mission.decel_regen_eff = parse_float("Decel regen efficiency", v_decel_regen_eff.get())
             for _p in mission.phases:
                 _p.course_deg = float(_p.course_deg if _p.course_deg else course_deg)
                 if _p.climb_rate_mps is None:
@@ -4096,6 +4463,8 @@ def launch_gui():
                 lines += [
                     "",
                     f"Reserve target/margin: {float(worst_metrics.get('reserve_target_Wh',0.0)):.1f} / {float(worst_metrics.get('reserve_margin_Wh',0.0)):+.1f} Wh",
+                    f"Transient (dt/a+/a-): {float(mission.transient_dt_s):.2f}s / {float(mission.max_accel_mps2):.2f} / {float(mission.max_decel_mps2):.2f} m/s²",
+                    f"Inflow μ/η/mult: {float(worst_metrics.get('advance_ratio_mu',0.0)):.3f} / {float(worst_metrics.get('inflow_efficiency',1.0)):.3f} / {float(worst_metrics.get('inflow_power_multiplier',1.0)):.3f}",
                     f"Thermal M/ESC/B: {float(worst_metrics.get('motor_temp_est_C',0.0)):.1f} / {float(worst_metrics.get('esc_temp_est_C',0.0)):.1f} / {float(worst_metrics.get('battery_temp_est_C',0.0)):.1f} °C [{worst_metrics.get('thermal_status','OK')}]",
                 ]
             out_print("\n".join(lines))
@@ -4452,6 +4821,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Return-to-home reserve (Wh)")
     parser.add_argument("--diversion_reserve_Wh", type=float, default=0.0,
                         help="Diversion reserve (Wh)")
+    parser.add_argument("--transient_dt_s", type=float, default=0.5,
+                        help="Mission simulation timestep for transient dynamics (s)")
+    parser.add_argument("--max_accel_mps2", type=float, default=2.0,
+                        help="Maximum forward acceleration for mission transient model (m/s²)")
+    parser.add_argument("--max_decel_mps2", type=float, default=2.5,
+                        help="Maximum deceleration for mission transient model (m/s²)")
+    parser.add_argument("--decel_regen_eff", type=float, default=0.0,
+                        help="Fraction of deceleration kinetic power recovered (0..1)")
+    parser.add_argument("--inflow_map_enabled", action="store_true", default=True,
+                        help="Enable rotor inflow/forward-flight efficiency map")
+    parser.add_argument("--disable_inflow_map", action="store_true", default=False,
+                        help="Disable rotor inflow/forward-flight efficiency map")
+    parser.add_argument("--inflow_mu_bp", type=str, default=None,
+                        help="Comma-separated advance-ratio mu breakpoints, e.g. '0,0.1,0.2,0.3'")
+    parser.add_argument("--inflow_eff_bp", type=str, default=None,
+                        help="Comma-separated inflow-efficiency breakpoints, same length as mu")
 
     # Options
     parser.add_argument("--orientation", type=str, default="forward", choices=["hover", "forward"])
@@ -4502,6 +4887,10 @@ def main():
         mission.rth_reserve_Wh = float(args.rth_reserve_Wh)
         mission.diversion_reserve_Wh = float(args.diversion_reserve_Wh)
         mission.wind_direction_deg = float(args.wind_direction_deg)
+        mission.transient_dt_s = float(args.transient_dt_s)
+        mission.max_accel_mps2 = float(args.max_accel_mps2)
+        mission.max_decel_mps2 = float(args.max_decel_mps2)
+        mission.decel_regen_eff = float(args.decel_regen_eff)
         for _p in mission.phases:
             _p.course_deg = float(_p.course_deg if _p.course_deg else args.course_deg)
             if _p.climb_rate_mps is None:
@@ -4572,6 +4961,12 @@ def main():
             tip_mach_f = float(tip_mach)
             noise_note = " (significant aeroacoustic noise likely)" if tip_mach_f > 0.6 else ""
             print(f"Tip Mach              : {tip_mach_f:.3f}{noise_note}")
+        print(f"Advance Ratio μ       : {metrics.get('advance_ratio_mu', 0.0):.3f}")
+        print(f"Inflow Efficiency η   : {metrics.get('inflow_efficiency', 1.0):.3f}")
+        print(f"Inflow Power Mult.    : {metrics.get('inflow_power_multiplier', 1.0):.3f}")
+        print(f"Commanded Airspeed    : {metrics.get('commanded_airspeed_mps', args.speed):.2f} m/s")
+        print(f"Acceleration          : {metrics.get('accel_mps2', 0.0):+.2f} m/s²")
+        print(f"Kinetic Power Term    : {metrics.get('kinetic_power_W', 0.0):+.1f} W")
         print(f"Potential Power Term  : {metrics.get('potential_power_W', 0.0):+.1f} W")
         print(f"Reserve Target/Margin : {metrics.get('reserve_target_Wh', 0.0):.1f} / {metrics.get('reserve_margin_Wh', 0.0):+.1f} Wh")
         print(f"Reserve Status        : {'VIOLATION' if metrics.get('reserve_breached', False) else 'OK'}")
