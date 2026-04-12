@@ -3727,6 +3727,12 @@ def launch_gui():
                 _show_figure(fig)
             display_nb.select(tab_plot_out)
 
+            def _fmt_out(x, nd=2):
+                try:
+                    return f"{float(x):.{nd}f}"
+                except Exception:
+                    return "n/a"
+
             out_print(
                 f"=== Single-Point Run @ {speed:.1f} m/s ({orientation}) ===\n"
                 f"Air density     : {drone.air_density:.3f} kg/m³\n"
@@ -3734,13 +3740,13 @@ def launch_gui():
                 f"Flight distance : {d_km:.2f} km\n"
                 f"Best endurance  : {be_v:.2f} m/s → {be_min:.2f} min\n"
                 f"Best range      : {br_v:.2f} m/s → {br_km:.2f} km\n"
-                f"Hover eff.      : {fmt(metrics.get('hover_efficiency_gW', float('nan')),2)} g/W\n"
-                f"Figure of merit : {fmt(metrics.get('figure_of_merit', float('nan')),3)}\n"
-                f"Disk loading    : {fmt(metrics.get('disk_loading_N_m2', float('nan')),1)} N/m²\n"
-                f"Tip Mach        : {fmt(metrics.get('tip_mach', float('nan')),3)}\n"
-                f"Thermal status  : {metrics.get('thermal_status', 'n/a')} ({fmt(metrics.get('motor_temp_est_C', float('nan')),1)} °C)\n"
-                f"Hover wind max  : {fmt(metrics.get('hover_wind_resistance_mps', float('nan')),2)} m/s\n"
-                f"Prop solidity σ : {fmt(metrics.get('prop_solidity_sigma', float('nan')),3)}\n"
+                f"Hover eff.      : {_fmt_out(metrics.get('hover_efficiency_gW', float('nan')),2)} g/W\n"
+                f"Figure of merit : {_fmt_out(metrics.get('figure_of_merit', float('nan')),3)}\n"
+                f"Disk loading    : {_fmt_out(metrics.get('disk_loading_N_m2', float('nan')),1)} N/m²\n"
+                f"Tip Mach        : {_fmt_out(metrics.get('tip_mach', float('nan')),3)}\n"
+                f"Thermal status  : {metrics.get('thermal_status', 'n/a')} ({_fmt_out(metrics.get('motor_temp_est_C', float('nan')),1)} °C)\n"
+                f"Hover wind max  : {_fmt_out(metrics.get('hover_wind_resistance_mps', float('nan')),2)} m/s\n"
+                f"Prop solidity σ : {_fmt_out(metrics.get('prop_solidity_sigma', float('nan')),3)}\n"
             )
         except Exception as e:
             messagebox.showerror("Error", str(e))
