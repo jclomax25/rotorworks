@@ -854,6 +854,7 @@ class DroneConfig:
                  esc: Optional[ESCConfig] = None,
                  avionics: Optional[AvionicsConfig] = None,
                  air_density: float = AIR_DENSITY,
+                 drag_model: str = "auto",  # "auto", "manual", or "geometry"
                  # --- Vehicle geometry / mechanical params (new) ---
                  body_length_m: Optional[float] = None,
                  body_width_m: Optional[float] = None,
@@ -891,6 +892,13 @@ class DroneConfig:
         self.esc = esc
         self.avionics = avionics
         self.air_density = float(air_density)
+        drag_mode_raw = str(drag_model or "auto").strip().lower()
+        if drag_mode_raw in ("manual", "direct", "exact"):
+            self.drag_model = "manual"
+        elif drag_mode_raw in ("geometry", "rect", "derived", "derive"):
+            self.drag_model = "geometry"
+        else:
+            self.drag_model = "auto"
 
         # Geometry / limits
         self.body_length_m = float(body_length_m) if body_length_m not in (None, "") else None
@@ -937,20 +945,29 @@ class DroneConfig:
 
     def derive_drag_from_geometry_if_missing(self) -> None:
         """
-        If the user did not provide drag parameters (or they are zero/negative),
-        approximate drag using a simple box body + square-tube arm model.
+        Depending on drag_model:
+          - manual: never derive (always use user-entered Cd/area terms)
+          - auto: derive only when drag terms are missing
+          - geometry: always derive from geometry (once)
+
+        Geometry derivation uses a simple box body + square-tube arm model.
 
         This is intentionally simple and meant as a fallback, not a substitute
         for measured CdA.
         """
-        # Consider drag "not provided" if all are <= 0
-        provided = any(x > 0 for x in (
-            self.profile_drag_coefficient, self.profile_area,
-            self.parasite_drag_coefficient, self.parasite_area,
-            self.frontal_area
-        ))
-        if provided or self._derived_drag_from_geometry:
+        if self.drag_model == "manual":
             return
+        if self._derived_drag_from_geometry:
+            return
+        if self.drag_model == "auto":
+            # Frontal area is not part of forward-drag terms, so don't use it to
+            # decide whether profile/parasite drag was explicitly provided.
+            provided = any(x > 0 for x in (
+                self.profile_drag_coefficient, self.profile_area,
+                self.parasite_drag_coefficient, self.parasite_area,
+            ))
+            if provided:
+                return
 
         # Need enough geometry to do anything useful
         if self.body_width_m is None or self.body_height_m is None:
@@ -1073,7 +1090,8 @@ class MissionProfile:
 
 def drag_force_required(config: DroneConfig, speed_mps: float, orientation: str) -> float:
     """Compute aerodynamic drag force (N) for the given airspeed and orientation."""
-    # If drag parameters were not provided, attempt to derive them from geometry.
+    # If enabled and drag parameters were not provided, derive from geometry fallback.
+    # In manual mode, user-specified Cd/area values are used directly.
     config.derive_drag_from_geometry_if_missing()
 
     if orientation == "hover":
@@ -2613,6 +2631,9 @@ def build_drone_from_args(args) -> DroneConfig:
     inflow_map_enabled = bool(getattr(args, "inflow_map_enabled", True))
     if bool(getattr(args, "disable_inflow_map", False)):
         inflow_map_enabled = False
+    drag_model_raw = str(getattr(args, "drag_model_mode", "auto")).strip().lower()
+    if drag_model_raw not in ("auto", "manual", "geometry"):
+        drag_model_raw = "auto"
     battery = BatteryConfig(
         operating_voltage_min=args.battery_operating_voltage_min,
         operating_voltage_nominal=args.battery_operating_voltage_nominal,
@@ -2707,6 +2728,7 @@ def build_drone_from_args(args) -> DroneConfig:
         coaxial_spacing_m=args.coaxial_spacing_m,
         max_tilt_deg=args.max_tilt_deg,
         motor_configuration=args.motor_configuration,
+        drag_model=drag_model_raw,
         transient_dt_s=float(getattr(args, "transient_dt_s", 0.5)),
         max_accel_mps2=float(getattr(args, "max_accel_mps2", 2.0)),
         max_decel_mps2=float(getattr(args, "max_decel_mps2", 2.5)),
@@ -3217,6 +3239,7 @@ def launch_gui():
     v_profile_area      = sv(0.01)
     v_parasite_drag     = sv(0.9)
     v_parasite_area     = sv(0.05)
+    v_drag_model_mode   = sv("auto")
     v_body_length_m     = sv("")
     v_body_width_m      = sv("")
     v_body_height_m     = sv("")
@@ -3441,6 +3464,15 @@ def launch_gui():
         row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
     ttk.Label(tab_drone, text="── Drag Parameters ──",
               foreground="gray").grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
+    ttk.Label(tab_drone, text="Drag model mode").grid(row=r, column=0, sticky="w", padx=6, pady=3)
+    drag_mode_cb = ttk.Combobox(
+        tab_drone,
+        textvariable=v_drag_model_mode,
+        values=["auto", "manual"],
+        state="readonly",
+        width=12,
+    )
+    drag_mode_cb.grid(row=r, column=1, sticky="w", padx=6, pady=3); r += 1
     add_row(tab_drone, r, "Profile Cd",              v_profile_drag);      r += 1
     add_row(tab_drone, r, "Profile Area (m²)",       v_profile_area);      r += 1
     add_row(tab_drone, r, "Parasite Cd",             v_parasite_drag);     r += 1
@@ -3450,11 +3482,11 @@ def launch_gui():
         row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
     ttk.Label(tab_drone, text="── Body Geometry (optional) ──",
               foreground="gray").grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
-    add_row(tab_drone, r, "Body Length (m)",         v_body_length_m);     r += 1
-    add_row(tab_drone, r, "Body Width (m)",          v_body_width_m);      r += 1
-    add_row(tab_drone, r, "Body Height (m)",         v_body_height_m);     r += 1
-    add_row(tab_drone, r, "Arm Length (m)",          v_arm_length_m);      r += 1
-    add_row(tab_drone, r, "Arm Width (m)",           v_arm_width_m);       r += 1
+    body_len_e = add_row(tab_drone, r, "Body Length (m)",         v_body_length_m);     r += 1
+    body_w_e = add_row(tab_drone, r, "Body Width (m)",          v_body_width_m);      r += 1
+    body_h_e = add_row(tab_drone, r, "Body Height (m)",         v_body_height_m);     r += 1
+    arm_len_e = add_row(tab_drone, r, "Arm Length (m)",          v_arm_length_m);      r += 1
+    arm_w_e = add_row(tab_drone, r, "Arm Width (m)",           v_arm_width_m);       r += 1
     add_row(tab_drone, r, "Max Tilt (deg)",          v_max_tilt_deg);      r += 1
     coax_entry = add_row(tab_drone, r, "Coaxial Spacing (m)", v_coaxial_spacing_m); r += 1
     coax_entry.configure(state="disabled")
@@ -3466,6 +3498,14 @@ def launch_gui():
             v_coaxial_spacing_m.set("")
             coax_entry.configure(state="disabled")
     motor_cfg_cb.bind("<<ComboboxSelected>>", _update_coax_state)
+
+    def _update_drag_model_state(event=None):
+        manual = (v_drag_model_mode.get().strip().lower() == "manual")
+        state = "disabled" if manual else "normal"
+        for e in (body_len_e, body_w_e, body_h_e, arm_len_e, arm_w_e):
+            e.configure(state=state)
+    drag_mode_cb.bind("<<ComboboxSelected>>", _update_drag_model_state)
+    _update_drag_model_state()
 
     # ===== BATTERY TAB =====
     ttk.Label(tab_batt, text="Unit mode:").grid(row=0, column=0, sticky="w", padx=6, pady=4)
@@ -3790,6 +3830,7 @@ def launch_gui():
         "body_height_m": v_body_height_m, "arm_length_m": v_arm_length_m,
         "arm_width_m": v_arm_width_m, "coaxial_spacing_m": v_coaxial_spacing_m,
         "max_tilt_deg": v_max_tilt_deg, "motor_configuration": v_motor_configuration,
+        "drag_model_mode": v_drag_model_mode,
         "batt_vmin": v_batt_vmin, "batt_vnom": v_batt_vnom, "batt_vmax": v_batt_vmax,
         "batt_unit_mode": v_batt_unit_mode,
         "batt_cell_capacity": v_batt_cell_capacity, "batt_pack_capacity": v_batt_pack_capacity,
@@ -4546,6 +4587,9 @@ def launch_gui():
         inflow_eff_bp = parse_float_list(v_inflow_eff_bp.get().strip())
         inflow_enabled_raw = v_inflow_map_enabled.get().strip().lower()
         inflow_map_enabled = inflow_enabled_raw not in ("0", "false", "no", "off", "")
+        drag_model_raw = v_drag_model_mode.get().strip().lower()
+        if drag_model_raw not in ("auto", "manual", "geometry"):
+            drag_model_raw = "auto"
         prop = PropellerConfig(
             diameter_in  = parse_float("Prop diameter", v_prop_d.get()),
             pitch_in     = parse_float("Prop pitch", v_prop_pitch.get()),
@@ -4581,6 +4625,7 @@ def launch_gui():
             coaxial_spacing_m        = (parse_float("Coaxial spacing", v_coaxial_spacing_m.get()) if v_coaxial_spacing_m.get().strip() else None),
             max_tilt_deg             = (parse_float("Max tilt", v_max_tilt_deg.get()) if v_max_tilt_deg.get().strip() else None),
             motor_configuration      = (v_motor_configuration.get().strip().lower() or "flat"),
+            drag_model               = drag_model_raw,
             transient_dt_s           = parse_float("Transient dt", v_transient_dt_s.get()),
             max_accel_mps2           = parse_float("Max accel", v_max_accel_mps2.get()),
             max_decel_mps2           = parse_float("Max decel", v_max_decel_mps2.get()),
@@ -5045,6 +5090,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile_area", type=float, default=0.0, help="Rotor/arms profile reference area (m^2)")
     parser.add_argument("--parasite_drag", type=float, default=0.0, help="Parasite drag coefficient (fuselage/arms)")
     parser.add_argument("--parasite_area", type=float, default=0.0, help="Parasite reference area (m^2)")
+    parser.add_argument(
+        "--drag_model_mode",
+        type=str,
+        default="auto",
+        choices=["auto", "manual"],
+        help="Drag model source: auto uses geometry fallback when drag inputs are missing; manual always uses provided profile/parasite values.",
+    )
     parser.add_argument("--area", type=float, required=False, help="Frontal area (m^2)")
     parser.add_argument("--body_length_m", type=float, default=None, help="Body length (m) for geometry-based drag fallback")
     parser.add_argument("--body_width_m", type=float, default=None, help="Body width (m) for geometry-based drag fallback")
