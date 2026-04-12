@@ -152,6 +152,8 @@ def parse_metrics(sim: str, stdout: str) -> Dict[str, Any]:
     lines = stdout.splitlines()
 
     # Generic raw key:value capture.
+    # Keep these around even if strict regex extractors miss, so downstream
+    # users can still inspect textual outputs in summary files.
     for ln in lines:
         if ":" not in ln:
             continue
@@ -177,6 +179,8 @@ def parse_metrics(sim: str, stdout: str) -> Dict[str, Any]:
             return
         metrics[key] = m.group(group).strip()
 
+    # Regex extractors for headline metrics from each simulator's CLI output.
+    # These patterns intentionally target stable human-readable summary lines.
     if sim == "fixedwing":
         cap_float(r"Flight Time\s*:\s*([-+]?\d*\.?\d+)\s*min", "flight_time_min")
         cap_float(r"Flight Range\s*:\s*([-+]?\d*\.?\d+)\s*km", "flight_range_km")
@@ -205,6 +209,8 @@ def parse_metrics(sim: str, stdout: str) -> Dict[str, Any]:
         cap_float(r"Potential Power Term\s*:\s*([-+]?\d*\.?\d+)\s*W", "potential_power_W")
 
     # Fallback numeric extraction for common raw keys.
+    # This improves resilience if output wording shifts slightly but still
+    # contains a recognizable "Label: value unit" structure.
     fallback_key_map = {
         "raw_flight_time": "flight_time_min",
         "raw_flight_range": "flight_range_km",
@@ -434,6 +440,14 @@ def evaluate_constraints(
     metrics: Dict[str, Any],
     constraints: Sequence[Tuple[str, str, Any]],
 ) -> Tuple[bool, float]:
+    """
+    Evaluate hard constraints and compute a normalized violation score.
+
+    Violation score is dimensionless and additive:
+      - min/max constraints use relative error against target magnitude
+      - missing numeric metrics incur a large fixed penalty
+      - eq constraints incur unit penalty when mismatched
+    """
     feasible = True
     violation = 0.0
     for mode, key, target in constraints:
@@ -464,6 +478,13 @@ def choose_best_result(
     results: Sequence[RunResult],
     objective: str,
 ) -> Optional[RunResult]:
+    """
+    Pick best result using objective spec:
+      maximize:<metric>
+      minimize:<metric>
+      target:<metric>:<value>
+    Returns None if objective metric is unavailable in all candidates.
+    """
     if not results:
         return None
 
@@ -532,6 +553,7 @@ def command_sweep(args: argparse.Namespace) -> int:
             f"# STDOUT\n{rr.stdout}\n\n# STDERR\n{rr.stderr}\n",
         )
 
+        # Keep one flat row per run for easy post-processing in pandas/Excel.
         row = {
             "run_name": run_name,
             "sweep_var": args.sweep_var,
@@ -598,6 +620,7 @@ def command_size(args: argparse.Namespace) -> int:
     all_results: List[RunResult] = []
     rows: List[Dict[str, Any]] = []
 
+    # Grid-search all design-point combinations.
     for i, combo in enumerate(combos, start=1):
         run_args = dict(base_args)
         for name, val in zip(names, combo):
@@ -627,8 +650,10 @@ def command_size(args: argparse.Namespace) -> int:
 
     feasible_runs = [r for r in all_results if r.feasible]
     if feasible_runs:
+        # Objective selection happens only across feasible candidates.
         best = choose_best_result(feasible_runs, args.objective)
     else:
+        # If no feasible design exists, report least-violating candidate.
         best = min(all_results, key=lambda r: float(r.violation_score or 1e12)) if all_results else None
 
     summary_csv = out_dir / "size_summary.csv"
@@ -701,6 +726,7 @@ def command_batch(args: argparse.Namespace) -> int:
             f"# STDOUT\n{rr.stdout}\n\n# STDERR\n{rr.stderr}\n",
         )
 
+        # One compact row per scripted run plus parsed metrics.
         row = {
             "run_name": name,
             "return_code": rr.return_code,

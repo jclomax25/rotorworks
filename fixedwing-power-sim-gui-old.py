@@ -1108,6 +1108,7 @@ def compute_metrics(config: FixedWingConfig, speed_mps: float) -> dict:
     batt = config.battery
     motor= config.motor
 
+    # Clamp speed just above stall to keep CL finite and avoid invalid operating points.
     V       = max(speed_mps, stall_speed(config) + 0.01)
     CL      = af.cl_at_speed(W, V, rho)
     CD      = af.cd_at_cl(CL)
@@ -1148,7 +1149,8 @@ def compute_metrics(config: FixedWingConfig, speed_mps: float) -> dict:
     spec_thrust     = specific_thrust(config)
     max_prop_P      = motor.max_power * config.num_motors
 
-    # Flight time at current speed
+    # Energy-to-endurance conversion (Wh to minutes), then distance at this speed.
+    # This legacy path assumes still-air groundspeed ~= airspeed.
     if P_total > 0 and pack_I <= batt.discharge_max_A and V_load >= batt.vmin_pack:
         t_min = (batt.usable_Wh / P_total) * 60.0
         d_km  = V * (t_min * 60.0) / 1000.0
