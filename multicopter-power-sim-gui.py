@@ -65,6 +65,38 @@ P0 = 101325  # Pa (sea level standard pressure)
 L = 0.0065   # K/m (temperature lapse rate)
 g0 = 9.80665 # m/s^2
 
+# Generic nonlinear SoC templates by chemistry:
+# curves are intentionally conservative and only approximate behavior.
+SOC_PRESETS = {
+    "lipo": {
+        "soc_bp":      [0.00, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
+        "ocv_cell_bp": [3.00, 3.30, 3.50, 3.65, 3.72, 3.76, 3.79, 3.82, 3.86, 3.92, 4.02, 4.20],
+        "r_scale_bp":  [2.60, 2.10, 1.70, 1.35, 1.18, 1.08, 1.00, 0.98, 1.00, 1.08, 1.25, 1.50],
+    },
+    "liion": {
+        "soc_bp":      [0.00, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
+        "ocv_cell_bp": [2.90, 3.20, 3.35, 3.50, 3.60, 3.67, 3.72, 3.77, 3.82, 3.89, 4.00, 4.20],
+        "r_scale_bp":  [2.80, 2.20, 1.80, 1.45, 1.22, 1.10, 1.00, 0.98, 1.00, 1.10, 1.30, 1.60],
+    },
+    "lifepo4": {
+        "soc_bp":      [0.00, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
+        "ocv_cell_bp": [2.80, 3.00, 3.15, 3.22, 3.26, 3.29, 3.31, 3.32, 3.33, 3.35, 3.42, 3.60],
+        "r_scale_bp":  [2.20, 1.90, 1.55, 1.30, 1.15, 1.06, 1.00, 0.98, 1.00, 1.08, 1.18, 1.35],
+    },
+}
+
+SOC_PRESET_ALIASES = {
+    "lipo": "lipo",
+    "li-po": "lipo",
+    "liion": "liion",
+    "li-ion": "liion",
+    "lion": "liion",
+    "nmc": "liion",
+    "lifepo4": "lifepo4",
+    "lfp": "lifepo4",
+    "li-fepo4": "lifepo4",
+}
+
 
 # -------------------------------
 # Battery Model
@@ -99,7 +131,12 @@ class BatteryConfig:
                  discharge_c_cont: Optional[float] = None,
                  discharge_c_max: Optional[float] = None,
                  discharge_percent: float = 100.0,
-                 resistance_cell_mOhm: float = 0.0):
+                 resistance_cell_mOhm: float = 0.0,
+                 soc_model: str = "auto",
+                 soc_curve_csv: Optional[str] = None,
+                 soc_bp: Optional[List[float]] = None,
+                 ocv_cell_bp: Optional[List[float]] = None,
+                 r_scale_bp: Optional[List[float]] = None):
         self.chemistry = chemistry
         self.operating_voltage_min = float(operating_voltage_min)
         self.operating_voltage_nominal = float(operating_voltage_nominal)
@@ -196,6 +233,23 @@ class BatteryConfig:
         self.usable_fraction = self.discharge_percent / 100.0
 
         self.resistance_cell = float(resistance_cell_mOhm) / 1000.0  # Ω
+        self.soc_model = str(soc_model or "auto").strip().lower()
+        self.soc_curve_csv = (str(soc_curve_csv).strip() if soc_curve_csv else None)
+
+        # Nonlinear SoC model state (populated by helper).
+        self.soc_nonlinear_enabled: bool = False
+        self.soc_model_source: str = "linear-fallback"
+        self.soc_bp: List[float] = []
+        self.ocv_cell_bp: List[float] = []
+        self.r_scale_bp: List[float] = []
+        _configure_battery_soc_model(
+            self,
+            model=self.soc_model,
+            curve_csv=self.soc_curve_csv,
+            soc_bp=soc_bp,
+            ocv_cell_bp=ocv_cell_bp,
+            r_scale_bp=r_scale_bp,
+        )
 
     @property
     def pack_resistance(self) -> float:
@@ -210,9 +264,123 @@ class BatteryConfig:
         return self.capacity_Wh * self.usable_fraction
 
 
-def battery_voltage_under_load(battery: BatteryConfig, current_A: float) -> float:
-    v = battery.vmax_pack - current_A * battery.pack_resistance
-    return max(v, battery.vmin_pack)
+def battery_pack_ocv_from_soc(battery: BatteryConfig, soc: float) -> float:
+    """Pack open-circuit voltage from SoC."""
+    if bool(getattr(battery, "soc_nonlinear_enabled", False)) and battery.soc_bp:
+        ocv_cell = _interp_linear_clamped(
+            min(max(float(soc), 0.0), 1.0),
+            list(battery.soc_bp),
+            list(battery.ocv_cell_bp),
+        )
+        return max(float(ocv_cell) * float(battery.series_cells), float(battery.vmin_pack))
+    # Linear fallback keeps the original behavior anchored near full-charge voltage.
+    return float(battery.vmax_pack)
+
+
+def battery_pack_resistance_from_soc(battery: BatteryConfig, soc: float) -> float:
+    """Pack internal resistance from SoC."""
+    base_r = max(float(getattr(battery, "pack_resistance", 0.0)), 0.0)
+    if bool(getattr(battery, "soc_nonlinear_enabled", False)) and battery.soc_bp:
+        scale = _interp_linear_clamped(
+            min(max(float(soc), 0.0), 1.0),
+            list(battery.soc_bp),
+            list(battery.r_scale_bp),
+        )
+        return base_r * max(float(scale), 0.05)
+    return base_r
+
+
+def battery_ocv_pack(battery: BatteryConfig, soc: float) -> float:
+    return battery_pack_ocv_from_soc(battery, soc)
+
+
+def battery_pack_resistance(battery: BatteryConfig, soc: float) -> float:
+    return battery_pack_resistance_from_soc(battery, soc)
+
+
+def battery_voltage_under_load(battery: BatteryConfig, current_A: float, soc: Optional[float] = None) -> float:
+    soc_eval = 1.0 if soc is None else min(max(float(soc), 0.0), 1.0)
+    ocv = battery_pack_ocv_from_soc(battery, soc_eval)
+    r = battery_pack_resistance_from_soc(battery, soc_eval)
+    v = ocv - float(current_A) * r
+    return max(float(v), float(battery.vmin_pack))
+
+
+def battery_soc_after_energy_draw(battery: BatteryConfig,
+                                  soc_now: float,
+                                  energy_draw_Wh: float) -> float:
+    usable_wh = max(float(getattr(battery, "usable_Wh", 0.0)), 1e-9)
+    soc_drop = max(float(energy_draw_Wh), 0.0) / usable_wh
+    return min(max(float(soc_now) - soc_drop, 0.0), 1.0)
+
+
+def _interp_linear_clamped(x: float, xp: List[float], fp: List[float]) -> float:
+    """Simple clamped linear interpolation without numpy dependency."""
+    if not xp or not fp or len(xp) != len(fp):
+        raise ValueError("Interpolation vectors must be same non-zero length.")
+    if len(xp) == 1:
+        return float(fp[0])
+    if x <= float(xp[0]):
+        return float(fp[0])
+    if x >= float(xp[-1]):
+        return float(fp[-1])
+    for i in range(1, len(xp)):
+        x0 = float(xp[i - 1]); x1 = float(xp[i])
+        if x <= x1:
+            y0 = float(fp[i - 1]); y1 = float(fp[i])
+            if abs(x1 - x0) < 1e-12:
+                return y1
+            t = (x - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return float(fp[-1])
+
+
+def _configure_battery_soc_model(battery: BatteryConfig,
+                                 model: str,
+                                 curve_csv: Optional[str],
+                                 soc_bp: Optional[List[float]],
+                                 ocv_cell_bp: Optional[List[float]],
+                                 r_scale_bp: Optional[List[float]]) -> None:
+    m = str(model or "auto").strip().lower()
+    if m in ("linear", "off", "disabled"):
+        battery.soc_nonlinear_enabled = False
+        battery.soc_model_source = "linear-selected"
+        return
+
+    # Priority: explicit arrays -> CSV -> model preset/chemistry fallback
+    try:
+        if soc_bp and ocv_cell_bp and r_scale_bp:
+            s, v, r = _normalize_soc_curves(list(soc_bp), list(ocv_cell_bp), list(r_scale_bp))
+            battery.soc_bp, battery.ocv_cell_bp, battery.r_scale_bp = s, v, r
+            battery.soc_nonlinear_enabled = True
+            battery.soc_model_source = "custom-arrays"
+            return
+        if curve_csv:
+            s, v, r = _load_soc_curve_csv(curve_csv)
+            battery.soc_bp, battery.ocv_cell_bp, battery.r_scale_bp = s, v, r
+            battery.soc_nonlinear_enabled = True
+            battery.soc_model_source = f"csv:{curve_csv}"
+            return
+    except Exception:
+        # fall through to presets / linear fallback
+        pass
+
+    preset_key = None
+    if m in ("auto", "", "preset"):
+        preset_key = _battery_preset_key(getattr(battery, "chemistry", None))
+    else:
+        preset_key = _battery_preset_key(m)
+    if preset_key and preset_key in SOC_PRESETS:
+        p = SOC_PRESETS[preset_key]
+        battery.soc_bp = list(p["soc_bp"])
+        battery.ocv_cell_bp = list(p["ocv_cell_bp"])
+        battery.r_scale_bp = list(p["r_scale_bp"])
+        battery.soc_nonlinear_enabled = True
+        battery.soc_model_source = f"preset:{preset_key}"
+        return
+
+    battery.soc_nonlinear_enabled = False
+    battery.soc_model_source = "linear-fallback"
 
 
 # -------------------------------
@@ -356,6 +524,94 @@ def parse_float_list(spec: Optional[object]) -> Optional[List[float]]:
         vals.append(float(t))
     return vals if vals else None
 
+
+def _battery_preset_key(chemistry: Optional[str]) -> Optional[str]:
+    if chemistry is None:
+        return None
+    key = str(chemistry).strip().lower()
+    if not key:
+        return None
+    return SOC_PRESET_ALIASES.get(key, key if key in SOC_PRESETS else None)
+
+
+def _normalize_soc_curves(soc_bp: List[float],
+                          ocv_cell_bp: List[float],
+                          r_scale_bp: List[float]) -> Tuple[List[float], List[float], List[float]]:
+    if len(soc_bp) != len(ocv_cell_bp) or len(soc_bp) != len(r_scale_bp):
+        raise ValueError("SoC curve columns must have same length.")
+    if len(soc_bp) < 2:
+        raise ValueError("SoC curve requires at least 2 points.")
+    rows = sorted((float(s), float(v), float(r)) for s, v, r in zip(soc_bp, ocv_cell_bp, r_scale_bp))
+    out_s: List[float] = []
+    out_v: List[float] = []
+    out_r: List[float] = []
+    for s, v, r in rows:
+        s = min(max(s, 0.0), 1.0)
+        v = max(v, 0.0)
+        r = max(r, 0.05)
+        if out_s and abs(s - out_s[-1]) < 1e-9:
+            out_v[-1] = v
+            out_r[-1] = r
+        else:
+            out_s.append(s)
+            out_v.append(v)
+            out_r.append(r)
+    if len(out_s) < 2:
+        raise ValueError("SoC curve must contain at least 2 unique SoC breakpoints.")
+    return out_s, out_v, out_r
+
+
+def _load_soc_curve_csv(path: str) -> Tuple[List[float], List[float], List[float]]:
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    df = pd.read_csv(path)
+    lower = {str(c).strip().lower(): c for c in df.columns}
+    soc_col = next((lower[k] for k in ("soc", "soc_frac", "soc_fraction") if k in lower), None)
+    ocv_col = next((lower[k] for k in ("ocv_cell", "v_oc_cell", "voltage_cell") if k in lower), None)
+    r_col = next((lower[k] for k in ("r_scale", "resistance_scale", "r_rel", "r_multiplier") if k in lower), None)
+    if soc_col is None or ocv_col is None or r_col is None:
+        raise ValueError("SoC CSV must include columns: soc, ocv_cell, r_scale")
+    soc_vals = pd.to_numeric(df[soc_col], errors="coerce")
+    ocv_vals = pd.to_numeric(df[ocv_col], errors="coerce")
+    r_vals = pd.to_numeric(df[r_col], errors="coerce")
+    mask = ~(soc_vals.isna() | ocv_vals.isna() | r_vals.isna())
+    return _normalize_soc_curves(
+        soc_vals[mask].tolist(),
+        ocv_vals[mask].tolist(),
+        r_vals[mask].tolist(),
+    )
+
+
+def _split_csv_tokens(spec: str) -> List[str]:
+    return [tok.strip() for tok in str(spec).split(",") if tok.strip()]
+
+
+def parse_soc_breakpoints(spec: Optional[object]) -> Optional[List[float]]:
+    vals = parse_float_list(spec)
+    if vals is None:
+        return None
+    out: List[float] = []
+    for v in vals:
+        vv = float(v)
+        if vv > 1.0:
+            vv = vv / 100.0
+        out.append(min(max(vv, 0.0), 1.0))
+    return out if out else None
+
+
+def _soc_model_short_label(source: Optional[str]) -> str:
+    s = str(source or "").strip().lower()
+    if not s:
+        return "linear-fallback"
+    if s.startswith("preset:"):
+        return s.replace("preset:", "preset-", 1)
+    if s.startswith("csv:"):
+        return "csv"
+    if s == "custom-arrays":
+        return "custom"
+    return s
+
+
 def avionics_input_power_W(avionics: Optional[AvionicsConfig]) -> float:
     """Return total input power drawn from the battery to supply avionics rails (W).
 
@@ -407,28 +663,34 @@ def esc_loss_and_checks(config: "DroneConfig", v_pack: float, motor_power_total_
 def total_power_with_esc(config: "DroneConfig",
                          motor_power_W: float,
                          periph_power_W: float,
-                         iters: int = 6) -> tuple[float, float, float, str, float]:
+                         iters: int = 6,
+                         soc: Optional[float] = None) -> tuple[float, float, float, str, float]:
     """Iteratively solve pack voltage/current while accounting for ESC loss.
 
     Returns:
       (total_power_W, v_load_V, pack_current_A, esc_note, motor_current_per_esc_A)
     """
     total_power = float(motor_power_W) + float(periph_power_W)
-    v_load = float(config.battery.vnom_pack)
+    v_load = battery_ocv_pack(config.battery, soc if soc is not None else 1.0)
     pack_current = total_power / max(v_load, 1e-9)
     esc_note = ""
     i_motor = 0.0
 
     # Fixed-point iteration (ESC loss depends on v_load)
     for _ in range(max(int(iters), 1)):
-        v_load, pack_current = solve_pack_voltage_and_current(config.battery, total_power)
+        v_load, pack_current = solve_pack_voltage_and_current(
+            config.battery, total_power, soc=soc
+        )
         esc_loss_W, esc_note, i_motor = esc_loss_and_checks(config, v_load, motor_power_W)
         total_power = float(motor_power_W) + float(periph_power_W) + float(esc_loss_W)
 
     return float(total_power), float(v_load), float(pack_current), esc_note, float(i_motor)
 
 
-def solve_pack_voltage_and_current(battery: "BatteryConfig", total_power_W: float, iters: int = 12) -> tuple[float, float]:
+def solve_pack_voltage_and_current(battery: "BatteryConfig",
+                                   total_power_W: float,
+                                   iters: int = 12,
+                                   soc: Optional[float] = None) -> tuple[float, float]:
     """Solve V_load and I_pack for a load that draws a (roughly) constant electrical power.
 
     We iterate:
@@ -437,13 +699,14 @@ def solve_pack_voltage_and_current(battery: "BatteryConfig", total_power_W: floa
 
     Returns (V_load, I_pack).
     """
+    soc_eval = 1.0 if soc is None else min(max(float(soc), 0.0), 1.0)
     if total_power_W <= 0:
-        return (battery.vmax_pack, 0.0)
+        return (battery_ocv_pack(battery, soc_eval), 0.0)
 
-    v = float(battery.vnom_pack)
+    v = battery_ocv_pack(battery, soc_eval)
     i = total_power_W / max(v, 1e-9)
     for _ in range(max(1, int(iters))):
-        v = battery_voltage_under_load(battery, i)
+        v = battery_voltage_under_load(battery, i, soc=soc_eval)
         i = total_power_W / max(v, 1e-9)
     return (float(v), float(i))
 
@@ -857,25 +1120,6 @@ def groundspeed_along_track_mps(airspeed_mps: float,
         return 0.0
     along_air = math.sqrt(max(v_air * v_air - xw * xw, 0.0))
     return max(along_air - float(headwind_mps), 0.0)
-
-
-def _interp_linear_clamped(x: float, xp: List[float], fp: List[float]) -> float:
-    """1D linear interpolation with endpoint clamping."""
-    if not xp or not fp or len(xp) != len(fp):
-        return 1.0
-    if x <= xp[0]:
-        return float(fp[0])
-    if x >= xp[-1]:
-        return float(fp[-1])
-    for i in range(1, len(xp)):
-        x0 = float(xp[i - 1]); x1 = float(xp[i])
-        if x <= x1:
-            y0 = float(fp[i - 1]); y1 = float(fp[i])
-            if abs(x1 - x0) < 1e-12:
-                return y1
-            t = (x - x0) / (x1 - x0)
-            return y0 + t * (y1 - y0)
-    return float(fp[-1])
 
 
 def advance_ratio_mu(config: DroneConfig, airspeed_mps: float, rpm: Optional[float]) -> float:
@@ -1414,7 +1658,8 @@ def _compute_operating_metrics_core(drone: DroneConfig,
                                     wind_mps: float = 0.0,
                                     wind_direction_deg: float = 0.0,
                                     course_deg: float = 0.0,
-                                    ambient_temp_C: float = 25.0) -> dict:
+                                    ambient_temp_C: float = 25.0,
+                                    soc: Optional[float] = None) -> dict:
     input_speed = float(speed_mps)
     headwind_mps, crosswind_mps = wind_components_mps(wind_mps, wind_direction_deg, course_deg)
     airspeed = input_speed
@@ -1428,8 +1673,9 @@ def _compute_operating_metrics_core(drone: DroneConfig,
     periph_power_W = avionics_input_power_W(getattr(drone, "avionics", None))
     if periph_power_W <= 0.0:
         periph_power_W = drone.battery.vnom_pack * max(drone.periph_current, 0.0)
+    soc_eval = 1.0 if soc is None else min(max(float(soc), 0.0), 1.0)
     total_power_W, v_load, pack_current_A, esc_note, motor_I_esc_A = total_power_with_esc(
-        drone, motor_power_W=motor_power_W, periph_power_W=periph_power_W)
+        drone, motor_power_W=motor_power_W, periph_power_W=periph_power_W, soc=soc_eval)
     total_thrust_N     = thrust_required(drone, airspeed, orientation)
     thrust_per_motor_N = total_thrust_N / max(int(drone.num_motors), 1)
     esc_loss_W  = max(0.0, float(total_power_W) - float(motor_power_W) - float(periph_power_W))
@@ -1467,7 +1713,7 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         # Recompute propulsion power with inflow multiplier applied.
         motor_power_W = power_required(drone, airspeed, orientation, inflow_multiplier=inflow_mult)
         total_power_W, v_load, pack_current_A, esc_note, motor_I_esc_A = total_power_with_esc(
-            drone, motor_power_W=motor_power_W, periph_power_W=periph_power_W
+            drone, motor_power_W=motor_power_W, periph_power_W=periph_power_W, soc=soc_eval
         )
         esc_loss_W = max(0.0, float(total_power_W) - float(motor_power_W) - float(periph_power_W))
     tilt_req = required_tilt_deg(drone, airspeed, orientation)
@@ -1495,7 +1741,10 @@ def _compute_operating_metrics_core(drone: DroneConfig,
     thermal_rise_C = 55.0 * (motor_I_esc_A / motor_i_max) ** 2 if motor_I_esc_A >= 0 else 0.0
     motor_temp_est_C = float(ambient_temp_C) + thermal_rise_C
     esc_temp_est_C = float(ambient_temp_C) + float(esc_loss_W) * 0.75
-    battery_loss_W = (float(pack_current_A) ** 2) * max(float(getattr(drone.battery, "pack_resistance", 0.0)), 0.0)
+    battery_loss_W = (float(pack_current_A) ** 2) * max(
+        float(battery_pack_resistance(drone.battery, soc_eval)),
+        0.0
+    )
     battery_temp_est_C = float(ambient_temp_C) + battery_loss_W * 0.25
     motor_thermal_headroom_C = 120.0 - motor_temp_est_C
     max_temp_c = max(motor_temp_est_C, esc_temp_est_C, battery_temp_est_C)
@@ -1513,6 +1762,9 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         "wind_cross_mps":      float(crosswind_mps),
         "wind_direction_deg":  float(wind_direction_deg),
         "course_deg":          float(course_deg),
+        "soc":                float(soc_eval),
+        "soc_percent":        float(soc_eval * 100.0),
+        "soc_model_source":   str(getattr(drone.battery, "soc_model_source", "linear-fallback")),
         "tilt_required_deg":   float(tilt_req),
         "tilt_limit_deg":      (float(drone.max_tilt_deg) if getattr(drone,'max_tilt_deg',None) is not None else None),
         "motor_power_W":       float(motor_power_W),
@@ -1563,7 +1815,8 @@ def compute_operating_metrics(config: DroneConfig,
                               wind_mps: float = 0.0,
                               wind_direction_deg: float = 0.0,
                               course_deg: float = 0.0,
-                              ambient_temp_C: float = 25.0) -> dict:
+                              ambient_temp_C: float = 25.0,
+                              soc: Optional[float] = None) -> dict:
     """Shared operating-point metrics for GUI, mission simulation, and CLI."""
     return _compute_operating_metrics_core(
         config,
@@ -1573,6 +1826,7 @@ def compute_operating_metrics(config: DroneConfig,
         wind_direction_deg=wind_direction_deg,
         course_deg=course_deg,
         ambient_temp_C=ambient_temp_C,
+        soc=soc,
     )
 
 
@@ -1600,6 +1854,7 @@ def estimate_flight_time_minutes(config: DroneConfig, speed_mps: float, orientat
         tilt_req = required_tilt_deg(config, speed_mps, orientation="forward")
         if tilt_req > float(config.max_tilt_deg) + 1e-9:
             return 0.0
+    soc = 1.0
     motor_power_W = power_required(config, speed_mps, orientation)
     periph_power_W = avionics_input_power_W(getattr(config, "avionics", None))
     if periph_power_W <= 0.0:
@@ -1610,6 +1865,7 @@ def estimate_flight_time_minutes(config: DroneConfig, speed_mps: float, orientat
         config,
         motor_power_W=motor_power_W,
         periph_power_W=periph_power_W,
+        soc=soc,
     )
 
     if total_power_W <= 0:
@@ -1689,12 +1945,14 @@ def simulate_mission(config: DroneConfig,
     worst_metrics: Optional[dict] = None
     reserve_breached = False
     reserve_min_wh = remaining_wh
+    soc_state = 1.0
     ambient_c = float(temperature_C) if temperature_C is not None else 25.0
     motor_temp_c = ambient_c
     esc_temp_c = ambient_c
     battery_temp_c = ambient_c
     prev_alt_m = float(mission.phases[0].altitude) if mission.phases else 0.0
     current_speed_mps = 0.0
+    soc_state = 1.0
 
     base_dt_s = max(
         float(getattr(mission, "transient_dt_s", getattr(config, "transient_dt_s", 0.5))),
@@ -1712,6 +1970,7 @@ def simulate_mission(config: DroneConfig,
         float(getattr(mission, "decel_regen_eff", getattr(config, "decel_regen_eff", 0.0))),
         0.0
     ), 1.0)
+    soc_state = 1.0
 
     mission_series: dict = {
         't_s': [],
@@ -1734,6 +1993,8 @@ def simulate_mission(config: DroneConfig,
         'battery_voltage_V': [],
         'battery_current_A': [],
         'battery_energy_Wh': [],
+        'battery_soc_frac': [],
+        'battery_soc_percent': [],
         'reserve_target_Wh': [],
         'reserve_margin_Wh': [],
         'reserve_breach': [],
@@ -1793,6 +2054,9 @@ def simulate_mission(config: DroneConfig,
         mission_series['battery_voltage_V'].append(float(m.get('v_load_V', 0.0)))
         mission_series['battery_current_A'].append(float(m.get('pack_current_A', 0.0)))
         mission_series['battery_energy_Wh'].append(float(remaining_wh_now))
+        soc_now = float(m.get('soc', soc_state))
+        mission_series['battery_soc_frac'].append(float(soc_now))
+        mission_series['battery_soc_percent'].append(float(soc_now * 100.0))
         mission_series['reserve_target_Wh'].append(float(reserve_target_wh))
         mission_series['reserve_margin_Wh'].append(float(remaining_wh_now - reserve_target_wh))
         mission_series['reserve_breach'].append(1 if reserve_hit else 0)
@@ -1825,6 +2089,10 @@ def simulate_mission(config: DroneConfig,
     def _merge_worst(worst: Optional[dict], m: dict) -> dict:
         if worst is None:
             return dict(m)
+        if m.get("soc") is not None:
+            worst["soc"] = min(float(worst.get("soc", 1.0)), float(m.get("soc", 1.0)))
+            worst["soc_percent"] = min(float(worst.get("soc_percent", 100.0)), float(m.get("soc_percent", 100.0)))
+            worst["soc_model_source"] = str(m.get("soc_model_source", worst.get("soc_model_source", "linear-fallback")))
         for k in ("pack_current_A", "total_power_W", "motor_power_W", "periph_power_W",
                   "esc_loss_W", "motor_I_per_esc_A", "thrust_total_N", "thrust_per_motor_N",
                   "motor_temp_est_C", "esc_temp_est_C", "battery_temp_est_C",
@@ -1939,6 +2207,7 @@ def simulate_mission(config: DroneConfig,
                 wind_direction_deg=float(mission.wind_direction_deg),
                 course_deg=float(phase.course_deg),
                 ambient_temp_C=ambient_c,
+                soc=soc_state,
             )
 
             potential_power_w = (config.drone_weight_g * 9.81 / 1000.0) * (climb_cmd - descent_cmd)
@@ -1963,7 +2232,11 @@ def simulate_mission(config: DroneConfig,
             m["climb_power_add_W"] = potential_power_w + kinetic_power_w
             m["total_power_W"] = total_power_w
             m["pack_current_A"] = total_power_w / max(float(config.battery.vnom_pack), 1.0)
-            m["v_load_V"] = battery_voltage_under_load(config.battery, m["pack_current_A"])
+            v_solve, i_solve = solve_pack_voltage_and_current(
+                config.battery, total_power_w, soc=soc_state
+            )
+            m["v_load_V"] = float(v_solve)
+            m["pack_current_A"] = float(i_solve)
             gs_mps = groundspeed_along_track_mps(v_eval, headwind_mps, crosswind_mps)
             m["airspeed_mps"] = v_eval
             m["commanded_airspeed_mps"] = target_speed_mps
@@ -1972,6 +2245,7 @@ def simulate_mission(config: DroneConfig,
             m["wind_head_mps"] = headwind_mps
             m["wind_cross_mps"] = crosswind_mps
             m["reserve_margin_Wh"] = remaining_wh - reserve_target_wh
+            m["soc_model_source"] = str(getattr(config.battery, "soc_model_source", "linear-fallback"))
 
             if phase.distance is not None:
                 remain_m = float(phase.distance) - phase_distance_m
@@ -1995,6 +2269,7 @@ def simulate_mission(config: DroneConfig,
                         wind_direction_deg=float(mission.wind_direction_deg),
                         course_deg=float(phase.course_deg),
                         ambient_temp_C=ambient_c,
+                        soc=soc_state,
                     )
                     kinetic_power_w = kinetic_power_term_W(
                         config.drone_weight_g,
@@ -2017,7 +2292,11 @@ def simulate_mission(config: DroneConfig,
                     m["climb_power_add_W"] = potential_power_w + kinetic_power_w
                     m["total_power_W"] = total_power_w
                     m["pack_current_A"] = total_power_w / max(float(config.battery.vnom_pack), 1.0)
-                    m["v_load_V"] = battery_voltage_under_load(config.battery, m["pack_current_A"])
+                    v_solve, i_solve = solve_pack_voltage_and_current(
+                        config.battery, total_power_w, soc=soc_state
+                    )
+                    m["v_load_V"] = float(v_solve)
+                    m["pack_current_A"] = float(i_solve)
                     gs_mps = groundspeed_along_track_mps(v_eval, headwind_mps, crosswind_mps)
                     m["airspeed_mps"] = v_eval
                     m["commanded_airspeed_mps"] = target_speed_mps
@@ -2026,6 +2305,7 @@ def simulate_mission(config: DroneConfig,
                     m["wind_head_mps"] = headwind_mps
                     m["wind_cross_mps"] = crosswind_mps
                     m["reserve_margin_Wh"] = remaining_wh - reserve_target_wh
+                    m["soc_model_source"] = str(getattr(config.battery, "soc_model_source", "linear-fallback"))
 
             pack_current_A = float(m.get("pack_current_A", 0.0))
             v_load = float(m.get("v_load_V", 0.0))
@@ -2051,6 +2331,9 @@ def simulate_mission(config: DroneConfig,
                 depleted = True
 
             remaining_wh = max(remaining_wh - energy_used_Wh, 0.0)
+            soc_state = battery_soc_after_energy_draw(config.battery, soc_state, energy_used_Wh)
+            m["soc"] = soc_state
+            m["soc_percent"] = soc_state * 100.0
             reserve_breached = reserve_breached or (remaining_wh < reserve_target_wh)
             reserve_min_wh = min(reserve_min_wh, remaining_wh)
 
@@ -2106,6 +2389,9 @@ def simulate_mission(config: DroneConfig,
         worst_metrics["reserve_min_Wh"] = reserve_min_wh
         worst_metrics["reserve_margin_Wh"] = reserve_min_wh - reserve_target_wh
         worst_metrics["reserve_breached"] = bool(reserve_breached)
+        worst_metrics["soc"] = soc_state
+        worst_metrics["soc_percent"] = soc_state * 100.0
+        worst_metrics["soc_model_source"] = str(getattr(config.battery, "soc_model_source", "linear-fallback"))
         worst_metrics["motor_temp_est_C"] = motor_temp_c
         worst_metrics["esc_temp_est_C"] = esc_temp_c
         worst_metrics["battery_temp_est_C"] = battery_temp_c
@@ -2321,6 +2607,9 @@ def make_motor_operating_point_figure(config: DroneConfig, metrics: dict, figsiz
 def build_drone_from_args(args) -> DroneConfig:
     inflow_mu_bp = parse_float_list(getattr(args, "inflow_mu_bp", None))
     inflow_eff_bp = parse_float_list(getattr(args, "inflow_eff_bp", None))
+    soc_bp = parse_float_list(getattr(args, "battery_soc_bp", None))
+    ocv_cell_bp = parse_float_list(getattr(args, "battery_ocv_cell_bp", None))
+    r_scale_bp = parse_float_list(getattr(args, "battery_r_scale_bp", None))
     inflow_map_enabled = bool(getattr(args, "inflow_map_enabled", True))
     if bool(getattr(args, "disable_inflow_map", False)):
         inflow_map_enabled = False
@@ -2346,6 +2635,11 @@ def build_drone_from_args(args) -> DroneConfig:
         cell_weight_g=args.battery_cell_weight_g,
         cell_capacity_mAh=args.battery_cell_capacity,
         pack_capacity_mAh=args.battery_pack_capacity,
+        soc_model=getattr(args, "battery_soc_model", "auto"),
+        soc_curve_csv=getattr(args, "battery_soc_curve_csv", None),
+        soc_bp=soc_bp,
+        ocv_cell_bp=ocv_cell_bp,
+        r_scale_bp=r_scale_bp,
     )
 
     motor = MotorConfig(
@@ -2948,6 +3242,11 @@ def launch_gui():
     v_batt_dischg_pct   = sv(80)
     v_batt_r            = sv(20)
     v_batt_chem         = sv("LiPo")
+    v_batt_soc_model    = sv("auto")
+    v_batt_soc_curve_csv= sv("")
+    v_batt_soc_bp       = sv("")
+    v_batt_ocv_cell_bp  = sv("")
+    v_batt_r_scale_bp   = sv("")
     v_batt_series       = sv(4)
     v_batt_parallel     = sv(1)
     v_batt_cells_series = sv(1)
@@ -3190,6 +3489,11 @@ def launch_gui():
     add_row(tab_batt, r, "Max C-rate",               v_batt_c_max);        r += 1
     add_row(tab_batt, r, "Usable Discharge (%)",     v_batt_dischg_pct);   r += 1
     add_row(tab_batt, r, "Rcell (mΩ)",               v_batt_r);            r += 1
+    add_row(tab_batt, r, "SoC model",                v_batt_soc_model);    r += 1
+    add_row(tab_batt, r, "SoC curve CSV",            v_batt_soc_curve_csv); r += 1
+    add_row(tab_batt, r, "SoC breakpoints (0..1)",   v_batt_soc_bp);       r += 1
+    add_row(tab_batt, r, "OCV/cell breakpoints (V)", v_batt_ocv_cell_bp);  r += 1
+    add_row(tab_batt, r, "R-scale breakpoints",      v_batt_r_scale_bp);   r += 1
     add_row(tab_batt, r, "Series Cells/Packs",       v_batt_series);       r += 1
     add_row(tab_batt, r, "Parallel Cells/Packs",     v_batt_parallel);     r += 1
     cells_s_e = add_row(tab_batt, r, "Cells in Series/Pack",  v_batt_cells_series);  r += 1
@@ -3493,6 +3797,9 @@ def launch_gui():
         "batt_chg": v_batt_chg, "batt_a_cont": v_batt_a_cont, "batt_a_max": v_batt_a_max,
         "batt_c_cont": v_batt_c_cont, "batt_c_max": v_batt_c_max,
         "batt_dischg_pct": v_batt_dischg_pct, "batt_r": v_batt_r, "batt_chem": v_batt_chem,
+        "batt_soc_model": v_batt_soc_model, "batt_soc_curve_csv": v_batt_soc_curve_csv,
+        "batt_soc_bp": v_batt_soc_bp, "batt_ocv_cell_bp": v_batt_ocv_cell_bp,
+        "batt_r_scale_bp": v_batt_r_scale_bp,
         "batt_series": v_batt_series, "batt_parallel": v_batt_parallel,
         "batt_cells_series": v_batt_cells_series, "batt_cells_parallel": v_batt_cells_parallel,
         "batt_pack_weight": v_batt_pack_weight, "batt_cell_weight": v_batt_cell_weight,
@@ -3940,6 +4247,8 @@ def launch_gui():
         _metrics_add("Energy (total)",    f"{fmt(float(batt.capacity_Wh),1)} Wh")
         _metrics_add("Total Capacity",    f"{fmt(cap_mAh,0)} mAh")
         _metrics_add("Usable Capacity",   f"{fmt(usable_mAh,0)} mAh")
+        _metrics_add("SoC",               f"{fmt(metrics.get('soc_percent', 100.0),1)} %")
+        _metrics_add("SoC model source",  f"{metrics.get('soc_model_source', 'linear-fallback')}")
         _metrics_add("Flight Time",       f"{fmt(t_min,2)} min")
         _metrics_add("Battery Weight",    f"{fmt(batt.weight_g,0)} g")
 
@@ -4051,6 +4360,8 @@ def launch_gui():
         ("battery_voltage_V",   "Battery voltage (loaded)",      "V"),
         ("battery_current_A",   "Battery current",               "A"),
         ("battery_energy_Wh",   "Battery energy remaining",      "Wh"),
+        ("battery_soc_frac",    "Battery SoC fraction",          "—"),
+        ("battery_soc_percent", "Battery SoC",                   "%"),
         ("reserve_target_Wh",   "Reserve target",                "Wh"),
         ("reserve_margin_Wh",   "Reserve margin",                "Wh"),
         ("reserve_breach",      "Reserve breach flag",           "bool"),
@@ -4196,6 +4507,11 @@ def launch_gui():
             parallel_units         = parse_int("Parallel units", v_batt_parallel.get()),
             cells_series_per_unit  = parse_int("Cells series/unit", v_batt_cells_series.get()),
             cells_parallel_per_unit= parse_int("Cells parallel/unit", v_batt_cells_parallel.get()),
+            soc_model              = v_batt_soc_model.get().strip() or "auto",
+            soc_curve_csv          = v_batt_soc_curve_csv.get().strip() or None,
+            soc_bp                 = parse_float_list(v_batt_soc_bp.get().strip()),
+            ocv_cell_bp            = parse_float_list(v_batt_ocv_cell_bp.get().strip()),
+            r_scale_bp             = parse_float_list(v_batt_r_scale_bp.get().strip()),
         )
         motor = MotorConfig(
             kv            = parse_float("Kv", v_motor_kv.get()),
@@ -4390,6 +4706,7 @@ def launch_gui():
                 f"Air density     : {drone.air_density:.3f} kg/m³\n"
                 f"Flight time     : {t_min:.2f} min\n"
                 f"Flight distance : {d_km:.2f} km\n"
+                f"SoC             : {_fmt_out(metrics.get('soc_percent', float('nan')),1)} % ({metrics.get('soc_model_source', 'linear-fallback')})\n"
                 f"Ground speed    : {_fmt_out(metrics.get('groundspeed_mps', float('nan')),2)} m/s\n"
                 f"Head/Cross wind : {_fmt_out(metrics.get('wind_head_mps', float('nan')),2)} / {_fmt_out(metrics.get('wind_cross_mps', float('nan')),2)} m/s\n"
                 f"Best endurance  : {be_v:.2f} m/s → {be_min:.2f} min\n"
@@ -4463,6 +4780,7 @@ def launch_gui():
                 lines += [
                     "",
                     f"Reserve target/margin: {float(worst_metrics.get('reserve_target_Wh',0.0)):.1f} / {float(worst_metrics.get('reserve_margin_Wh',0.0)):+.1f} Wh",
+                    f"SoC (min/model): {float(worst_metrics.get('soc_percent',100.0)):.1f}% / {str(worst_metrics.get('soc_model_source','linear-fallback'))}",
                     f"Transient (dt/a+/a-): {float(mission.transient_dt_s):.2f}s / {float(mission.max_accel_mps2):.2f} / {float(mission.max_decel_mps2):.2f} m/s²",
                     f"Inflow μ/η/mult: {float(worst_metrics.get('advance_ratio_mu',0.0)):.3f} / {float(worst_metrics.get('inflow_efficiency',1.0)):.3f} / {float(worst_metrics.get('inflow_power_multiplier',1.0)):.3f}",
                     f"Thermal M/ESC/B: {float(worst_metrics.get('motor_temp_est_C',0.0)):.1f} / {float(worst_metrics.get('esc_temp_est_C',0.0)):.1f} / {float(worst_metrics.get('battery_temp_est_C',0.0)):.1f} °C [{worst_metrics.get('thermal_status','OK')}]",
@@ -4767,7 +5085,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--battery_pack_capacity", type=float, required=False)  # mAh per pack
     parser.add_argument("--battery_pack_weight_g", type=float, required=False)
     parser.add_argument("--battery_cell_weight_g", type=float, required=False)
-
+    parser.add_argument("--battery_soc_model", type=str, default="auto",
+                        help="Battery SoC model: auto/linear/lipo/liion/lifepo4")
+    parser.add_argument("--battery_soc_curve_csv", type=str, default=None,
+                        help="CSV path with SoC curve columns: soc, ocv_cell, r_scale")
+    parser.add_argument("--battery_soc_bp", type=str, default=None,
+                        help="Comma-separated SoC breakpoints in [0,1]")
+    parser.add_argument("--battery_ocv_cell_bp", type=str, default=None,
+                        help="Comma-separated OCV-per-cell breakpoints (V)")
+    parser.add_argument("--battery_r_scale_bp", type=str, default=None,
+                        help="Comma-separated resistance scale breakpoints")
     # Motor
     parser.add_argument("--motor_kv", type=float, required=False)
     parser.add_argument("--motor_idle_current", type=float, required=False)
@@ -4949,6 +5276,7 @@ def main():
 
         print(f"Estimated flight time at {args.speed:.2f} m/s ({orientation}): {t_min:.1f} min")
         print(f"Estimated flight distance at {args.speed:.2f} m/s ({orientation}): {d_km:.2f} km")
+        print(f"SoC / model source    : {metrics.get('soc_percent', 100.0):.1f}% / {metrics.get('soc_model_source', 'linear-fallback')}")
         print(f"Ground speed          : {metrics.get('groundspeed_mps', 0.0):.2f} m/s")
         print(f"Head / Cross wind     : {metrics.get('wind_head_mps', 0.0):+.2f} / {metrics.get('wind_cross_mps', 0.0):+.2f} m/s")
         print(f"Best endurance speed (forward): {be_v:.1f} m/s -> {be_min:.1f} min")
