@@ -1054,7 +1054,7 @@ def service_ceiling_m(config: FixedWingConfig,
     rc_threshold_mps (default 100 ft/min ≈ 0.508 m/s).
     Returns +inf if threshold is still exceeded at max_alt_m.
     """
-    # Cache by configuration state to avoid recomputing in sweeps.
+    # Cache by configuration state to avoid recomputing in speed sweeps/GUI refreshes.
     cache = getattr(config, "_service_ceiling_cache", {})
     cache_key = (
         round(rc_threshold_mps, 4),
@@ -1100,7 +1100,7 @@ def service_ceiling_m(config: FixedWingConfig,
         setattr(config, "_service_ceiling_cache", cache)
         return float("inf")
 
-    # Refine crossing with binary search.
+    # Refine the "RC crosses threshold" altitude with binary search.
     for _ in range(12):
         mid = 0.5 * (lo + hi)
         rc_mid = _max_rate_of_climb_at_altitude_m(config, mid)
@@ -1488,6 +1488,7 @@ def compute_metrics(config: FixedWingConfig,
     batt = config.battery
     motor= config.motor
 
+    # Coordinated turn load factor raises required lift and therefore CL/CD and stall speed.
     n_turn  = bank_load_factor(bank_deg)
     V_stall = stall_speed(config)
     V_stall_turn = V_stall * math.sqrt(max(n_turn, 1.0))
@@ -1534,7 +1535,8 @@ def compute_metrics(config: FixedWingConfig,
     wing_load_kg_m2 = wing_loading_kg_m2(config)
     V_min_sink, sink_min = minimum_sink_speed(config, V_stall)
 
-    # Flight time at current speed
+    # Flight time/range at this operating point.
+    # Ground distance uses along-track groundspeed (airspeed corrected for wind vector).
     if P_total > 0 and pack_I <= batt.discharge_max_A and V_load >= batt.vmin_pack:
         t_min = (batt.usable_Wh / P_total) * 60.0
         gs_track = groundspeed_along_track_mps(V, wind_head_mps, wind_cross_mps)
@@ -1559,7 +1561,7 @@ def compute_metrics(config: FixedWingConfig,
     turn_period_s = (360.0 / abs(turn_rate_dps)) if abs(turn_rate_dps) > 1e-9 else float("inf")
     loiter_circles = ((t_min * 60.0) / turn_period_s) if (turn_period_s > 0 and math.isfinite(turn_period_s)) else 0.0
 
-    # Thermal model (single-point steady estimate)
+    # Thermal model (single-point steady estimate, not a transient RC network).
     motor_i_per_motor = P_elec / max(V_load, 1.0) / max(config.num_motors, 1)
     motor_copper_loss_W = (motor_i_per_motor ** 2) * max(config.motor.resistance, 0.0) * max(config.num_motors, 1)
     battery_loss_W = (pack_I ** 2) * max(config.battery.pack_resistance, 0.0)

@@ -691,7 +691,8 @@ class MissionProfile:
 
 def drag_force_required(config: DroneConfig, speed_mps: float, orientation: str) -> float:
     """Compute aerodynamic drag force (N) for the given airspeed and orientation."""
-    # If drag parameters were not provided, attempt to derive them from geometry.
+    # Geometry-derived drag is a fallback only; measured CdA should be preferred for
+    # validation studies and performance sizing.
     config.derive_drag_from_geometry_if_missing()
 
     if orientation == "hover":
@@ -1060,6 +1061,11 @@ def simulate_mission(config: DroneConfig,
     Returns:
       (results, worst_metrics) where worst_metrics aggregates worst-case values across phases
       for limit/status checks.
+
+    Legacy mission model note:
+      This older solver treats each phase as quasi-steady (single operating point per
+      phase) and performs energy integration at phase level, unlike the newer transient
+      timestep solver in the main multicopter simulator.
     """
     remaining_wh = config.battery.usable_Wh
     results: List[Tuple[str, float, float, str]] = []

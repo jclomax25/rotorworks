@@ -341,6 +341,11 @@ def _configure_battery_soc_model(battery: BatteryConfig,
                                  soc_bp: Optional[List[float]],
                                  ocv_cell_bp: Optional[List[float]],
                                  r_scale_bp: Optional[List[float]]) -> None:
+    # Resolution order:
+    #  1) explicit breakpoint arrays
+    #  2) CSV curve file
+    #  3) chemistry preset (or auto-from-chemistry)
+    #  4) linear fallback
     m = str(model or "auto").strip().lower()
     if m in ("linear", "off", "disabled"):
         battery.soc_nonlinear_enabled = False
