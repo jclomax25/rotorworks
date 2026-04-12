@@ -739,6 +739,125 @@ def disk_area(diameter_in: float) -> float:
     return math.pi * (d_m / 2.0) ** 2
 
 
+def total_disk_area(config: DroneConfig) -> float:
+    """Total rotor disk area over all motors [m²]."""
+    return disk_area(config.propeller.diameter_in) * max(int(config.num_motors), 1)
+
+
+def disk_loading_N_m2(config: DroneConfig) -> float:
+    """Disk loading: DL = W / (N * A_disk) [N/m²]."""
+    weight_N = config.drone_weight_g * 9.81 / 1000.0
+    area = total_disk_area(config)
+    return weight_N / area if area > 0 else 0.0
+
+
+def available_total_thrust_N(config: DroneConfig) -> float:
+    """Estimate maximum total thrust available [N] from prop/motor data."""
+    nm = max(int(config.num_motors), 1)
+    if getattr(config.propeller, "table", None) is not None:
+        try:
+            return float(config.propeller.table["Thrust_g"].max()) * 9.81 / 1000.0 * nm
+        except Exception:
+            pass
+
+    max_thr_g = float(getattr(config.propeller, "max_thrust_g", 0.0) or 0.0)
+    if max_thr_g > 0:
+        return max_thr_g * 9.81 / 1000.0 * nm
+
+    # Fallback from motor max power + actuator-disk estimate.
+    p_max_pm = max(float(getattr(config.motor, "max_power", 0.0) or 0.0), 0.0)
+    if p_max_pm <= 0:
+        return 0.0
+    rho = max(float(config.air_density), 1e-9)
+    A_pm = max(disk_area(config.propeller.diameter_in), 1e-9)
+    # P = T^(3/2) / sqrt(2*rho*A)  => T = (P*sqrt(2*rho*A))^(2/3)
+    t_pm = (p_max_pm * math.sqrt(2.0 * rho * A_pm)) ** (2.0 / 3.0)
+    return t_pm * nm
+
+
+def tip_speed_mps_from_rpm(diameter_in: float, rpm: float) -> float:
+    """Blade tip speed from prop diameter and RPM [m/s]."""
+    d_m = max(float(diameter_in), 0.0) * 0.0254
+    n = max(float(rpm), 0.0) / 60.0
+    return math.pi * d_m * n
+
+
+def estimate_blade_chord_m(diameter_in: float, blades: int) -> float:
+    """
+    Estimate average blade chord from diameter and blade count.
+    This is a coarse empirical estimate for small multicopter props.
+    """
+    d_m = max(float(diameter_in), 0.0) * 0.0254
+    b = max(int(blades), 1)
+    # Base chord scales with diameter; slightly narrower blades when blade count increases.
+    return 0.11 * d_m / (1.0 + 0.08 * (b - 2))
+
+
+def propeller_solidity(diameter_in: float, blades: int) -> float:
+    """
+    Propeller solidity:
+      sigma = N_blades * c_blade / (pi * R)
+    """
+    d_m = max(float(diameter_in), 0.0) * 0.0254
+    r_m = d_m / 2.0
+    if r_m <= 0:
+        return 0.0
+    c_blade = estimate_blade_chord_m(diameter_in, blades)
+    return max(int(blades), 1) * c_blade / (math.pi * r_m)
+
+
+def hover_ideal_induced_power_W(config: DroneConfig,
+                                total_thrust_N: float) -> float:
+    """
+    Ideal actuator-disk induced power in hover:
+      P_ideal = T^(3/2) / sqrt(2 * rho * A_total)
+    """
+    rho = max(float(config.air_density), 1e-9)
+    area = total_disk_area(config)
+    if area <= 0:
+        return 0.0
+    T = max(float(total_thrust_N), 0.0)
+    return (T ** 1.5) / math.sqrt(2.0 * rho * area)
+
+
+def hover_figure_of_merit(config: DroneConfig,
+                          total_thrust_N: float,
+                          actual_induced_power_W: float) -> float:
+    """
+    Figure of merit based on induced power:
+      FM = P_ideal / P_actual_induced
+    """
+    p_actual = max(float(actual_induced_power_W), 1e-9)
+    p_ideal = hover_ideal_induced_power_W(config, total_thrust_N)
+    return min(p_ideal / p_actual, 1.5)
+
+
+def hover_wind_resistance_mps(config: DroneConfig) -> float:
+    """
+    Estimate maximum hover wind resistance from available horizontal thrust:
+      V_max = sqrt(2 * T_horizontal / (rho * C_D * A_frontal))
+    Uses thrust margin, tilt limit, and frontal drag model.
+    """
+    rho = max(float(config.air_density), 1e-9)
+    Cd = max(float(getattr(config, "parasite_drag_coefficient", 0.0)), 0.2)
+    A_frontal = max(float(getattr(config, "frontal_area", 0.0)), 1e-6)
+    weight_N = config.drone_weight_g * 9.81 / 1000.0
+
+    t_avail = max(available_total_thrust_N(config), 0.0)
+    if t_avail <= weight_N:
+        return 0.0
+
+    tilt_lim = float(getattr(config, "max_tilt_deg", 35.0) or 35.0)
+    tilt_lim = max(min(tilt_lim, 85.0), 5.0)
+    t_h_balanced = math.sqrt(max(t_avail ** 2 - weight_N ** 2, 0.0))
+    t_h_tilt_cap = t_avail * math.sin(math.radians(tilt_lim))
+    t_horizontal = min(t_h_balanced, t_h_tilt_cap)
+
+    if t_horizontal <= 0:
+        return 0.0
+    return math.sqrt((2.0 * t_horizontal) / (rho * Cd * A_frontal))
+
+
 def compute_air_density(altitude_m: float, temperature_C: Optional[float] = None, pressure_Pa: Optional[float] = None) -> float:
     """
     altitude_m: meters
@@ -1078,6 +1197,125 @@ def power_required(config: DroneConfig, speed_mps: float, orientation: str) -> f
     return motor_power_W * config.num_motors
 
 
+def _compute_operating_metrics_core(drone: DroneConfig, speed_mps: float, orientation: str, wind_mps: float = 0.0) -> dict:
+    airspeed = float(speed_mps)
+    if orientation == "forward":
+        airspeed = max(0.0, float(speed_mps) + float(wind_mps))
+    drone.derive_drag_from_geometry_if_missing()
+    motor_power_W = power_required(drone, airspeed, orientation)
+    periph_power_W = avionics_input_power_W(getattr(drone, "avionics", None))
+    if periph_power_W <= 0.0:
+        periph_power_W = drone.battery.vnom_pack * max(drone.periph_current, 0.0)
+    total_power_W, v_load, pack_current_A, esc_note, motor_I_esc_A = total_power_with_esc(
+        drone, motor_power_W=motor_power_W, periph_power_W=periph_power_W)
+    total_thrust_N     = thrust_required(drone, airspeed, orientation)
+    thrust_per_motor_N = total_thrust_N / max(int(drone.num_motors), 1)
+    esc_loss_W  = max(0.0, float(total_power_W) - float(motor_power_W) - float(periph_power_W))
+    rpm_est     = None
+    if drone.propeller.TConst and drone.propeller.PConst:
+        try:
+            D   = drone.propeller.diameter_in * 0.0254
+            rho = drone.air_density
+            lo, hi = 100.0, 40000.0
+            sol = None
+            for _ in range(40):
+                mid = 0.5*(lo+hi)
+                n   = mid/60.0
+                T   = float(drone.propeller.TConst)*rho*(n**2)*(D**4)
+                if T < thrust_per_motor_N:
+                    lo = mid
+                else:
+                    hi = mid
+                    sol = mid
+            rpm_est = float(sol) if sol is not None else None
+        except Exception:
+            rpm_est = None
+    motor_table = None
+    if getattr(drone, 'propeller', None) is not None and drone.propeller.table is not None:
+        try:
+            motor_table = interpolate_motor_point(drone, thrust_per_motor_N)
+            if 'RPM' in motor_table:
+                rpm_est = float(motor_table['RPM'])
+        except Exception:
+            motor_table = None
+    tilt_req = required_tilt_deg(drone, airspeed, orientation)
+
+    hover_thrust_total_N = thrust_required(drone, 0.0, "hover")
+    hover_thrust_pm_N = hover_thrust_total_N / max(int(drone.num_motors), 1)
+    hover_motor_power_W = power_required(drone, 0.0, "hover")
+    hover_total_power_W, _, _, _, _ = total_power_with_esc(
+        drone, motor_power_W=hover_motor_power_W, periph_power_W=periph_power_W
+    )
+    hover_propulsion_power_W = max(float(hover_total_power_W) - float(periph_power_W), 0.0)
+    hover_thrust_total_g = hover_thrust_total_N * 1000.0 / 9.81
+    hover_efficiency_gW = hover_thrust_total_g / hover_propulsion_power_W if hover_propulsion_power_W > 0 else 0.0
+
+    A_total = total_disk_area(drone)
+    p_ideal_hover = hover_ideal_induced_power_W(drone, hover_thrust_total_N)
+    p_actual_induced = hover_propulsion_power_W
+    fm_hover = hover_figure_of_merit(drone, hover_thrust_total_N, p_actual_induced)
+
+    tip_speed = tip_speed_mps_from_rpm(drone.propeller.diameter_in, float(rpm_est)) if rpm_est is not None else float("nan")
+    tip_mach = tip_speed / 340.0 if tip_speed == tip_speed else float("nan")
+
+    p_copper = (motor_I_esc_A ** 2) * float(getattr(drone.motor, "resistance", 0.0))
+    motor_i_max = max(float(getattr(drone.motor, "max_current", 0.0)), 1e-9)
+    thermal_rise_C = 55.0 * (motor_I_esc_A / motor_i_max) ** 2 if motor_I_esc_A >= 0 else 0.0
+    ambient_temp_C = 25.0
+    motor_temp_est_C = ambient_temp_C + thermal_rise_C
+    motor_thermal_headroom_C = 120.0 - motor_temp_est_C
+    thermal_status = "OK" if motor_temp_est_C < 95.0 else ("WARN" if motor_temp_est_C < 115.0 else "HOT")
+
+    rotor_solidity = propeller_solidity(drone.propeller.diameter_in, drone.propeller.blades)
+    blade_chord_est_m = estimate_blade_chord_m(drone.propeller.diameter_in, drone.propeller.blades)
+    dl = disk_loading_N_m2(drone)
+    v_max_wind = hover_wind_resistance_mps(drone)
+
+    return {
+        "airspeed_mps":        float(airspeed),
+        "tilt_required_deg":   float(tilt_req),
+        "tilt_limit_deg":      (float(drone.max_tilt_deg) if getattr(drone,'max_tilt_deg',None) is not None else None),
+        "motor_power_W":       float(motor_power_W),
+        "periph_power_W":      float(periph_power_W),
+        "total_power_W":       float(total_power_W),
+        "v_load_V":            float(v_load),
+        "pack_current_A":      float(pack_current_A),
+        "esc_loss_W":          float(esc_loss_W),
+        "esc_note":            str(esc_note),
+        "motor_I_per_esc_A":   float(motor_I_esc_A),
+        "thrust_total_N":      float(total_thrust_N),
+        "thrust_per_motor_N":  float(thrust_per_motor_N),
+        "prop_rpm":            (float(rpm_est) if rpm_est is not None else None),
+        "motor_table_throttle_pct": (float(motor_table["Throttle_pct"]) if motor_table and "Throttle_pct" in motor_table else None),
+        "motor_table_eff_gW":  (float(motor_table["Efficiency_gW"])    if motor_table and "Efficiency_gW" in motor_table else None),
+        "motor_table_temp_C":  (float(motor_table["Temp_C"])           if motor_table and "Temp_C" in motor_table else None),
+        "hover_efficiency_gW": float(hover_efficiency_gW),
+        "hover_thrust_total_N": float(hover_thrust_total_N),
+        "hover_thrust_per_motor_N": float(hover_thrust_pm_N),
+        "hover_propulsion_power_W": float(hover_propulsion_power_W),
+        "hover_ideal_power_W": float(p_ideal_hover),
+        "actual_induced_power_W": float(p_actual_induced),
+        "figure_of_merit":     float(fm_hover),
+        "disk_loading_N_m2":   float(dl),
+        "total_disk_area_m2":  float(A_total),
+        "tip_speed_mps":       (float(tip_speed) if tip_speed == tip_speed else None),
+        "tip_mach":            (float(tip_mach) if tip_mach == tip_mach else None),
+        "noise_significant":   bool(tip_mach == tip_mach and tip_mach > 0.6),
+        "motor_copper_loss_W_per_motor": float(p_copper),
+        "motor_temp_est_C":    float(motor_temp_est_C),
+        "motor_thermal_headroom_C": float(motor_thermal_headroom_C),
+        "thermal_status":      thermal_status,
+        "hover_wind_resistance_mps": float(v_max_wind),
+        "prop_solidity_sigma": float(rotor_solidity),
+        "blade_chord_est_m":   float(blade_chord_est_m),
+    }
+
+
+def compute_operating_metrics(config: DroneConfig, speed_mps: float, orientation: str, wind_mps: float = 0.0) -> dict:
+    """Shared operating-point metrics for GUI, mission simulation, and CLI."""
+    return _compute_operating_metrics_core(config, speed_mps=speed_mps, orientation=orientation, wind_mps=wind_mps)
+
+
 # -------------------------------
 # Flight Performance
 # -------------------------------
@@ -1205,6 +1443,13 @@ def simulate_mission(config: DroneConfig,
         'thrust_total_N': [],
         'periph_power_W': [],
         'esc_loss_W': [],
+        'hover_efficiency_gW': [],
+        'figure_of_merit': [],
+        'disk_loading_N_m2': [],
+        'tip_mach': [],
+        'motor_temp_est_C': [],
+        'hover_wind_resistance_mps': [],
+        'prop_solidity_sigma': [],
     }
 
     t_s = 0.0
@@ -1234,6 +1479,13 @@ def simulate_mission(config: DroneConfig,
         mission_series['thrust_total_N'].append(float(m.get('thrust_total_N', 0.0)))
         mission_series['periph_power_W'].append(float(m.get('periph_power_W', 0.0)))
         mission_series['esc_loss_W'].append(float(m.get('esc_loss_W', 0.0)))
+        mission_series['hover_efficiency_gW'].append(float(m.get('hover_efficiency_gW', 0.0)))
+        mission_series['figure_of_merit'].append(float(m.get('figure_of_merit', 0.0)))
+        mission_series['disk_loading_N_m2'].append(float(m.get('disk_loading_N_m2', 0.0)))
+        mission_series['tip_mach'].append(float(m.get('tip_mach')) if m.get('tip_mach') is not None else float('nan'))
+        mission_series['motor_temp_est_C'].append(float(m.get('motor_temp_est_C', 0.0)))
+        mission_series['hover_wind_resistance_mps'].append(float(m.get('hover_wind_resistance_mps', 0.0)))
+        mission_series['prop_solidity_sigma'].append(float(m.get('prop_solidity_sigma', 0.0)))
 
 
     def _merge_worst(worst: Optional[dict], m: dict) -> dict:
@@ -1566,8 +1818,8 @@ def build_drone_from_args(args) -> DroneConfig:
         parallel_units=args.battery_parallel_units,
         cells_series_per_unit=args.battery_cells_series_per_unit,
         cells_parallel_per_unit=args.battery_cells_parallel_per_unit,
-        pack_weight_g=args.battery_pack_weight,
-        cell_weight_g=args.battery_cell_weight,
+        pack_weight_g=args.battery_pack_weight_g,
+        cell_weight_g=args.battery_cell_weight_g,
         cell_capacity_mAh=args.battery_cell_capacity,
         pack_capacity_mAh=args.battery_pack_capacity,
     )
@@ -1582,28 +1834,19 @@ def build_drone_from_args(args) -> DroneConfig:
         max_power=args.motor_max_power,
         pole_count=args.motor_pole_count,
         weight_g=args.motor_weight,
-        size_mm=args.motor_size_mm,
-    )
-
-    esc = ESCConfig(
-        voltage_rating=args.esc_voltage_rating,
-        continuous_current_A=args.esc_continuous_current_A,
-        max_current_A=args.esc_max_current_A,
-        idle_current_A=args.esc_idle_current_A,
-        resistance=args.esc_resistance,
-        weight_g=args.esc_weight,
+        size_mm=args.motor_size,
     )
 
     prop = PropellerConfig(
         diameter_in=args.prop_diameter,
         pitch_in=args.prop_pitch,
-        max_rpm=args.prop_max_rpm,
-        max_thrust_g=args.prop_max_thrust_g,
+        max_rpm=getattr(args, "prop_max_rpm", 0) or 0,
+        max_thrust_g=getattr(args, "prop_max_thrust", 0) or 0,
         blades=args.prop_blades,
         table_csv=args.prop_table,
         PConst=args.prop_pconst,
         TConst=args.prop_tconst,
-        weight_g=args.prop_weight,
+        weight_g=getattr(args, "prop_weight_g", None),
     )
 
     avionics = AvionicsConfig(
@@ -1614,7 +1857,7 @@ def build_drone_from_args(args) -> DroneConfig:
     if any(x is not None for x in [args.esc_voltage_rating, args.esc_cont_current, args.esc_max_current, args.esc_idle_current, args.esc_resistance, args.esc_weight]):
         # Provide safe defaults if some fields omitted
         esc = ESCConfig(
-            voltage_rating=int(args.esc_voltage_rating) if args.esc_voltage_rating is not None else int(args.series),
+            voltage_rating=int(args.esc_voltage_rating) if args.esc_voltage_rating is not None else int(args.battery_series_units or 1),
             continuous_current_A=float(args.esc_cont_current) if args.esc_cont_current is not None else 0.0,
             max_current_A=float(args.esc_max_current) if args.esc_max_current is not None else float(args.esc_cont_current or 0.0),
             idle_current_A=float(args.esc_idle_current) if args.esc_idle_current is not None else 0.0,
@@ -2931,6 +3174,7 @@ def launch_gui():
         Ipack = float(metrics.get("pack_current_A", 0.0))
         Vload = float(metrics.get("v_load_V", 0.0))
         Ptot  = float(metrics.get("total_power_W", 0.0))
+        tip_mach = metrics.get("tip_mach", None)
 
         Vmin = float(getattr(config.battery, "vmin_pack", 0.0))
         tag_v = _status_color_tag(Vload, Vmin, "min") if Vmin > 0 else "na"
@@ -2967,6 +3211,11 @@ def launch_gui():
             _insert_status_row(motor_table, "Motor power / motor", f"{Pmotor_pm:.0f} W",
                 f"<= {float(config.motor.max_power):.0f} W",
                 _status_color_tag(Pmotor_pm, float(config.motor.max_power), "max"))
+        if metrics.get("motor_temp_est_C") is not None:
+            t_est = float(metrics["motor_temp_est_C"])
+            _insert_status_row(motor_table, "Motor temp estimate", f"{t_est:.1f} °C",
+                "<= 120 °C", _status_color_tag(t_est, 120.0, "max"),
+                f"Status: {metrics.get('thermal_status', 'n/a')}")
         esc = getattr(config, "esc", None)
         if esc is not None:
             _insert_status_row(motor_table, "ESC current (cont)", f"{Iesc:.2f} A",
@@ -2994,6 +3243,13 @@ def launch_gui():
         else:
             _insert_status_row(prop_table_tv, "Prop RPM (est)", "n/a",
                 f"<= {float(mr):.0f} rpm" if mr else "n/a", "na")
+        if tip_mach is not None:
+            tip_mach_f = float(tip_mach)
+            _insert_status_row(prop_table_tv, "Tip Mach",
+                f"{tip_mach_f:.3f}",
+                "<= 0.60",
+                _status_color_tag(tip_mach_f, 0.60, "max"),
+                "Above 0.6 can generate significant aeroacoustic noise")
 
     # ---- Metrics panel ----
     metrics_container = ttk.Frame(tab_metrics_out, padding=4)
@@ -3082,13 +3338,7 @@ def launch_gui():
             P_mech_motor = V_emf * max(0.0, I_motor - I0)
         motor_eff = (P_mech_motor / P_elec_motor) if (P_mech_motor==P_mech_motor and P_elec_motor==P_elec_motor and P_elec_motor > 0) else float("nan")
 
-        T_est = float("nan")
-        try:
-            Imax = float(getattr(drone.motor, "max_current", 0.0))
-            if Imax > 0 and I_motor == I_motor:
-                copper = (I_motor**2) * Rm
-                T_est  = 25.0 + 20.0 * (copper / max(1e-6, (Imax**2) * Rm))
-        except Exception: pass
+        T_est = float(metrics.get("motor_temp_est_C", float("nan")))
 
         thrust_total_N = float(metrics.get("thrust_total_N",    float("nan")))
         thrust_pm_N    = float(metrics.get("thrust_per_motor_N",float("nan")))
@@ -3134,7 +3384,13 @@ def launch_gui():
         _metrics_add("Efficiency",         f"{fmt(motor_eff*100,1)} %")
         _metrics_add("Resistance Rm",      f"{fmt(Rm*1000,1)} mΩ")
         _metrics_add("Specific Thrust",    f"{fmt(spec_thrust,2)} g/W")
+        _metrics_add("Hover Efficiency",   f"{fmt(metrics.get('hover_efficiency_gW', float('nan')),2)} g/W")
+        _metrics_add("Figure of Merit",    f"{fmt(metrics.get('figure_of_merit', float('nan')),3)}")
+        _metrics_add("Ideal Hover Power",  f"{fmt(metrics.get('hover_ideal_power_W', float('nan')),1)} W")
+        _metrics_add("Actual Induced Pwr", f"{fmt(metrics.get('actual_induced_power_W', float('nan')),1)} W")
         _metrics_add("Est. Temperature",   f"{fmt(T_est,0)} °C")
+        _metrics_add("Thermal Status",     f"{metrics.get('thermal_status', 'n/a')}")
+        _metrics_add("Thermal Headroom",   f"{fmt(metrics.get('motor_thermal_headroom_C', float('nan')),1)} °C")
 
         _metrics_add_section("Total Drive")
         _metrics_add("Drive Weight",       f"{fmt(drive_g,0)} g")
@@ -3151,6 +3407,13 @@ def launch_gui():
         _metrics_add("Speed",              f"{fmt(speed_mps*3.6,1)} km/h  ({fmt(speed_mps*2.237,1)} mph)")
         _metrics_add("Estimated Range",    f"{fmt(range_m,0)} m  ({fmt(range_mi,2)} mi)")
         _metrics_add("Total Disc Area",    f"{fmt(A_total*1e4,0)} cm²  ({fmt(A_total/(0.0254**2),0)} in²)")
+        _metrics_add("Disk Loading",       f"{fmt(metrics.get('disk_loading_N_m2', float('nan')),1)} N/m²")
+        _metrics_add("Tip Speed",          f"{fmt(metrics.get('tip_speed_mps', float('nan')),1)} m/s")
+        _metrics_add("Tip Mach",           f"{fmt(metrics.get('tip_mach', float('nan')),3)}"
+                                           f"{'  (significant aeroacoustic noise likely)' if metrics.get('noise_significant', False) else ''}")
+        _metrics_add("Wind Resistance (hover)", f"{fmt(metrics.get('hover_wind_resistance_mps', float('nan')),2)} m/s")
+        _metrics_add("Prop Solidity σ",    f"{fmt(metrics.get('prop_solidity_sigma', float('nan')),3)}")
+        _metrics_add("Blade Chord (est)",  f"{fmt(metrics.get('blade_chord_est_m', float('nan'))*1000.0,1)} mm")
         max_pay_g = (thrust_total_N/g0 - weight_kg)*1000 if thrust_total_N==thrust_total_N else float("nan")
         _metrics_add("Max Extra Payload",  f"{fmt(max_pay_g,0)} g")
 
@@ -3201,6 +3464,13 @@ def launch_gui():
         ("motor_power_per_motor_W","Motor power (per motor)",    "W"),
         ("motor_current_A",     "Motor/ESC current (per ESC)",   "A"),
         ("motor_rpm",           "Motor RPM",                     "rpm"),
+        ("tip_mach",            "Tip Mach",                      "—"),
+        ("hover_efficiency_gW", "Hover efficiency",              "g/W"),
+        ("figure_of_merit",     "Figure of merit",               "—"),
+        ("disk_loading_N_m2",   "Disk loading",                  "N/m²"),
+        ("motor_temp_est_C",    "Motor temperature (est)",       "°C"),
+        ("hover_wind_resistance_mps", "Hover wind resistance",   "m/s"),
+        ("prop_solidity_sigma", "Propeller solidity",            "—"),
         ("motor_thrust_N",      "Motor thrust (per motor)",      "N"),
         ("thrust_total_N",      "Total thrust",                  "N"),
         ("periph_power_W",      "Avionics/peripherals power",    "W"),
@@ -3401,68 +3671,6 @@ def launch_gui():
         return drone
 
     # ================================================================== #
-    #  OPERATING METRICS                                                  #
-    # ================================================================== #
-    def _estimate_prop_rpm(drone: DroneConfig, thrust_per_motor_N: float) -> Optional[float]:
-        try:
-            if not (drone.propeller.TConst and drone.propeller.PConst):
-                return None
-            D   = drone.propeller.diameter_in * 0.0254
-            rho = drone.air_density
-            lo, hi = 100.0, 40000.0
-            sol = None
-            for _ in range(40):
-                mid = 0.5*(lo+hi)
-                n   = mid/60.0
-                T   = float(drone.propeller.TConst)*rho*(n**2)*(D**4)
-                if T < thrust_per_motor_N: lo = mid
-                else: hi = mid; sol = mid
-            return float(sol) if sol is not None else None
-        except Exception:
-            return None
-
-    def compute_operating_metrics(drone: DroneConfig, speed_mps: float, orientation: str, wind_mps: float = 0.0) -> dict:
-        airspeed = float(speed_mps)
-        if orientation == "forward":
-            airspeed = max(0.0, float(speed_mps) + float(wind_mps))
-        motor_power_W = power_required(drone, airspeed, orientation)
-        periph_power_W = avionics_input_power_W(getattr(drone, "avionics", None))
-        if periph_power_W <= 0.0:
-            periph_power_W = drone.battery.vnom_pack * max(drone.periph_current, 0.0)
-        total_power_W, v_load, pack_current_A, esc_note, motor_I_esc_A = total_power_with_esc(
-            drone, motor_power_W=motor_power_W, periph_power_W=periph_power_W)
-        total_thrust_N     = thrust_required(drone, airspeed, orientation)
-        thrust_per_motor_N = total_thrust_N / max(int(drone.num_motors), 1)
-        esc_loss_W  = max(0.0, float(total_power_W) - float(motor_power_W) - float(periph_power_W))
-        rpm_est     = _estimate_prop_rpm(drone, thrust_per_motor_N)
-        motor_table = None
-        if getattr(drone, 'propeller', None) is not None and drone.propeller.table is not None:
-            try:
-                motor_table = interpolate_motor_point(drone, thrust_per_motor_N)
-                if 'RPM' in motor_table: rpm_est = float(motor_table['RPM'])
-            except Exception: motor_table = None
-        tilt_req = required_tilt_deg(drone, airspeed, orientation)
-        return {
-            "airspeed_mps":        float(airspeed),
-            "tilt_required_deg":   float(tilt_req),
-            "tilt_limit_deg":      (float(drone.max_tilt_deg) if getattr(drone,'max_tilt_deg',None) is not None else None),
-            "motor_power_W":       float(motor_power_W),
-            "periph_power_W":      float(periph_power_W),
-            "total_power_W":       float(total_power_W),
-            "v_load_V":            float(v_load),
-            "pack_current_A":      float(pack_current_A),
-            "esc_loss_W":          float(esc_loss_W),
-            "esc_note":            str(esc_note),
-            "motor_I_per_esc_A":   float(motor_I_esc_A),
-            "thrust_total_N":      float(total_thrust_N),
-            "thrust_per_motor_N":  float(thrust_per_motor_N),
-            "prop_rpm":            (float(rpm_est) if rpm_est is not None else None),
-            "motor_table_throttle_pct": (float(motor_table["Throttle_pct"]) if motor_table and "Throttle_pct" in motor_table else None),
-            "motor_table_eff_gW":  (float(motor_table["Efficiency_gW"])    if motor_table and "Efficiency_gW" in motor_table else None),
-            "motor_table_temp_C":  (float(motor_table["Temp_C"])           if motor_table and "Temp_C" in motor_table else None),
-        }
-
-    # ================================================================== #
     #  RUN CALLBACKS                                                      #
     # ================================================================== #
     def run_single_point():
@@ -3494,6 +3702,9 @@ def launch_gui():
                 "Power Hov (W)": [power_required(drone,v,"hover") for v in _mc_v],
                 "Thrust Fwd (N)": [thrust_required(drone,v,"forward") for v in _mc_v],
                 "Thrust Hov (N)": [thrust_required(drone,v,"hover") for v in _mc_v],
+                "Disk Loading (N/m²)": [disk_loading_N_m2(drone)] * len(_mc_v),
+                "Hover Wind Resistance (m/s)": [hover_wind_resistance_mps(drone)] * len(_mc_v),
+                "Prop Solidity (σ)": [propeller_solidity(drone.propeller.diameter_in, drone.propeller.blades)] * len(_mc_v),
             })
             _last_run_cfg[0] = drone
             update_weight_budget(drone)
@@ -3523,6 +3734,13 @@ def launch_gui():
                 f"Flight distance : {d_km:.2f} km\n"
                 f"Best endurance  : {be_v:.2f} m/s → {be_min:.2f} min\n"
                 f"Best range      : {br_v:.2f} m/s → {br_km:.2f} km\n"
+                f"Hover eff.      : {metrics.get('hover_efficiency_gW', 0.0):.2f} g/W\n"
+                f"Figure of merit : {metrics.get('figure_of_merit', 0.0):.3f}\n"
+                f"Disk loading    : {metrics.get('disk_loading_N_m2', 0.0):.1f} N/m²\n"
+                f"Tip Mach        : {metrics.get('tip_mach', 0.0):.3f}\n"
+                f"Thermal status  : {metrics.get('thermal_status', 'n/a')} ({metrics.get('motor_temp_est_C', float('nan')):.1f} °C)\n"
+                f"Hover wind max  : {metrics.get('hover_wind_resistance_mps', 0.0):.2f} m/s\n"
+                f"Prop solidity σ : {metrics.get('prop_solidity_sigma', 0.0):.3f}\n"
             )
         except Exception as e:
             messagebox.showerror("Error", str(e))
@@ -3913,9 +4131,9 @@ def validate_required_cli_args(args):
     required = [
         "num_motors", "weight", "area",
         "battery_operating_voltage_min", "battery_operating_voltage_max",
-        "battery_capacity", "battery_weight", "battery_energy_density",
-        "battery_charge_current_max", "battery_discharge_cont",
-        "battery_resistance_cell", "battery_cell_count",
+        "battery_cell_capacity", "battery_cell_weight_g", "battery_energy_density",
+        "battery_charge_current_max", "battery_discharge_cont_A",
+        "battery_resistance_cell", "battery_series_units",
         "motor_kv", "motor_idle_current", "motor_resistance", "motor_max_current", "motor_max_power",
         "prop_diameter", "prop_pitch",
     ]
@@ -3935,15 +4153,18 @@ def main():
 
     validate_required_cli_args(args)
     drone = build_drone_from_args(args)
+    orientation = args.orientation.strip().lower()
+    if orientation not in ("hover", "forward"):
+        raise ValueError("orientation must be 'hover' or 'forward'")
 
     print(f"Using air density = {drone.air_density:.3f} kg/m^3 at {args.altitude:.1f} m altitude")
 
     if args.mission:
         mission = MissionProfile.from_json(args.mission)
-        results, _worst_metrics = simulate_mission(
+        results, _worst_metrics, _mission_series = simulate_mission(
             drone,
             mission,
-            orientation=args.orientation,
+            orientation=orientation,
             temperature_C=args.temperature,
             pressure_Pa=args.pressure,
             wind_mps=args.wind,
@@ -3951,14 +4172,26 @@ def main():
         for name, time_min, dist_km, status in results:
             print(f"{name}: {time_min:.1f} min, {dist_km:.2f} km, {status}")
     else:
-        t_min = estimate_flight_time_minutes(drone, args.speed, orientation=args.orientation)
-        d_km = estimate_flight_distance_km(drone, args.speed, orientation=args.orientation)
+        t_min = estimate_flight_time_minutes(drone, args.speed, orientation=orientation)
+        d_km = estimate_flight_distance_km(drone, args.speed, orientation=orientation)
         be_v, be_min, br_v, br_km = find_optimal_speeds(drone)
+        metrics = _compute_operating_metrics_core(drone, speed_mps=args.speed, orientation=orientation, wind_mps=args.wind)
 
-        print(f"Estimated flight time at {args.speed:.2f} m/s ({args.orientation}): {t_min:.1f} min")
-        print(f"Estimated flight distance at {args.speed:.2f} m/s ({args.orientation}): {d_km:.2f} km")
+        print(f"Estimated flight time at {args.speed:.2f} m/s ({orientation}): {t_min:.1f} min")
+        print(f"Estimated flight distance at {args.speed:.2f} m/s ({orientation}): {d_km:.2f} km")
         print(f"Best endurance speed (forward): {be_v:.1f} m/s -> {be_min:.1f} min")
         print(f"Best range speed (forward): {br_v:.1f} m/s -> {br_km:.2f} km")
+        print(f"Hover Efficiency      : {metrics.get('hover_efficiency_gW', 0.0):.2f} g/W")
+        print(f"Figure of Merit (FM)  : {metrics.get('figure_of_merit', 0.0):.3f}")
+        print(f"Disk Loading          : {metrics.get('disk_loading_N_m2', 0.0):.1f} N/m²")
+        tip_mach = metrics.get("tip_mach", None)
+        if tip_mach is not None:
+            tip_mach_f = float(tip_mach)
+            noise_note = " (significant aeroacoustic noise likely)" if tip_mach_f > 0.6 else ""
+            print(f"Tip Mach              : {tip_mach_f:.3f}{noise_note}")
+        print(f"Motor Thermal Status  : {metrics.get('thermal_status', 'n/a')} @ {metrics.get('motor_temp_est_C', 0.0):.1f} °C")
+        print(f"Hover Wind Resistance : {metrics.get('hover_wind_resistance_mps', 0.0):.2f} m/s")
+        print(f"Prop Solidity σ       : {metrics.get('prop_solidity_sigma', 0.0):.3f}")
 
     if args.plot:
         plot_performance(drone)
