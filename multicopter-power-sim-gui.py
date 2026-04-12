@@ -3734,13 +3734,13 @@ def launch_gui():
                 f"Flight distance : {d_km:.2f} km\n"
                 f"Best endurance  : {be_v:.2f} m/s → {be_min:.2f} min\n"
                 f"Best range      : {br_v:.2f} m/s → {br_km:.2f} km\n"
-                f"Hover eff.      : {metrics.get('hover_efficiency_gW', 0.0):.2f} g/W\n"
-                f"Figure of merit : {metrics.get('figure_of_merit', 0.0):.3f}\n"
-                f"Disk loading    : {metrics.get('disk_loading_N_m2', 0.0):.1f} N/m²\n"
-                f"Tip Mach        : {metrics.get('tip_mach', 0.0):.3f}\n"
-                f"Thermal status  : {metrics.get('thermal_status', 'n/a')} ({metrics.get('motor_temp_est_C', float('nan')):.1f} °C)\n"
-                f"Hover wind max  : {metrics.get('hover_wind_resistance_mps', 0.0):.2f} m/s\n"
-                f"Prop solidity σ : {metrics.get('prop_solidity_sigma', 0.0):.3f}\n"
+                f"Hover eff.      : {fmt(metrics.get('hover_efficiency_gW', float('nan')),2)} g/W\n"
+                f"Figure of merit : {fmt(metrics.get('figure_of_merit', float('nan')),3)}\n"
+                f"Disk loading    : {fmt(metrics.get('disk_loading_N_m2', float('nan')),1)} N/m²\n"
+                f"Tip Mach        : {fmt(metrics.get('tip_mach', float('nan')),3)}\n"
+                f"Thermal status  : {metrics.get('thermal_status', 'n/a')} ({fmt(metrics.get('motor_temp_est_C', float('nan')),1)} °C)\n"
+                f"Hover wind max  : {fmt(metrics.get('hover_wind_resistance_mps', float('nan')),2)} m/s\n"
+                f"Prop solidity σ : {fmt(metrics.get('prop_solidity_sigma', float('nan')),3)}\n"
             )
         except Exception as e:
             messagebox.showerror("Error", str(e))
