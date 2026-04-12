@@ -510,6 +510,7 @@ class AirframeConfig:
                  CL_max:         float  = 1.30,
                  oswald:         float  = 0.80,
                  mu_roll:        float  = 0.04,
+                 mu_brake:       Optional[float] = None,
                  CL_takeoff:     float  = 0.80,
                  prop_efficiency: float = 0.75,
                  num_motors:     int    = 1):
@@ -519,6 +520,8 @@ class AirframeConfig:
         self.CL_max        = float(CL_max)
         self.oswald        = float(oswald)
         self.mu_roll       = float(mu_roll)       # rolling friction coefficient
+        # Landing rollout braking friction can be tuned independently from takeoff roll.
+        self.mu_brake      = float(mu_brake) if mu_brake is not None else max(self.mu_roll * 1.8, 0.08)
         self.CL_takeoff    = float(CL_takeoff)    # CL at take-off rotation
         self.prop_efficiency = float(prop_efficiency)  # η_prop for thrust from power
         self.num_motors    = int(num_motors)
@@ -596,6 +599,7 @@ class FixedWingConfig:
                  propeller:       PropellerConfig,
                  aircraft_weight_g: float,
                  cruise_speed_mps:  float,
+                 payload_mass_g:   float = 0.0,
                  periph_current_A:  float   = 0.0,
                  esc:             Optional[ESCConfig]      = None,
                  avionics:        Optional[AvionicsConfig] = None,
@@ -605,7 +609,9 @@ class FixedWingConfig:
         self.battery           = battery
         self.motor             = motor
         self.propeller         = propeller
-        self.aircraft_weight_g = float(aircraft_weight_g)
+        self.base_aircraft_weight_g = float(aircraft_weight_g)
+        self.payload_mass_g    = max(float(payload_mass_g), 0.0)
+        self.aircraft_weight_g = self.base_aircraft_weight_g + self.payload_mass_g
         self.cruise_speed_mps  = float(cruise_speed_mps)
         self.periph_current_A  = float(periph_current_A)
         self.esc               = esc
@@ -731,8 +737,7 @@ def motor_shaft_power_from_thrust(config: FixedWingConfig, thrust_N: float) -> f
             return float(df["Power_W"].iloc[-1])
         
         # Within range: linear interpolation
-        return float(pd.Series(df["Thrust_g"]).searchsorted(thrust_g) and
-                     _interp1d(df["Thrust_g"].values, df["Power_W"].values, thrust_g))
+        return float(_interp1d(df["Thrust_g"].values, df["Power_W"].values, thrust_g))
 
     if config.motor.kv is not None:
         # --- KV-based electrical model ---
@@ -1140,8 +1145,8 @@ def landing_distance_m(config: FixedWingConfig,
     D_land  = q_td * S * CD_land
     L_land  = q_td * S * CL_land
 
-    # Use a higher effective friction than takeoff roll (braking applied).
-    mu_brake = max(af.mu_roll * 1.8, 0.08)
+    # Use the dedicated braking-friction input for landing rollout.
+    mu_brake = max(float(getattr(af, "mu_brake", af.mu_roll * 1.8)), 0.08)
     F_brake  = mu_brake * max(W - L_land, 0.0)
     mass_kg  = max(W / G0, 1e-6)
     decel    = (F_brake + D_land) / mass_kg
@@ -1194,7 +1199,7 @@ def _fit_propeller_curve(thrust_g_data: np.ndarray, y_data: np.ndarray, degree: 
         return None
 
 
-def _eval_poly(coeffs: np.ndarray, x: float) -> float:
+def _eval_poly(coeffs: np.ndarray, x: float) -> Optional[float]:
     """Evaluate polynomial with coefficients from np.polyfit at point x."""
     if coeffs is None:
         return None
@@ -1477,7 +1482,8 @@ def compute_metrics(config: FixedWingConfig,
                     bank_deg: float = 0.0,
                     ambient_temp_C: float = 25.0,
                     wind_head_mps: float = 0.0,
-                    wind_cross_mps: float = 0.0) -> dict:
+                    wind_cross_mps: float = 0.0,
+                    glide_altitude_m: Optional[float] = None) -> dict:
     """
     Compute all performance metrics at the given cruise airspeed.
     Returns a dict matching the eCalc-style output columns.
@@ -1553,7 +1559,8 @@ def compute_metrics(config: FixedWingConfig,
     else:
         service_ceiling_agl_m = float("inf")
     glide_ratio = LD
-    glide_dist_m = glide_ratio * max(config.reference_altitude_m, 0.0)
+    glide_alt = max(float(config.reference_altitude_m if glide_altitude_m is None else glide_altitude_m), 0.0)
+    glide_dist_m = glide_ratio * glide_alt
 
     # Turning-flight metrics
     turn_r_m = turn_radius_m(V, bank_deg)
@@ -2136,6 +2143,7 @@ def simulate_fw_mission(
             ambient_temp_C=ambient_c,
             wind_head_mps=headwind_mps,
             wind_cross_mps=crosswind_mps,
+            glide_altitude_m=float(phase.altitude),
         )
         m["climb_rate_cmd_mps"] = climb_cmd
         m["descent_rate_cmd_mps"] = descent_cmd
@@ -2261,6 +2269,7 @@ def _extract_weight_budget(cfg) -> list:
     rows = []
     total_g = float(getattr(cfg, "drone_weight_g",
                     getattr(cfg, "aircraft_weight_g", 0.0)))
+    payload_g = max(float(getattr(cfg, "payload_mass_g", 0.0) or 0.0), 0.0)
     num_motors = int(getattr(cfg, "num_motors",
                     getattr(getattr(cfg, "airframe", None), "num_motors", 1)))
     batt  = getattr(cfg, "battery",   None)
@@ -2284,6 +2293,8 @@ def _extract_weight_budget(cfg) -> list:
     if prop:
         w = float(getattr(prop, "weight_g", 0.0) or 0.0)
         rows.append(("Propeller", w, num_motors, w * num_motors)); accounted += w * num_motors
+    if payload_g > 0:
+        rows.append(("Payload", payload_g, 1, payload_g)); accounted += payload_g
     airframe_g = max(0.0, total_g - accounted)
     rows.append(("Airframe / Structure", airframe_g, 1, airframe_g))
     rows.append(("TOTAL", total_g, 1, total_g))
@@ -2876,7 +2887,8 @@ def launch_gui():
         return tk.StringVar(value=str(default))
 
     # Airframe
-    v_weight        = sv(2500)     # grams
+    v_weight        = sv(2500)     # base aircraft grams (excluding payload)
+    v_payload_mass  = sv(0)        # payload grams
     v_num_motors    = sv(1)
     v_wing_span     = sv(1.6)      # m
     v_wing_area     = sv(0.45)     # m²
@@ -2884,6 +2896,7 @@ def launch_gui():
     v_CL_max        = sv(1.30)
     v_oswald        = sv(0.82)
     v_mu_roll       = sv(0.04)
+    v_mu_brake      = sv(0.08)
     v_CL_takeoff    = sv(0.80)
     v_prop_eff      = sv(0.75)
     v_cruise_speed  = sv(18.0)     # m/s
@@ -2963,10 +2976,10 @@ def launch_gui():
     v_periph_cur       = sv(0.5)
 
     config_vars = dict(
-        weight=v_weight, num_motors=v_num_motors,
+        weight=v_weight, payload_mass_g=v_payload_mass, num_motors=v_num_motors,
         wing_span=v_wing_span, wing_area=v_wing_area,
         CD0=v_CD0, CL_max=v_CL_max, oswald=v_oswald,
-        mu_roll=v_mu_roll, CL_takeoff=v_CL_takeoff,
+        mu_roll=v_mu_roll, mu_brake=v_mu_brake, CL_takeoff=v_CL_takeoff,
         prop_eff=v_prop_eff, cruise_speed=v_cruise_speed,
         batt_chem=v_batt_chem, batt_vmin=v_batt_vmin,
         batt_vnom=v_batt_vnom, batt_vmax=v_batt_vmax,
@@ -3008,7 +3021,8 @@ def launch_gui():
 
     # ===== AIRFRAME TAB =====
     r = 0
-    add_row(tab_airframe, r, "Aircraft Weight (g)",         v_weight);       r += 1
+    add_row(tab_airframe, r, "Base Aircraft Weight (g)",    v_weight);       r += 1
+    add_row(tab_airframe, r, "Payload Mass (g)",            v_payload_mass); r += 1
     add_row(tab_airframe, r, "Number of Motors",            v_num_motors);   r += 1
     add_row(tab_airframe, r, "Cruise Speed (m/s)",          v_cruise_speed); r += 1
     add_row(tab_airframe, r, "Peripheral Current (A)",      v_periph_cur);   r += 1
@@ -3031,6 +3045,7 @@ def launch_gui():
     ttk.Label(tab_airframe, text="── Takeoff / Ground Roll ──",
               foreground="gray").grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
     add_row(tab_airframe, r, "Rolling Friction μ",         v_mu_roll);       r += 1
+    add_row(tab_airframe, r, "Braking Friction μ",         v_mu_brake);      r += 1
     add_row(tab_airframe, r, "CL at Takeoff Rotation",     v_CL_takeoff);    r += 1
     ttk.Separator(tab_airframe, orient="horizontal").grid(
         row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
@@ -3997,6 +4012,7 @@ def launch_gui():
             CL_max          = safe_float(v_CL_max.get(), 1.30),
             oswald          = safe_float(v_oswald.get(), 0.82),
             mu_roll         = safe_float(v_mu_roll.get(), 0.04),
+            mu_brake        = safe_float(v_mu_brake.get(), 0.08),
             CL_takeoff      = safe_float(v_CL_takeoff.get(), 0.80),
             prop_efficiency = safe_float(v_prop_eff.get(), 0.75),
             num_motors      = parse_int("Num motors", v_num_motors.get()) or 1,
@@ -4075,6 +4091,7 @@ def launch_gui():
             motor               = motor,
             propeller           = prop,
             aircraft_weight_g   = safe_float(v_weight.get(), 2500),
+            payload_mass_g      = max(safe_float(v_payload_mass.get(), 0.0), 0.0),
             cruise_speed_mps    = safe_float(v_cruise_speed.get(), 18.0),
             periph_current_A    = safe_float(v_periph_cur.get(), 0.0),
             esc                 = esc,
@@ -4531,7 +4548,8 @@ def build_arg_parser():
     p.add_argument("--gui", action="store_true", help="Launch Tkinter GUI")
 
     # Airframe
-    p.add_argument("--weight",         type=float, help="Total aircraft weight (g)")
+    p.add_argument("--weight",         type=float, help="Base aircraft weight excluding payload (g)")
+    p.add_argument("--payload_mass_g", type=float, default=0.0, help="Payload mass added to base aircraft weight (g)")
     p.add_argument("--num_motors",     type=int,   default=1)
     p.add_argument("--wing_span",      type=float, help="Wing span (m)")
     p.add_argument("--wing_area",      type=float, help="Wing area (m²)")
@@ -4539,6 +4557,7 @@ def build_arg_parser():
     p.add_argument("--CL_max",         type=float, default=1.30)
     p.add_argument("--oswald",         type=float, default=0.82)
     p.add_argument("--mu_roll",        type=float, default=0.04)
+    p.add_argument("--mu_brake",       type=float, default=0.08, help="Landing rollout braking friction coefficient")
     p.add_argument("--CL_takeoff",     type=float, default=0.80)
     p.add_argument("--prop_efficiency",type=float, default=0.75)
     p.add_argument("--cruise_speed",   type=float, default=18.0)
@@ -4609,6 +4628,22 @@ def build_arg_parser():
     return p
 
 
+def validate_required_cli_args(args):
+    required = [
+        "weight", "wing_span", "wing_area",
+        "battery_cell_capacity", "battery_cell_weight_g", "battery_energy_density",
+        "battery_charge_current_max", "battery_resistance_cell",
+        "motor_kv", "motor_resistance", "motor_max_current", "motor_max_power",
+        "prop_diameter", "prop_pitch",
+    ]
+    missing = [k for k in required if getattr(args, k) is None]
+    if missing:
+        raise SystemExit(
+            f"Missing required CLI args: {', '.join('--' + m for m in missing)}\n"
+            f"Tip: run with --gui to use the graphical interface."
+        )
+
+
 def main():
     parser = build_arg_parser()
     args   = parser.parse_args()
@@ -4618,6 +4653,7 @@ def main():
         return
 
     # ---- CLI mode ----
+    validate_required_cli_args(args)
     rho = isa_density(args.altitude, args.temperature)
     print(f"Air density: {rho:.4f} kg/m³  at altitude {args.altitude:.0f} m")
 
@@ -4628,6 +4664,7 @@ def main():
         CL_max          = args.CL_max,
         oswald          = args.oswald,
         mu_roll         = args.mu_roll,
+        mu_brake        = args.mu_brake,
         CL_takeoff      = args.CL_takeoff,
         prop_efficiency = args.prop_efficiency,
         num_motors      = args.num_motors,
@@ -4682,6 +4719,7 @@ def main():
         motor             = motor,
         propeller         = prop,
         aircraft_weight_g = args.weight,
+        payload_mass_g    = max(float(args.payload_mass_g or 0.0), 0.0),
         cruise_speed_mps  = args.cruise_speed,
         periph_current_A  = args.periph_current,
         air_density       = rho,
@@ -4696,6 +4734,7 @@ def main():
         ambient_temp_C=(float(args.temperature) if args.temperature is not None else 25.0),
         wind_head_mps=headwind,
         wind_cross_mps=crosswind,
+        glide_altitude_m=args.altitude,
     )
     climb_rate = max(float(args.climb_rate_mps), 0.0)
     descent_rate = max(float(args.descent_rate_mps), 0.0)
