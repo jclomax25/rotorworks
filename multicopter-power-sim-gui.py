@@ -530,6 +530,25 @@ def parse_float_list(spec: Optional[object]) -> Optional[List[float]]:
     return vals if vals else None
 
 
+def parse_optional_bool(spec: Optional[object]) -> Optional[bool]:
+    """
+    Parse permissive CLI-style booleans.
+    Returns None when the value is omitted/blank so callers can apply defaults.
+    """
+    if spec is None:
+        return None
+    if isinstance(spec, bool):
+        return spec
+    s = str(spec).strip().lower()
+    if not s:
+        return None
+    if s in ("1", "true", "yes", "y", "on", "enable", "enabled"):
+        return True
+    if s in ("0", "false", "no", "n", "off", "disable", "disabled"):
+        return False
+    raise ValueError(f"Invalid boolean value: {spec!r}")
+
+
 def _battery_preset_key(chemistry: Optional[str]) -> Optional[str]:
     if chemistry is None:
         return None
@@ -1813,12 +1832,12 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         "figure_of_merit":     float(fm_hover),
         "disk_loading_N_m2":   float(dl),
         "total_disk_area_m2":  float(A_total),
-        "tip_speed_mps":       (float(tip_speed) if tip_speed == tip_speed else None),
-        "tip_mach":            (float(tip_mach) if tip_mach == tip_mach else None),
+        "tip_speed_mps":       (float(tip_speed) if math.isfinite(tip_speed) else None),
+        "tip_mach":            (float(tip_mach) if math.isfinite(tip_mach) else None),
         "advance_ratio_mu":    float(mu_adv),
         "inflow_efficiency":   float(eta_inflow),
         "inflow_power_multiplier": float(inflow_mult),
-        "noise_significant":   bool(tip_mach == tip_mach and tip_mach > 0.6),
+        "noise_significant":   bool(math.isfinite(tip_mach) and tip_mach > 0.6),
         "motor_copper_loss_W_per_motor": float(p_copper),
         "battery_loss_W":      float(battery_loss_W),
         "motor_temp_est_C":    float(motor_temp_est_C),
@@ -2633,9 +2652,8 @@ def build_drone_from_args(args) -> DroneConfig:
     soc_bp = parse_float_list(getattr(args, "battery_soc_bp", None))
     ocv_cell_bp = parse_float_list(getattr(args, "battery_ocv_cell_bp", None))
     r_scale_bp = parse_float_list(getattr(args, "battery_r_scale_bp", None))
-    inflow_map_enabled = bool(getattr(args, "inflow_map_enabled", True))
-    if bool(getattr(args, "disable_inflow_map", False)):
-        inflow_map_enabled = False
+    inflow_map_raw = parse_optional_bool(getattr(args, "inflow_map_enabled", None))
+    inflow_map_enabled = True if inflow_map_raw is None else bool(inflow_map_raw)
     drag_model_raw = str(getattr(args, "drag_model_mode", "auto")).strip().lower()
     if drag_model_raw not in ("auto", "manual", "geometry"):
         drag_model_raw = "auto"
@@ -2690,7 +2708,7 @@ def build_drone_from_args(args) -> DroneConfig:
         table_csv=args.prop_table,
         PConst=args.prop_pconst,
         TConst=args.prop_tconst,
-        weight_g=getattr(args, "prop_weight_g", None),
+        weight_g=getattr(args, "prop_weight", None),
     )
 
     avionics = AvionicsConfig(
@@ -2709,12 +2727,14 @@ def build_drone_from_args(args) -> DroneConfig:
             weight_g=float(args.esc_weight) if args.esc_weight is not None else None,
         )
 
+    base_weight_g = float(args.weight)
+    payload_mass_g = max(float(getattr(args, "payload_mass_g", 0.0) or 0.0), 0.0)
     drone = DroneConfig(
         num_motors=args.num_motors,
         battery=battery,
         motor=motor,
         propeller=prop,
-        drone_weight_g=args.weight,
+        drone_weight_g=base_weight_g + payload_mass_g,
         profile_drag_coefficient=args.profile_drag,
         profile_area=args.profile_area,
         parasite_drag_coefficient=args.parasite_drag,
@@ -2742,6 +2762,7 @@ def build_drone_from_args(args) -> DroneConfig:
         inflow_mu_bp=inflow_mu_bp,
         inflow_eff_bp=inflow_eff_bp,
     )
+    drone.payload_mass_g = payload_mass_g
 
     # Initialize air density at user-specified conditions
     drone.air_density = compute_air_density(
@@ -2775,6 +2796,7 @@ def _extract_weight_budget(cfg) -> list:
     rows = []
     total_g = float(getattr(cfg, "drone_weight_g",
                     getattr(cfg, "aircraft_weight_g", 0.0)))
+    payload_g = max(float(getattr(cfg, "payload_mass_g", 0.0) or 0.0), 0.0)
     num_motors = int(getattr(cfg, "num_motors",
                     getattr(getattr(cfg, "airframe", None), "num_motors", 1)))
     batt  = getattr(cfg, "battery",   None)
@@ -2798,6 +2820,8 @@ def _extract_weight_budget(cfg) -> list:
     if prop:
         w = float(getattr(prop, "weight_g", 0.0) or 0.0)
         rows.append(("Propeller", w, num_motors, w * num_motors)); accounted += w * num_motors
+    if payload_g > 0:
+        rows.append(("Payload", payload_g, 1, payload_g)); accounted += payload_g
     airframe_g = max(0.0, total_g - accounted)
     rows.append(("Airframe / Structure", airframe_g, 1, airframe_g))
     rows.append(("TOTAL", total_g, 1, total_g))
@@ -3237,6 +3261,7 @@ def launch_gui():
     # Drone
     v_num_motors        = sv(4)
     v_weight            = sv(1500)
+    v_payload_mass      = sv(0)
     v_area              = sv(0.05)
     v_speed             = sv(10)
     v_periph_current    = sv(0.0)
@@ -3460,7 +3485,8 @@ def launch_gui():
 
     r = 1
     add_row(tab_drone, r, "Num Motors",              v_num_motors);        r += 1
-    add_row(tab_drone, r, "Weight (g)",              v_weight);            r += 1
+    add_row(tab_drone, r, "Base Weight (g)",         v_weight);            r += 1
+    add_row(tab_drone, r, "Payload Mass (g)",        v_payload_mass);      r += 1
     add_row(tab_drone, r, "Frontal Area (m²)",       v_area);              r += 1
     add_row(tab_drone, r, "Cruise Speed (m/s)",      v_speed);             r += 1
     add_row(tab_drone, r, "Peripheral Current (A)",  v_periph_current);    r += 1
@@ -3827,7 +3853,7 @@ def launch_gui():
     #  Collect config_vars for save/load                                  #
     # ------------------------------------------------------------------ #
     config_vars = {
-        "num_motors": v_num_motors, "weight": v_weight, "area": v_area,
+        "num_motors": v_num_motors, "weight": v_weight, "payload_mass_g": v_payload_mass, "area": v_area,
         "speed": v_speed, "periph_current": v_periph_current,
         "profile_drag": v_profile_drag, "profile_area": v_profile_area,
         "parasite_drag": v_parasite_drag, "parasite_area": v_parasite_area,
@@ -4590,8 +4616,8 @@ def launch_gui():
         tc = v_prop_tconst.get().strip(); pc = v_prop_pconst.get().strip()
         inflow_mu_bp = parse_float_list(v_inflow_mu_bp.get().strip())
         inflow_eff_bp = parse_float_list(v_inflow_eff_bp.get().strip())
-        inflow_enabled_raw = v_inflow_map_enabled.get().strip().lower()
-        inflow_map_enabled = inflow_enabled_raw not in ("0", "false", "no", "off", "")
+        inflow_enabled_raw = parse_optional_bool(v_inflow_map_enabled.get().strip())
+        inflow_map_enabled = True if inflow_enabled_raw is None else bool(inflow_enabled_raw)
         drag_model_raw = v_drag_model_mode.get().strip().lower()
         if drag_model_raw not in ("auto", "manual", "geometry"):
             drag_model_raw = "auto"
@@ -4606,12 +4632,14 @@ def launch_gui():
             PConst       = float(pc) if pc else None,
             weight_g     = parse_float("Prop weight", v_prop_weight.get()),
         )
+        base_weight_g = parse_float("Weight", v_weight.get())
+        payload_mass_g = max(parse_float("Payload mass", v_payload_mass.get()), 0.0)
         drone = DroneConfig(
             num_motors               = parse_int("Num motors", v_num_motors.get()),
             battery                  = batt,
             motor                    = motor,
             propeller                = prop,
-            drone_weight_g           = parse_float("Weight", v_weight.get()),
+            drone_weight_g           = base_weight_g + payload_mass_g,
             profile_drag_coefficient = (parse_float("Profile Cd", v_profile_drag.get()) if v_profile_drag.get().strip() else 0.0),
             profile_area             = (parse_float("Profile area", v_profile_area.get()) if v_profile_area.get().strip() else 0.0),
             parasite_drag_coefficient= (parse_float("Parasite Cd", v_parasite_drag.get()) if v_parasite_drag.get().strip() else 0.0),
@@ -4639,6 +4667,7 @@ def launch_gui():
             inflow_mu_bp             = inflow_mu_bp,
             inflow_eff_bp            = inflow_eff_bp,
         )
+        drone.payload_mass_g = payload_mass_g
         alt  = parse_float("Altitude", v_alt.get())
         temp = v_temp.get().strip()
         pres = v_press.get().strip()
@@ -5090,7 +5119,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # Drone
     parser.add_argument("--num_motors", type=int, required=False)
-    parser.add_argument("--weight", type=float, required=False, help="Drone weight (g)")
+    parser.add_argument("--weight", type=float, required=False, help="Base drone weight excluding payload (g)")
+    parser.add_argument("--payload_mass_g", type=float, default=0.0, help="Payload mass added to base drone weight (g)")
     parser.add_argument("--profile_drag", type=float, default=0.0, help="Profile drag coefficient")
     parser.add_argument("--profile_area", type=float, default=0.0, help="Rotor/arms profile reference area (m^2)")
     parser.add_argument("--parasite_drag", type=float, default=0.0, help="Parasite drag coefficient (fuselage/arms)")
@@ -5127,7 +5157,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--battery_discharge_c_max", type=float, required=False,
                         help="Max/burst discharge C-rate (e.g., 25 for 25C). Defaults to continuous if omitted.")
     parser.add_argument("--battery_discharge_percent", type=float, default=100.0,
-                        help="Percent of pack capacity to use (e.g., 80 means stop at 20% remaining).")
+                        help="Percent of pack capacity to use (e.g., 80 means stop at 20 percent remaining).")
     parser.add_argument("--battery_chemistry", type=str, default=None)
 
     parser.add_argument("--battery_unit_mode", choices=["cell", "pack"], default="cell") # cells or pack
@@ -5173,12 +5203,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esc_weight", type=float, required=False)
 
     # Avionics
-    parser.add_argument("--avionics_voltage_tree", type=str, default=None, help="Voltage tree for avionics power draw, e.g., '5.0:(2,0.9), 12.0:(1.5,0.85)' means 2A at 5V with 90% efficiency, and 1.5A at 12V with 85% efficiency")
+    parser.add_argument("--avionics_voltage_tree", type=str, default=None, help="Voltage tree for avionics power draw, e.g., '5.0:(2,0.9), 12.0:(1.5,0.85)' means 2A at 5V with 90 percent efficiency, and 1.5A at 12V with 85 percent efficiency")
 
     # Propeller
     parser.add_argument("--prop_diameter", type=float, required=False)
     parser.add_argument("--prop_pitch", type=float, required=False)
     parser.add_argument("--prop_blades", type=int, default=2)
+    parser.add_argument("--prop_weight", type=float, required=False, help="Propeller weight per motor (g)")
+    parser.add_argument("--prop_weight_g", dest="prop_weight", type=float, required=False, help=argparse.SUPPRESS)
     parser.add_argument("--prop_table", type=str, default=None)
     parser.add_argument("--prop_tconst", type=float, default=None, help="Prop thrust coefficient (C_T-like)")
     parser.add_argument("--prop_pconst", type=float, default=None, help="Prop power coefficient (C_P-like)")
@@ -5213,10 +5245,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help="Maximum deceleration for mission transient model (m/s²)")
     parser.add_argument("--decel_regen_eff", type=float, default=0.0,
                         help="Fraction of deceleration kinetic power recovered (0..1)")
-    parser.add_argument("--inflow_map_enabled", action="store_true", default=True,
-                        help="Enable rotor inflow/forward-flight efficiency map")
-    parser.add_argument("--disable_inflow_map", action="store_true", default=False,
-                        help="Disable rotor inflow/forward-flight efficiency map")
+    parser.add_argument(
+        "--inflow_map_enabled",
+        type=str,
+        default=None,
+        help="Enable/disable rotor inflow map (true/false, 1/0, yes/no). Default: enabled.",
+    )
     parser.add_argument("--inflow_mu_bp", type=str, default=None,
                         help="Comma-separated advance-ratio mu breakpoints, e.g. '0,0.1,0.2,0.3'")
     parser.add_argument("--inflow_eff_bp", type=str, default=None,
@@ -5236,7 +5270,7 @@ def validate_required_cli_args(args):
     """
     required = [
         "num_motors", "weight", "area",
-        "battery_operating_voltage_min", "battery_operating_voltage_max",
+        "battery_operating_voltage_min", "battery_operating_voltage_nominal", "battery_operating_voltage_max",
         "battery_cell_capacity", "battery_cell_weight_g", "battery_energy_density",
         "battery_charge_current_max", "battery_discharge_cont_A",
         "battery_resistance_cell", "battery_series_units",

@@ -542,7 +542,14 @@ def command_sweep(args: argparse.Namespace) -> int:
         run_args = dict(base_args)
         run_args[args.sweep_var] = val
         run_name = f"{args.sweep_var}={val}"
-        rr = run_simulation(args.sim, sim_script, run_name, run_args, args.timeout)
+        rr = run_simulation(
+            args.sim,
+            sim_script,
+            run_name,
+            run_args,
+            args.timeout,
+            print_command=args.print_commands,
+        )
         results.append(rr)
         print(f"[{i}/{len(sweep_vals)}] {format_short_result(rr)}")
 
@@ -626,7 +633,14 @@ def command_size(args: argparse.Namespace) -> int:
         for name, val in zip(names, combo):
             run_args[name] = val
         run_name = ",".join(f"{n}={v}" for n, v in zip(names, combo))
-        rr = run_simulation(args.sim, sim_script, run_name, run_args, args.timeout)
+        rr = run_simulation(
+            args.sim,
+            sim_script,
+            run_name,
+            run_args,
+            args.timeout,
+            print_command=args.print_commands,
+        )
         feasible, viol = evaluate_constraints(rr.metrics, constraints)
         rr.feasible = feasible and rr.return_code == 0
         rr.violation_score = viol + (1e6 if rr.return_code != 0 else 0.0)
@@ -715,7 +729,14 @@ def command_batch(args: argparse.Namespace) -> int:
             raise ValueError(f"Run '{name}' overrides must be an object.")
         run_args = dict(base_args)
         run_args.update(overrides)
-        rr = run_simulation(args.sim, sim_script, name, run_args, args.timeout)
+        rr = run_simulation(
+            args.sim,
+            sim_script,
+            name,
+            run_args,
+            args.timeout,
+            print_command=args.print_commands,
+        )
         results.append(rr)
         print(f"[{i}/{len(runs)}] {format_short_result(rr)}")
 
