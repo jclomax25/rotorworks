@@ -46,6 +46,49 @@ from typing import Optional, List, Tuple
 
 import pandas as pd
 import numpy as np
+
+# ------------------------------------------------------------------
+# Shared core, extracted so the two simulators cannot drift apart.
+# See rotorworks_core.py for what lives there and what deliberately
+# does not. It must sit beside this file.
+# ------------------------------------------------------------------
+try:
+    import rotorworks_core as core
+except ImportError as _exc:      # pragma: no cover - install/deploy problem
+    raise SystemExit(
+        "rotorworks_core.py could not be imported. It must sit in the same "
+        f"folder as this script.\nOriginal error: {_exc}"
+    )
+
+# Names re-exported under their historical spellings so existing call sites,
+# saved scripts and the test suite keep working unchanged.
+SOC_PRESETS = core.SOC_PRESETS
+SOC_PRESET_ALIASES = core.SOC_PRESET_ALIASES
+Tooltip = _Tooltip = core.Tooltip
+parse_float_list = core.parse_float_list
+parse_soc_breakpoints = core.parse_soc_breakpoints
+wind_components_mps = core.wind_components_mps
+groundspeed_along_track_mps = core.groundspeed_along_track_mps
+thermal_step = core.thermal_step
+_eval_poly = core.eval_poly
+_interp_linear_clamped = core.interp_linear_clamped
+_battery_preset_key = core.battery_preset_key
+_normalize_soc_curves = core.normalize_soc_curves
+_load_soc_curve_csv = core.load_soc_curve_csv
+_configure_battery_soc_model = core.configure_battery_soc_model
+_soc_model_short_label = core.soc_model_short_label
+battery_pack_ocv_from_soc = core.pack_ocv_from_soc
+battery_pack_resistance_from_soc = core.pack_resistance_from_soc
+battery_voltage_under_load = core.pack_voltage_under_load
+battery_soc_after_energy_draw = core.soc_after_energy_draw
+_fit_propeller_curve = core.fit_propeller_curve
+kinetic_power_term_W = core.kinetic_power_term_W
+ramp_speed = core.ramp_speed
+
+# Build identifier. Shown in the title bar, the Output pane and Help > About
+# so you can always tell which copy of the script you are running.
+SIM_VERSION = "2.12.0"
+SIM_BUILD_NOTE = "Airspeed-dependent thrust available; climb rates corrected"
 import matplotlib.pyplot as plt
 
 # -------------------------------
@@ -67,35 +110,7 @@ g0 = 9.80665 # m/s^2
 
 # Generic nonlinear SoC templates by chemistry:
 # curves are intentionally conservative and only approximate behavior.
-SOC_PRESETS = {
-    "lipo": {
-        "soc_bp":      [0.00, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
-        "ocv_cell_bp": [3.00, 3.30, 3.50, 3.65, 3.72, 3.76, 3.79, 3.82, 3.86, 3.92, 4.02, 4.20],
-        "r_scale_bp":  [2.60, 2.10, 1.70, 1.35, 1.18, 1.08, 1.00, 0.98, 1.00, 1.08, 1.25, 1.50],
-    },
-    "liion": {
-        "soc_bp":      [0.00, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
-        "ocv_cell_bp": [2.90, 3.20, 3.35, 3.50, 3.60, 3.67, 3.72, 3.77, 3.82, 3.89, 4.00, 4.20],
-        "r_scale_bp":  [2.80, 2.20, 1.80, 1.45, 1.22, 1.10, 1.00, 0.98, 1.00, 1.10, 1.30, 1.60],
-    },
-    "lifepo4": {
-        "soc_bp":      [0.00, 0.05, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
-        "ocv_cell_bp": [2.80, 3.00, 3.15, 3.22, 3.26, 3.29, 3.31, 3.32, 3.33, 3.35, 3.42, 3.60],
-        "r_scale_bp":  [2.20, 1.90, 1.55, 1.30, 1.15, 1.06, 1.00, 0.98, 1.00, 1.08, 1.18, 1.35],
-    },
-}
 
-SOC_PRESET_ALIASES = {
-    "lipo": "lipo",
-    "li-po": "lipo",
-    "liion": "liion",
-    "li-ion": "liion",
-    "lion": "liion",
-    "nmc": "liion",
-    "lifepo4": "lifepo4",
-    "lfp": "lifepo4",
-    "li-fepo4": "lifepo4",
-}
 
 
 # -------------------------------
@@ -142,8 +157,10 @@ class BatteryConfig:
         self.operating_voltage_nominal = float(operating_voltage_nominal)
         self.operating_voltage_max = float(operating_voltage_max)
         self.unit_mode = str(unit_mode).strip().lower() if unit_mode is not None else "cell"
-        self.series_units = int(series_units)
-        self.parallel_units = int(parallel_units)
+        # Counts must be at least 1 — a 0 or negative count would silently
+        # produce a zero-volt / zero-capacity pack and divide-by-zero later.
+        self.series_units = max(int(series_units), 1)
+        self.parallel_units = max(int(parallel_units), 1)
 
         if self.unit_mode not in ("cell", "pack"):
             # Fallback if the GUI or args provide a non-standard string.
@@ -153,8 +170,8 @@ class BatteryConfig:
             cells_series_per_unit = 1
             cells_parallel_per_unit = 1
 
-        self.cells_series_per_unit = int(cells_series_per_unit)
-        self.cells_parallel_per_unit = int(cells_parallel_per_unit)
+        self.cells_series_per_unit = max(int(cells_series_per_unit), 1)
+        self.cells_parallel_per_unit = max(int(cells_parallel_per_unit), 1)
 
         # Final pack layout in CELLS
         self.series_cells = self.series_units * self.cells_series_per_unit
@@ -174,21 +191,37 @@ class BatteryConfig:
         self.min_operating_temperature_C = float(min_operating_temperature_C) if min_operating_temperature_C is not None else None
         self.charge_current_max = float(charge_current_max) if charge_current_max is not None else 0.0
 
-        # Capacity in Ah — must be computed before energy_density_Wh_per_kg
-        if unit_mode == "cell":
+        # ------------------------------------------------------------------
+        # Capacity in mAh / Ah  — must be computed before energy density.
+        #
+        # PHYSICS: capacity (Ah) is set by the number of PARALLEL branches.
+        # Connecting units in SERIES raises voltage, NOT capacity.  Total
+        # energy still rises with series count because  E = C_Ah x V_pack
+        # and V_pack scales with series count.
+        #
+        #   6S1P of 5000 mAh packs ->  5000 mAh @ 22.2 V =  111 Wh
+        #   6S2P of 5000 mAh packs -> 10000 mAh @ 22.2 V =  222 Wh
+        #  12S1P of 5000 mAh packs ->  5000 mAh @ 44.4 V =  222 Wh   <- same energy, 2x voltage
+        #  12S2P of 5000 mAh packs -> 10000 mAh @ 44.4 V =  444 Wh
+        #
+        # NOTE: branch on self.unit_mode (normalised/lower-cased), never the
+        # raw `unit_mode` argument — "Pack"/"PACK"/" cell" would otherwise
+        # fall through and silently zero the capacity and weight.
+        # ------------------------------------------------------------------
+        if self.unit_mode == "cell":
+            # One "unit" is a cell: parallel cells set capacity.
             self.capacity_mAh = (self.cell_capacity_mAh or 0.0) * self.parallel_cells
-        elif unit_mode == "pack":
-            self.capacity_mAh = (self.pack_capacity_mAh or 0.0) * self.parallel_units * self.series_units
-        else:
-            self.capacity_mAh = 0.0
+        else:  # "pack"
+            # One "unit" is a pack: only packs wired in PARALLEL add capacity.
+            self.capacity_mAh = (self.pack_capacity_mAh or 0.0) * self.parallel_units
         self.capacity_Ah = self.capacity_mAh / 1000.0
 
-        if unit_mode == "cell":
+        # Weight DOES scale with the total number of units (series x parallel),
+        # because every physical unit is carried regardless of how it is wired.
+        if self.unit_mode == "cell":
             self.weight_g = (self.cell_weight_g or 0.0) * self.total_cells
-        elif unit_mode == "pack":
-            self.weight_g = (self.pack_weight_g or 0.0) * self.parallel_units * self.series_units
-        else:
-            self.weight_g = 0.0
+        else:  # "pack"
+            self.weight_g = (self.pack_weight_g or 0.0) * self.series_units * self.parallel_units
 
         # Energy density — must follow capacity_Ah and weight_g
         if unit_energy_density is not None:
@@ -251,6 +284,28 @@ class BatteryConfig:
             r_scale_bp=r_scale_bp,
         )
 
+    # ---- SoC API -----------------------------------------------------
+    # Thin wrappers over the module-level helpers below, so that this class
+    # exposes the SAME method names as the fixed-wing simulator's
+    # BatteryConfig. Same physics either way; having one API makes the two
+    # interchangeable in shared code and in tests.
+    def ocv_at_soc(self, soc: float) -> float:
+        """Pack open-circuit voltage at a given state of charge (0..1)."""
+        return battery_pack_ocv_from_soc(self, soc)
+
+    def resistance_at_soc(self, soc: float) -> float:
+        """Pack internal resistance at a given state of charge (0..1)."""
+        return battery_pack_resistance_from_soc(self, soc)
+
+    def voltage_under_load(self, current_A: float,
+                           soc: Optional[float] = None) -> float:
+        """Loaded pack voltage; soc defaults to fully charged."""
+        return battery_voltage_under_load(self, current_A, soc)
+
+    def soc_after_energy_draw(self, soc_now: float, energy_draw_Wh: float) -> float:
+        """Advance SoC after drawing a given amount of energy."""
+        return battery_soc_after_energy_draw(self, soc_now, energy_draw_Wh)
+
     @property
     def pack_resistance(self) -> float:
         return self.resistance_cell * self.series_cells / self.parallel_cells
@@ -264,128 +319,12 @@ class BatteryConfig:
         return self.capacity_Wh * self.usable_fraction
 
 
-def battery_pack_ocv_from_soc(battery: BatteryConfig, soc: float) -> float:
-    """Pack open-circuit voltage from SoC."""
-    if bool(getattr(battery, "soc_nonlinear_enabled", False)) and battery.soc_bp:
-        ocv_cell = _interp_linear_clamped(
-            min(max(float(soc), 0.0), 1.0),
-            list(battery.soc_bp),
-            list(battery.ocv_cell_bp),
-        )
-        return max(float(ocv_cell) * float(battery.series_cells), float(battery.vmin_pack))
-    # Linear fallback keeps the original behavior anchored near full-charge voltage.
-    return float(battery.vmax_pack)
-
-
-def battery_pack_resistance_from_soc(battery: BatteryConfig, soc: float) -> float:
-    """Pack internal resistance from SoC."""
-    base_r = max(float(getattr(battery, "pack_resistance", 0.0)), 0.0)
-    if bool(getattr(battery, "soc_nonlinear_enabled", False)) and battery.soc_bp:
-        scale = _interp_linear_clamped(
-            min(max(float(soc), 0.0), 1.0),
-            list(battery.soc_bp),
-            list(battery.r_scale_bp),
-        )
-        return base_r * max(float(scale), 0.05)
-    return base_r
-
-
 def battery_ocv_pack(battery: BatteryConfig, soc: float) -> float:
     return battery_pack_ocv_from_soc(battery, soc)
 
 
 def battery_pack_resistance(battery: BatteryConfig, soc: float) -> float:
     return battery_pack_resistance_from_soc(battery, soc)
-
-
-def battery_voltage_under_load(battery: BatteryConfig, current_A: float, soc: Optional[float] = None) -> float:
-    soc_eval = 1.0 if soc is None else min(max(float(soc), 0.0), 1.0)
-    ocv = battery_pack_ocv_from_soc(battery, soc_eval)
-    r = battery_pack_resistance_from_soc(battery, soc_eval)
-    v = ocv - float(current_A) * r
-    return max(float(v), float(battery.vmin_pack))
-
-
-def battery_soc_after_energy_draw(battery: BatteryConfig,
-                                  soc_now: float,
-                                  energy_draw_Wh: float) -> float:
-    usable_wh = max(float(getattr(battery, "usable_Wh", 0.0)), 1e-9)
-    soc_drop = max(float(energy_draw_Wh), 0.0) / usable_wh
-    return min(max(float(soc_now) - soc_drop, 0.0), 1.0)
-
-
-def _interp_linear_clamped(x: float, xp: List[float], fp: List[float]) -> float:
-    """Simple clamped linear interpolation without numpy dependency."""
-    if not xp or not fp or len(xp) != len(fp):
-        raise ValueError("Interpolation vectors must be same non-zero length.")
-    if len(xp) == 1:
-        return float(fp[0])
-    if x <= float(xp[0]):
-        return float(fp[0])
-    if x >= float(xp[-1]):
-        return float(fp[-1])
-    for i in range(1, len(xp)):
-        x0 = float(xp[i - 1]); x1 = float(xp[i])
-        if x <= x1:
-            y0 = float(fp[i - 1]); y1 = float(fp[i])
-            if abs(x1 - x0) < 1e-12:
-                return y1
-            t = (x - x0) / (x1 - x0)
-            return y0 + t * (y1 - y0)
-    return float(fp[-1])
-
-
-def _configure_battery_soc_model(battery: BatteryConfig,
-                                 model: str,
-                                 curve_csv: Optional[str],
-                                 soc_bp: Optional[List[float]],
-                                 ocv_cell_bp: Optional[List[float]],
-                                 r_scale_bp: Optional[List[float]]) -> None:
-    # Resolution order:
-    #  1) explicit breakpoint arrays
-    #  2) CSV curve file
-    #  3) chemistry preset (or auto-from-chemistry)
-    #  4) linear fallback
-    m = str(model or "auto").strip().lower()
-    if m in ("linear", "off", "disabled"):
-        battery.soc_nonlinear_enabled = False
-        battery.soc_model_source = "linear-selected"
-        return
-
-    # Priority: explicit arrays -> CSV -> model preset/chemistry fallback
-    try:
-        if soc_bp and ocv_cell_bp and r_scale_bp:
-            s, v, r = _normalize_soc_curves(list(soc_bp), list(ocv_cell_bp), list(r_scale_bp))
-            battery.soc_bp, battery.ocv_cell_bp, battery.r_scale_bp = s, v, r
-            battery.soc_nonlinear_enabled = True
-            battery.soc_model_source = "custom-arrays"
-            return
-        if curve_csv:
-            s, v, r = _load_soc_curve_csv(curve_csv)
-            battery.soc_bp, battery.ocv_cell_bp, battery.r_scale_bp = s, v, r
-            battery.soc_nonlinear_enabled = True
-            battery.soc_model_source = f"csv:{curve_csv}"
-            return
-    except Exception:
-        # fall through to presets / linear fallback
-        pass
-
-    preset_key = None
-    if m in ("auto", "", "preset"):
-        preset_key = _battery_preset_key(getattr(battery, "chemistry", None))
-    else:
-        preset_key = _battery_preset_key(m)
-    if preset_key and preset_key in SOC_PRESETS:
-        p = SOC_PRESETS[preset_key]
-        battery.soc_bp = list(p["soc_bp"])
-        battery.ocv_cell_bp = list(p["ocv_cell_bp"])
-        battery.r_scale_bp = list(p["r_scale_bp"])
-        battery.soc_nonlinear_enabled = True
-        battery.soc_model_source = f"preset:{preset_key}"
-        return
-
-    battery.soc_nonlinear_enabled = False
-    battery.soc_model_source = "linear-fallback"
 
 
 # -------------------------------
@@ -398,18 +337,21 @@ class MotorConfig:
                  idle_voltage: float,
                  rated_voltage: int, #S rating for ESC compatibility checks
                  resistance: float,
-                 max_current: float,
-                 max_power: float,
+                 max_current: Optional[float] = None,
+                 max_power: Optional[float] = None,
                  pole_count: Optional[int] = None,
                  weight_g: Optional[float] = None,
                  size_mm: Optional[str] = None):
         self.kv = None if kv is None else float(kv)   # RPM/V
-        self.idle_current = float(idle_current)       # A
-        self.idle_voltage = float(idle_voltage)
-        self.resistance = float(resistance)           # Ω
-        self.max_current = float(max_current)         # A
-        self.max_power = float(max_power)             # W
-        self.rated_voltage = int(rated_voltage)
+        self.idle_current = float(idle_current or 0.0)   # A
+        self.idle_voltage = float(idle_voltage or 10.0)
+        self.resistance = float(resistance)              # Ω
+        # max_current / max_power are rating limits used only for status
+        # checks.  None means "no rating supplied" — the check is skipped
+        # rather than the whole run failing.
+        self.max_current = None if max_current is None else float(max_current)
+        self.max_power   = None if max_power   is None else float(max_power)
+        self.rated_voltage = int(rated_voltage or 0)
         self.pole_count = pole_count
         self.weight_g = weight_g
         self.size_mm = size_mm
@@ -511,25 +453,6 @@ def parse_voltage_tree(spec: Optional[str]) -> dict:
     return out
 
 
-def parse_float_list(spec: Optional[object]) -> Optional[List[float]]:
-    """Parse comma-separated floats into a list; empty input returns None."""
-    if spec is None:
-        return None
-    if isinstance(spec, (list, tuple, np.ndarray)):
-        vals = [float(x) for x in spec]
-        return vals if vals else None
-    s = str(spec).strip()
-    if not s:
-        return None
-    vals: List[float] = []
-    for tok in s.split(","):
-        t = tok.strip()
-        if not t:
-            continue
-        vals.append(float(t))
-    return vals if vals else None
-
-
 def parse_optional_bool(spec: Optional[object]) -> Optional[bool]:
     """
     Parse permissive CLI-style booleans.
@@ -549,91 +472,8 @@ def parse_optional_bool(spec: Optional[object]) -> Optional[bool]:
     raise ValueError(f"Invalid boolean value: {spec!r}")
 
 
-def _battery_preset_key(chemistry: Optional[str]) -> Optional[str]:
-    if chemistry is None:
-        return None
-    key = str(chemistry).strip().lower()
-    if not key:
-        return None
-    return SOC_PRESET_ALIASES.get(key, key if key in SOC_PRESETS else None)
-
-
-def _normalize_soc_curves(soc_bp: List[float],
-                          ocv_cell_bp: List[float],
-                          r_scale_bp: List[float]) -> Tuple[List[float], List[float], List[float]]:
-    if len(soc_bp) != len(ocv_cell_bp) or len(soc_bp) != len(r_scale_bp):
-        raise ValueError("SoC curve columns must have same length.")
-    if len(soc_bp) < 2:
-        raise ValueError("SoC curve requires at least 2 points.")
-    rows = sorted((float(s), float(v), float(r)) for s, v, r in zip(soc_bp, ocv_cell_bp, r_scale_bp))
-    out_s: List[float] = []
-    out_v: List[float] = []
-    out_r: List[float] = []
-    for s, v, r in rows:
-        s = min(max(s, 0.0), 1.0)
-        v = max(v, 0.0)
-        r = max(r, 0.05)
-        if out_s and abs(s - out_s[-1]) < 1e-9:
-            out_v[-1] = v
-            out_r[-1] = r
-        else:
-            out_s.append(s)
-            out_v.append(v)
-            out_r.append(r)
-    if len(out_s) < 2:
-        raise ValueError("SoC curve must contain at least 2 unique SoC breakpoints.")
-    return out_s, out_v, out_r
-
-
-def _load_soc_curve_csv(path: str) -> Tuple[List[float], List[float], List[float]]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    df = pd.read_csv(path)
-    lower = {str(c).strip().lower(): c for c in df.columns}
-    soc_col = next((lower[k] for k in ("soc", "soc_frac", "soc_fraction") if k in lower), None)
-    ocv_col = next((lower[k] for k in ("ocv_cell", "v_oc_cell", "voltage_cell") if k in lower), None)
-    r_col = next((lower[k] for k in ("r_scale", "resistance_scale", "r_rel", "r_multiplier") if k in lower), None)
-    if soc_col is None or ocv_col is None or r_col is None:
-        raise ValueError("SoC CSV must include columns: soc, ocv_cell, r_scale")
-    soc_vals = pd.to_numeric(df[soc_col], errors="coerce")
-    ocv_vals = pd.to_numeric(df[ocv_col], errors="coerce")
-    r_vals = pd.to_numeric(df[r_col], errors="coerce")
-    mask = ~(soc_vals.isna() | ocv_vals.isna() | r_vals.isna())
-    return _normalize_soc_curves(
-        soc_vals[mask].tolist(),
-        ocv_vals[mask].tolist(),
-        r_vals[mask].tolist(),
-    )
-
-
 def _split_csv_tokens(spec: str) -> List[str]:
     return [tok.strip() for tok in str(spec).split(",") if tok.strip()]
-
-
-def parse_soc_breakpoints(spec: Optional[object]) -> Optional[List[float]]:
-    vals = parse_float_list(spec)
-    if vals is None:
-        return None
-    out: List[float] = []
-    for v in vals:
-        vv = float(v)
-        if vv > 1.0:
-            vv = vv / 100.0
-        out.append(min(max(vv, 0.0), 1.0))
-    return out if out else None
-
-
-def _soc_model_short_label(source: Optional[str]) -> str:
-    s = str(source or "").strip().lower()
-    if not s:
-        return "linear-fallback"
-    if s.startswith("preset:"):
-        return s.replace("preset:", "preset-", 1)
-    if s.startswith("csv:"):
-        return "csv"
-    if s == "custom-arrays":
-        return "custom"
-    return s
 
 
 def avionics_input_power_W(avionics: Optional[AvionicsConfig]) -> float:
@@ -768,7 +608,13 @@ def load_motor_prop_table_csv(path: str) -> pd.DataFrame:
         raw = pd.read_csv(path, header=None)
         header_row = None
         for i in range(min(len(raw), 25)):
-            row = raw.iloc[i].astype(str).str.strip().str.lower().tolist()
+            # Coerce every cell to a string explicitly. Do NOT rely on
+            # Series.astype(str): with pandas' newer "str" dtype it leaves
+            # NaN as a real float, so a sparse row (a title line followed by
+            # empty cells) yields floats here and .startswith() below raises
+            # "'float' object has no attribute 'startswith'".
+            row = ["" if pd.isna(v) else str(v).strip().lower()
+                   for v in raw.iloc[i].tolist()]
             if any("throttle" == x or x.startswith("throttle") for x in row) and any("thrust" in x for x in row):
                 header_row = i
                 break
@@ -856,6 +702,29 @@ class PropellerConfig:
         self.table: Optional[pd.DataFrame] = None
         if table_csv:
             self.table = load_motor_prop_table_csv(table_csv)
+            self._cache_table_arrays()
+
+    def _cache_table_arrays(self) -> None:
+        """
+        Precompute the scalars and arrays the hot paths need.
+
+        Every one of these was previously recomputed from the DataFrame on
+        each call. The climb-rate and best-speed searches evaluate thrust
+        hundreds of times per run, so a pandas reduction per evaluation turned
+        a 5 ms calculation into 50 ms and made the window stop responding.
+        """
+        self._thrust_g_arr = None
+        self._power_w_arr = None
+        self._thrust_g_min = None
+        self._thrust_g_max = None
+        if self.table is None or "Thrust_g" not in self.table:
+            return
+        self._thrust_g_arr = self.table["Thrust_g"].to_numpy(dtype=float)
+        if "Power_W" in self.table:
+            self._power_w_arr = self.table["Power_W"].to_numpy(dtype=float)
+        if self._thrust_g_arr.size:
+            self._thrust_g_min = float(self._thrust_g_arr.min())
+            self._thrust_g_max = float(self._thrust_g_arr.max())
 
 
 # -------------------------------
@@ -1031,10 +900,19 @@ class DroneConfig:
             self.parasite_area = 0.0
             self.parasite_drag_coefficient = 0.0
 
-        # Profile drag term in this simplified model represents rotor/arm "profile".
-        # We approximate it with arms only so hover-side drag isn't zero.
-        self.profile_area = A_arms
-        self.profile_drag_coefficient = CD_ARM if A_arms > 0 else 0.0
+        # Profile term = the SIDE silhouette, used when the vehicle translates
+        # laterally while level (the "hover" orientation).  Approximate it as
+        # the body seen side-on (length x height) plus the arms, since an arm
+        # presents roughly the same tube area from the side as from the front.
+        A_body_side = self.body_length_m * self.body_height_m
+        A_side_total = A_body_side + A_arms
+        if A_side_total > 0:
+            self.profile_area = A_side_total
+            self.profile_drag_coefficient = (
+                (CD_BOX * A_body_side + CD_ARM * A_arms) / A_side_total)
+        else:
+            self.profile_area = 0.0
+            self.profile_drag_coefficient = 0.0
 
         # Frontal area stored separately if you want to use it elsewhere
         self.frontal_area = A_body
@@ -1118,12 +996,21 @@ def drag_force_required(config: DroneConfig, speed_mps: float, orientation: str)
     # In manual mode, user-specified Cd/area values are used directly.
     config.derive_drag_from_geometry_if_missing()
 
-    if orientation == "hover":
-        return 0.5 * config.air_density * speed_mps**2 * config.profile_area * config.profile_drag_coefficient
+    q = 0.5 * config.air_density * speed_mps ** 2      # dynamic pressure [Pa]
 
-    parasite = 0.5 * config.air_density * speed_mps**2 * config.parasite_area * config.parasite_drag_coefficient
-    profile = 0.5 * config.air_density * speed_mps**2 * config.profile_area * config.profile_drag_coefficient
-    return parasite + profile
+    if orientation == "hover":
+        # Level attitude, translating sideways/laterally: the vehicle presents
+        # its SIDE profile to the airflow.
+        return q * config.profile_area * config.profile_drag_coefficient
+
+    # Forward flight, nose pitched down: the vehicle presents its FRONTAL
+    # silhouette.  parasite_area is the FULL frontal area (body + arms +
+    # legs), so it already accounts for every frontal component.
+    #
+    # Previously this returned  parasite + profile, which double-counted the
+    # arms: the geometry fallback puts the arms into BOTH parasite_area
+    # (body + arms) and profile_area (arms), so their drag was charged twice.
+    return q * config.parasite_area * config.parasite_drag_coefficient
 
 
 def required_tilt_deg(config: DroneConfig, speed_mps: float, orientation: str) -> float:
@@ -1137,31 +1024,6 @@ def required_tilt_deg(config: DroneConfig, speed_mps: float, orientation: str) -
 def disk_area(diameter_in: float) -> float:
     d_m = diameter_in * 0.0254
     return math.pi * (d_m / 2.0) ** 2
-
-
-def wind_components_mps(wind_speed_mps: float,
-                        wind_direction_deg: float,
-                        course_deg: float) -> Tuple[float, float]:
-    """
-    Resolve wind into along-track headwind (+) and crosswind components.
-    """
-    w = max(float(wind_speed_mps), 0.0)
-    rel = math.radians(float(wind_direction_deg) - float(course_deg))
-    return w * math.cos(rel), w * math.sin(rel)
-
-
-def groundspeed_along_track_mps(airspeed_mps: float,
-                                headwind_mps: float,
-                                crosswind_mps: float) -> float:
-    """
-    Along-track groundspeed when holding course with crab.
-    """
-    v_air = max(float(airspeed_mps), 0.0)
-    xw = abs(float(crosswind_mps))
-    if xw >= v_air:
-        return 0.0
-    along_air = math.sqrt(max(v_air * v_air - xw * xw, 0.0))
-    return max(along_air - float(headwind_mps), 0.0)
 
 
 def advance_ratio_mu(config: DroneConfig, airspeed_mps: float, rpm: Optional[float]) -> float:
@@ -1199,35 +1061,6 @@ def rotor_inflow_power_multiplier(config: DroneConfig,
     return float(multiplier), float(mu), float(eta)
 
 
-def kinetic_power_term_W(weight_g: float, v_now_mps: float, v_next_mps: float, dt_s: float, regen_eff: float) -> float:
-    """
-    Kinetic energy rate [W] from speed change:
-      P = d(0.5*m*v^2)/dt
-    Positive values require extra power; negative values can be partially recovered.
-    """
-    if dt_s <= 1e-9:
-        return 0.0
-    m_kg = max(float(weight_g), 0.0) / 1000.0
-    e_now = 0.5 * m_kg * (max(float(v_now_mps), 0.0) ** 2)
-    e_next = 0.5 * m_kg * (max(float(v_next_mps), 0.0) ** 2)
-    p = (e_next - e_now) / float(dt_s)
-    if p >= 0.0:
-        return p
-    return p * min(max(float(regen_eff), 0.0), 1.0)
-
-
-def thermal_step(temp_c: float,
-                 ambient_c: float,
-                 loss_w: float,
-                 r_th_c_per_w: float,
-                 tau_s: float,
-                 dt_s: float) -> float:
-    """First-order thermal update towards ambient + loss*Rth."""
-    target = float(ambient_c) + max(float(loss_w), 0.0) * max(float(r_th_c_per_w), 0.0)
-    if dt_s <= 0:
-        return float(temp_c)
-    alpha = 1.0 - math.exp(-float(dt_s) / max(float(tau_s), 1e-6))
-    return float(temp_c) + (target - float(temp_c)) * alpha
 
 
 def total_disk_area(config: DroneConfig) -> float:
@@ -1247,7 +1080,10 @@ def available_total_thrust_N(config: DroneConfig) -> float:
     nm = max(int(config.num_motors), 1)
     if getattr(config.propeller, "table", None) is not None:
         try:
-            return float(config.propeller.table["Thrust_g"].max()) * 9.81 / 1000.0 * nm
+            _cached = getattr(config.propeller, "_thrust_g_max", None)
+            _max_g = (_cached if _cached is not None
+                      else float(config.propeller.table["Thrust_g"].max()))
+            return float(_max_g) * 9.81 / 1000.0 * nm
         except Exception:
             pass
 
@@ -1331,7 +1167,27 @@ def hover_wind_resistance_mps(config: DroneConfig) -> float:
     """
     rho = max(float(config.air_density), 1e-9)
     Cd = max(float(getattr(config, "parasite_drag_coefficient", 0.0)), 0.2)
-    A_frontal = max(float(getattr(config, "frontal_area", 0.0)), 1e-6)
+
+    # Reference area: prefer the area the drag model actually uses
+    # (parasite_area, which the geometry fallback populates), then an
+    # explicitly entered frontal_area.
+    #
+    # If neither is known we must NOT substitute a token value: the old
+    # 1e-6 m2 floor turned an unknown area into a divide-by-almost-zero and
+    # reported wind resistances of thousands of m/s. Return NaN instead so
+    # the figure displays as "n/a" rather than a confident wrong number.
+    A_frontal = 0.0
+    for attr in ("parasite_area", "frontal_area"):
+        try:
+            val = float(getattr(config, attr, 0.0) or 0.0)
+        except (TypeError, ValueError):
+            val = 0.0
+        if val > 0.0:
+            A_frontal = val
+            break
+    if A_frontal < 1e-4:          # smaller than 1 cm2 is not a real airframe
+        return float("nan")
+
     weight_N = config.drone_weight_g * 9.81 / 1000.0
 
     t_avail = max(available_total_thrust_N(config), 0.0)
@@ -1349,23 +1205,17 @@ def hover_wind_resistance_mps(config: DroneConfig) -> float:
     return math.sqrt((2.0 * t_horizontal) / (rho * Cd * A_frontal))
 
 
-def compute_air_density(altitude_m: float, temperature_C: Optional[float] = None, pressure_Pa: Optional[float] = None) -> float:
+def compute_air_density(altitude_m: float,
+                        temperature_C: Optional[float] = None,
+                        pressure_Pa: Optional[float] = None) -> float:
     """
-    altitude_m: meters
-    temperature_C: °C; if None, ISA lapse rate is used
-    pressure_Pa: Pa; if None, barometric formula is used (troposphere)
+    Air density [kg/m^3]. Thin wrapper over the shared core implementation.
+
+    Kept under this name because both simulators, their CLIs and saved
+    scripts refer to it. The two used to carry separate implementations
+    that disagreed about pressure overrides; there is now exactly one.
     """
-    if temperature_C is None:
-        temperature_C = (T0 - L * altitude_m) - 273.15
-
-    T = temperature_C + 273.15
-
-    if pressure_Pa is None:
-        P = P0 * (1.0 - (L * altitude_m) / T0) ** (g0 / (R * L))
-    else:
-        P = pressure_Pa
-
-    return P / (R * T)
+    return core.air_density(altitude_m, temperature_C, pressure_Pa)
 
 
 def thrust_required(config: DroneConfig, speed_mps: float, orientation: str) -> float:
@@ -1392,47 +1242,6 @@ def thrust_required(config: DroneConfig, speed_mps: float, orientation: str) -> 
 
     # forward flight (vector sum)
     return math.sqrt(weight_force**2 + drag_force**2)
-
-
-# -------------------------------
-# Power Models
-# -------------------------------
-def _fit_propeller_curve(thrust_g_data: np.ndarray, y_data: np.ndarray, degree: int = 2) -> tuple:
-    """Fit a polynomial to propeller data for extrapolation.
-    
-    Args:
-        thrust_g_data: Thrust values in grams (x-axis)
-        y_data: Property values (Power_W, Current_A, etc.)
-        degree: Polynomial degree (1 or 2 recommended)
-    
-    Returns:
-        (coeffs, min_thrust, max_thrust) where coeffs are polyfit coefficients
-    """
-    # Filter out NaN values
-    valid_idx = ~(np.isnan(thrust_g_data) | np.isnan(y_data))
-    if valid_idx.sum() < degree + 1:
-        # Not enough valid points, return None
-        return None
-    
-    x_valid = thrust_g_data[valid_idx]
-    y_valid = y_data[valid_idx]
-    
-    try:
-        # Fit polynomial (highest degree first)
-        coeffs = np.polyfit(x_valid, y_valid, degree)
-        return (coeffs, x_valid.min(), x_valid.max())
-    except:
-        return None
-
-
-def _eval_poly(coeffs: np.ndarray, x: float) -> float:
-    """Evaluate polynomial with coefficients from np.polyfit at point x."""
-    if coeffs is None:
-        return None
-    result = 0.0
-    for i, c in enumerate(coeffs):
-        result += c * (x ** (len(coeffs) - 1 - i))
-    return result
 
 
 def _extrapolate_motor_value(df: pd.DataFrame, thrust_g: float, column: str) -> Optional[float]:
@@ -1502,19 +1311,48 @@ def interpolate_motor_point(config: DroneConfig, thrust_per_motor_N: float) -> d
     min_thrust = float(df["Thrust_g"].min())
     max_thrust = float(df["Thrust_g"].max())
     
-    # Handle below minimum: extrapolate using curve fit
+    # Handle below minimum: extrapolate below the measured range.
+    #
+    # A polynomial fitted to the measured band and run downward is unsafe — on
+    # a table spanning 1426-6733 g it crosses zero near 250 g and turns
+    # negative, which surfaces as an operating point at negative power and an
+    # absurd efficiency. Quantities with a known physical scaling use it
+    # instead, anchored on the lowest MEASURED row so the fit is exact at the
+    # edge of the table:
+    #
+    #     power    proportional to T^1.5   (static momentum theory)
+    #     RPM      proportional to T^0.5   (thrust goes as omega^2)
+    #     current  proportional to torque, which goes as T^1.5
+    #
+    # Anything without a clean scaling law falls back to the fitted curve, and
+    # is then floored so it can never go negative.
     if thrust_g < min_thrust:
         out = {}
+        first = df.iloc[0]
+        ratio = (thrust_g / min_thrust) if min_thrust > 0 else 0.0
+        PHYSICAL_EXPONENT = {
+            "Power_W": 1.5, "Current_A": 1.5, "Torque_Nm": 1.5,
+            "RPM": 0.5, "Throttle_pct": 0.5,
+        }
         for col in ("Power_W","RPM","Current_A","Voltage_V","Throttle_pct","Efficiency_gW","Temp_C","Torque_Nm"):
-            # Try to extrapolate
+            if col not in df.columns or not pd.notna(first[col]):
+                continue
+            anchor = float(first[col])
+            exponent = PHYSICAL_EXPONENT.get(col)
+            if exponent is not None and anchor > 0 and ratio > 0:
+                out[col] = max(anchor * (ratio ** exponent), 1e-9)
+                continue
+            if col in ("Voltage_V", "Temp_C"):
+                out[col] = anchor          # roughly flat; holding is honest
+                continue
             extrapolated = _extrapolate_motor_value(df, thrust_g, col)
-            if extrapolated is not None:
-                out[col] = extrapolated
-            elif col in df.columns:
-                # Fall back to first row value
-                row = df.iloc[0]
-                if pd.notna(row[col]):
-                    out[col] = float(row[col])
+            if extrapolated is not None and float(extrapolated) > 0:
+                out[col] = float(extrapolated)
+            else:
+                out[col] = anchor
+        # Efficiency must stay consistent with the power we just produced.
+        if "Power_W" in out and out["Power_W"] > 0:
+            out["Efficiency_gW"] = thrust_g / out["Power_W"]
         return out
 
     if thrust_g >= max_thrust:
@@ -1547,7 +1385,76 @@ def interpolate_motor_power(config: DroneConfig, thrust_per_motor_N: float) -> f
         raise ValueError("prop_table interpolation failed to produce Power_W")
     return float(pt["Power_W"])
 
-def motor_power_from_params(config: DroneConfig, thrust_per_motor_N: float) -> float:
+def induced_velocity_forward_flight(v_hover: float,
+                                    airspeed_mps: float,
+                                    disk_incidence_rad: float = 0.0,
+                                    iters: int = 40) -> float:
+    """
+    Rotor induced velocity in forward flight (Glauert's momentum theory).
+
+    A hovering rotor must accelerate still air, so it works hard:
+        v_h = sqrt( T / (2 * rho * A) )
+
+    Once the vehicle is moving, the rotor meets air that is ALREADY moving,
+    so far less velocity has to be added and induced power falls sharply.
+    Glauert's relation for a rotor at incidence alpha to the freestream is:
+
+        vi = v_h^2 / sqrt( (V*cos a)^2 + (V*sin a + vi)^2 )
+
+    Special cases this reduces to:
+      * V = 0            ->  vi = v_h                     (hover)
+      * a = 90 deg       ->  vi = -V/2 + sqrt((V/2)^2 + v_h^2)
+                                                          (axial / propeller)
+      * a = 0 deg        ->  vi = v_h^2 / sqrt(V^2 + vi^2)
+                                                          (edgewise / multirotor)
+
+    A multicopter in forward flight sits near the edgewise case: its rotors
+    stay nearly horizontal and only tilt by the angle needed to balance drag,
+    so the freestream is almost in the disk plane.
+
+    Why this matters
+    ----------------
+    Using the hover value at all speeds overstates induced power by roughly
+    2x at 10 m/s and 4x at 20 m/s for a typical quad.  That removes the
+    "power bucket" — the 10-25% dip below hover power that real multirotors
+    show around 8-14 m/s — and leaves a monotonically rising power curve.
+    With no minimum in the curve, best-endurance and best-range speed
+    searches simply pin to the ends of their search range.
+
+    This returns vi only.  Shaft power is then
+        P = T * (V*sin(a) + vi)
+    where the first term is the propulsive power overcoming airframe drag.
+
+    Solved by damped fixed-point iteration, which converges quickly because
+    the right-hand side is a contraction for all physical inputs.
+    """
+    vh = max(float(v_hover), 0.0)
+    V = max(float(airspeed_mps), 0.0)
+    if vh <= 0.0:
+        return 0.0
+    if V <= 1e-9:
+        return vh                       # hover
+
+    a = float(disk_incidence_rad)
+    v_par = V * math.cos(a)             # in-plane component
+    v_perp = V * math.sin(a)            # through-disk component
+
+    vi = vh                             # start from the hover value
+    for _ in range(max(int(iters), 1)):
+        denom = math.sqrt(v_par ** 2 + (v_perp + vi) ** 2)
+        vi_new = (vh ** 2) / max(denom, 1e-9)
+        # Damping keeps the iteration stable near the vortex-ring region.
+        vi_next = 0.5 * (vi + vi_new)
+        if abs(vi_next - vi) < 1e-9:
+            vi = vi_next
+            break
+        vi = vi_next
+    return max(vi, 0.0)
+
+
+def motor_power_from_params(config: DroneConfig, thrust_per_motor_N: float,
+                            airspeed_mps: float = 0.0,
+                            disk_incidence_rad: float = 0.0) -> float:
     """
     Estimate electrical input power required for a given thrust per motor.
 
@@ -1556,9 +1463,12 @@ def motor_power_from_params(config: DroneConfig, thrust_per_motor_N: float) -> f
             T = C_T * rho * n^2 * D^4
         Then mechanical shaft power:
             P_mech = C_P * rho * n^3 * D^5
-      - Else: fallback to momentum theory induced power:
-            vi = sqrt(T / (2*rho*A))
+      - Else: momentum-theory induced power, corrected for forward flight:
+            v_h = sqrt(T / (2*rho*A))
+            vi  = induced_velocity_forward_flight(v_h, V, incidence)
             P_mech ≈ T * vi
+        At V = 0 this is the familiar hover result; at speed the rotor meets
+        already-moving air, so vi (and induced power) drop sharply.
 
     Electrical conversion (very simplified):
       - torque constant: Kt = 60 / (2π Kv)  [Nm/A]
@@ -1597,8 +1507,16 @@ def motor_power_from_params(config: DroneConfig, thrust_per_motor_N: float) -> f
         torque_Nm = mech_power_W / max(omega, 1e-9)
     else:
         A = disk_area(config.propeller.diameter_in)
-        vi = math.sqrt(thrust_per_motor_N / (2.0 * rho * A))
-        mech_power_W = thrust_per_motor_N * vi
+        v_hover = math.sqrt(max(thrust_per_motor_N, 0.0) / max(2.0 * rho * A, 1e-9))
+        vi = induced_velocity_forward_flight(v_hover, airspeed_mps, disk_incidence_rad)
+        # Shaft power = thrust x (through-disk freestream + induced velocity).
+        #   P = T * (V*sin(a) + vi)
+        # The first term is the propulsive power that overcomes airframe drag:
+        # by the tilt balance T*sin(a) = D, so T*V*sin(a) = D*V exactly.
+        # Dropping it (as an induced-only model does) makes power fall without
+        # bound at speed; at V = 0 it vanishes and hover is unchanged.
+        v_through = max(float(airspeed_mps), 0.0) * math.sin(float(disk_incidence_rad))
+        mech_power_W = thrust_per_motor_N * (v_through + vi)
         # crude omega/torque estimate from Kv and voltage
         omega = (config.battery.vnom_pack * config.motor.kv) * (2.0 * math.pi / 60.0)
         torque_Nm = mech_power_W / max(omega, 1e-9)
@@ -1676,14 +1594,33 @@ def power_required(config: DroneConfig,
     total_thrust_N = thrust_required(config, speed_mps, orientation)
     thrust_per_motor_N = total_thrust_N / config.num_motors
 
+    # Disk incidence: the angle between the freestream and the rotor DISK
+    # PLANE.  A multicopter only tilts by the amount needed to balance drag,
+    # so the airflow is close to edgewise (incidence ~ tilt angle).  In hover
+    # there is no freestream, so the incidence is irrelevant.
+    if orientation == "forward":
+        incidence_rad = math.radians(required_tilt_deg(config, speed_mps, "forward"))
+        airspeed_for_inflow = max(float(speed_mps), 0.0)
+    else:
+        incidence_rad = 0.0
+        airspeed_for_inflow = max(float(speed_mps), 0.0)
+
     if config.propeller.table is not None:
+        # A measured table already embeds the real operating point, so no
+        # analytic inflow correction is applied on top of it.
         motor_power_W = interpolate_motor_power(config, thrust_per_motor_N)
     elif config.motor.kv is not None:
-        motor_power_W = motor_power_from_params(config, thrust_per_motor_N)
+        motor_power_W = motor_power_from_params(
+            config, thrust_per_motor_N,
+            airspeed_mps=airspeed_for_inflow,
+            disk_incidence_rad=incidence_rad)
     else:
         A = disk_area(config.propeller.diameter_in)
-        vi = math.sqrt(thrust_per_motor_N / (2.0 * config.air_density * A))
-        motor_power_W = (thrust_per_motor_N * vi) / 0.85
+        v_hover = math.sqrt(max(thrust_per_motor_N, 0.0) /
+                            max(2.0 * config.air_density * A, 1e-9))
+        vi = induced_velocity_forward_flight(v_hover, airspeed_for_inflow, incidence_rad)
+        v_through = airspeed_for_inflow * math.sin(incidence_rad)
+        motor_power_W = (thrust_per_motor_N * (v_through + vi)) / 0.85
 
     # Apply motor-configuration penalty (e.g., coaxial interference)
     motor_power_W *= motor_configuration_power_multiplier(config, orientation)
@@ -1779,8 +1716,16 @@ def _compute_operating_metrics_core(drone: DroneConfig,
     tip_mach = tip_speed / 340.0 if tip_speed == tip_speed else float("nan")
 
     p_copper = (motor_I_esc_A ** 2) * float(getattr(drone.motor, "resistance", 0.0))
-    motor_i_max = max(float(getattr(drone.motor, "max_current", 0.0)), 1e-9)
-    thermal_rise_C = 55.0 * (motor_I_esc_A / motor_i_max) ** 2 if motor_I_esc_A >= 0 else 0.0
+    # The motor thermal estimate is anchored to the motor's rated current:
+    # at the rating we assume a 55 C rise, scaling with I^2.  If no rating was
+    # supplied there is nothing to scale against, so report ambient rather
+    # than crashing or inventing a limit.
+    _i_max_raw = getattr(drone.motor, "max_current", None)
+    if _i_max_raw is None:
+        thermal_rise_C = 0.0
+    else:
+        motor_i_max = max(float(_i_max_raw), 1e-9)
+        thermal_rise_C = 55.0 * (motor_I_esc_A / motor_i_max) ** 2 if motor_I_esc_A >= 0 else 0.0
     motor_temp_est_C = float(ambient_temp_C) + thermal_rise_C
     esc_temp_est_C = float(ambient_temp_C) + float(esc_loss_W) * 0.75
     battery_loss_W = (float(pack_current_A) ** 2) * max(
@@ -2543,6 +2488,132 @@ def plot_performance(config: DroneConfig, max_speed: float = 30.0):
     plt.show()
 
 
+def make_airframe_diagram_figure(config: DroneConfig, figsize: tuple = (9, 8)):
+    """
+    Plan-view stick diagram of the airframe, with dimensions labelled.
+
+    Layout rules:
+      * The body is an equilateral polygon with one vertex per motor.
+      * Each arm runs radially outward from a vertex.
+      * A propeller disc is drawn at every rotor position, to scale.
+
+    A coaxial X8 has two motors per arm, so it is drawn with N/2 arm positions
+    and a second dashed disc at each — otherwise eight separate arms would be
+    shown for a four-arm aircraft.
+
+    The point of the drawing is to make propeller overlap obvious. Discs that
+    intersect are drawn in red and the tip gap is reported as a negative
+    number.
+    """
+    import matplotlib.pyplot as _plt
+    from matplotlib.patches import Circle as _Circle, Polygon as _Polygon
+
+    n_motors = max(int(config.num_motors), 1)
+    coaxial = str(getattr(config, "motor_configuration", "flat")).lower() == "coaxial"
+    n_arms = max(n_motors // 2, 1) if coaxial else n_motors
+
+    prop_d = float(config.propeller.diameter_in) * 0.0254
+
+    # Body size: use the entered plan dimensions when available, else fall
+    # back to something proportionate so the sketch is still readable.
+    body_l = float(getattr(config, "body_length_m", 0.0) or 0.0)
+    body_w = float(getattr(config, "body_width_m", 0.0) or 0.0)
+    if body_l > 0 or body_w > 0:
+        body_r = max(body_l, body_w) / 2.0
+        body_known = True
+    else:
+        body_r = prop_d * 0.45
+        body_known = False
+
+    arm_len = float(getattr(config, "arm_length_m", 0.0) or 0.0)
+    if arm_len <= 0:
+        arm_len = prop_d * 0.75          # enough to clear the body if unstated
+        arm_known = False
+    else:
+        arm_known = True
+
+    arm_w = float(getattr(config, "arm_width_m", 0.0) or 0.0) or prop_d * 0.03
+
+    layout = core.rotor_ring_layout(
+        num_positions=n_arms, body_circumradius_m=body_r,
+        arm_length_m=arm_len, prop_diameter_m=prop_d,
+        rotation_rad=math.pi / n_arms if n_arms % 2 == 0 else math.pi / 2.0)
+
+    fig, ax = _plt.subplots(figsize=figsize)
+    overlap = layout["overlaps"]
+    disc_colour = "#C62828" if overlap else "#2E7D32"
+
+    # Body polygon
+    ax.add_patch(_Polygon(layout["vertices"], closed=True, fill=True,
+                          facecolor="#CFD8DC", edgecolor="#37474F",
+                          linewidth=1.8, zorder=2))
+
+    # Arms and rotors
+    for (vx, vy), (mx, my) in zip(layout["vertices"], layout["rotors"]):
+        ax.plot([vx, mx], [vy, my], color="#37474F",
+                linewidth=max(arm_w * 400.0, 2.0), solid_capstyle="round", zorder=1)
+        ax.add_patch(_Circle((mx, my), layout["prop_radius_m"], fill=False,
+                             edgecolor=disc_colour, linewidth=1.6, zorder=3))
+        if coaxial:
+            ax.add_patch(_Circle((mx, my), layout["prop_radius_m"] * 0.97,
+                                 fill=False, edgecolor=disc_colour,
+                                 linewidth=1.0, linestyle="--", zorder=3))
+        ax.plot([mx], [my], marker="o", markersize=5,
+                color="#37474F", zorder=4)
+
+    # Dimension annotations
+    r_rot = layout["rotor_radius_m"]
+    ax.annotate("", xy=layout["rotors"][0], xytext=(0, 0),
+                arrowprops=dict(arrowstyle="<->", color="#1565C0", lw=1.2))
+    ax.text(layout["rotors"][0][0] * 0.5, layout["rotors"][0][1] * 0.5,
+            f"  centre to rotor\n  {r_rot * 1000:.0f} mm",
+            color="#1565C0", fontsize=8, va="bottom")
+
+    if n_arms >= 2:
+        a, b = layout["rotors"][0], layout["rotors"][1]
+        ax.annotate("", xy=a, xytext=b,
+                    arrowprops=dict(arrowstyle="<->", color="#6A1B9A", lw=1.2))
+        ax.text((a[0] + b[0]) / 2, (a[1] + b[1]) / 2,
+                f"  {layout['motor_spacing_m'] * 1000:.0f} mm\n  motor pitch",
+                color="#6A1B9A", fontsize=8, ha="center")
+
+    ax.set_aspect("equal", adjustable="box")
+    limit = (r_rot + layout["prop_radius_m"]) * 1.25
+    ax.set_xlim(-limit, limit)
+    ax.set_ylim(-limit, limit)
+    ax.grid(True, linestyle=":", alpha=0.4)
+    ax.set_xlabel("metres")
+    ax.set_ylabel("metres")
+
+    gap_mm = layout["adjacent_gap_m"] * 1000.0
+    verdict = (f"OVERLAP {abs(gap_mm):.0f} mm" if overlap
+               else f"tip gap {gap_mm:.0f} mm")
+    title = (f"{n_motors} motors"
+             + (f" on {n_arms} coaxial arms" if coaxial else "")
+             + f"  |  {config.propeller.diameter_in:g} in props  |  {verdict}")
+    ax.set_title(title, fontsize=11,
+                 color="#C62828" if overlap else "#000000")
+
+    notes = [
+        f"Prop diameter      {prop_d * 1000:.0f} mm",
+        f"Body across flats  {body_r * 2000:.0f} mm" + ("" if body_known else "  (assumed)"),
+        f"Arm length         {arm_len * 1000:.0f} mm" + ("" if arm_known else "  (assumed)"),
+        f"Motor pitch        {layout['motor_spacing_m'] * 1000:.0f} mm",
+        f"Tip-to-tip gap     {gap_mm:+.0f} mm",
+        f"Overall span       {layout['span_m'] * 1000:.0f} mm",
+    ]
+    if not (body_known and arm_known):
+        notes.append("")
+        notes.append("Enter Body and Arm dimensions on the")
+        notes.append("Airframe tab for a to-scale drawing.")
+    ax.text(0.02, 0.02, "\n".join(notes), transform=ax.transAxes,
+            fontsize=8, family="monospace", va="bottom",
+            bbox=dict(boxstyle="round", facecolor="#FFFDE7", edgecolor="#BDBDBD"))
+
+    fig.tight_layout()
+    return fig
+
+
 def make_motor_operating_point_figure(config: DroneConfig, metrics: dict, figsize: tuple = (12, 8)):
     """
     Create a figure showing motor/propeller operating curves with the current operating point marked.
@@ -2637,7 +2708,21 @@ def make_motor_operating_point_figure(config: DroneConfig, metrics: dict, figsiz
     lines2, labels2 = (ax2_2.get_legend_handles_labels() if ax2_2 else ([], []))
     ax2.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=9)
     
-    fig.suptitle(f"Motor/Propeller Operating Curves (Thrust/Motor: {thrust_g_op:.0f}g)", 
+    # Say plainly when the operating point sits outside the measured data.
+    # Anything outside the table is an extrapolation, and a reader deserves to
+    # know that before trusting the marker's position.
+    _t_lo = float(df["Thrust_g"].min()) if "Thrust_g" in df else None
+    _t_hi = float(df["Thrust_g"].max()) if "Thrust_g" in df else None
+    _outside = (_t_lo is not None
+                and (thrust_g_op < _t_lo or thrust_g_op > _t_hi))
+    _range_note = ""
+    if _outside:
+        _where = "below" if thrust_g_op < _t_lo else "above"
+        _range_note = (f"   —  EXTRAPOLATED, {_where} the measured "
+                       f"{_t_lo:.0f}-{_t_hi:.0f} g range")
+    fig.suptitle(f"Motor/Propeller Operating Curves (Thrust/Motor: {thrust_g_op:.0f}g)"
+                 + _range_note,
+                 color=("#C62828" if _outside else "black"), 
                  fontsize=12, fontweight="bold")
     fig.tight_layout(rect=[0, 0, 1, 0.96])
     return fig
@@ -2686,15 +2771,17 @@ def build_drone_from_args(args) -> DroneConfig:
         r_scale_bp=r_scale_bp,
     )
 
+    # Reference-only motor fields fall back to safe defaults when omitted, so
+    # a CLI/batch run does not need every datasheet number just to get an answer.
     motor = MotorConfig(
         kv=args.motor_kv,
-        idle_current=args.motor_idle_current,
-        idle_voltage=args.motor_idle_voltage,
-        rated_voltage=args.motor_rated_voltage,
+        idle_current=args.motor_idle_current if args.motor_idle_current is not None else 0.0,
+        idle_voltage=args.motor_idle_voltage if args.motor_idle_voltage is not None else 10.0,
+        rated_voltage=args.motor_rated_voltage if args.motor_rated_voltage is not None else 0,
         resistance=args.motor_resistance,
-        max_current=args.motor_max_current,
-        max_power=args.motor_max_power,
-        pole_count=args.motor_pole_count,
+        max_current=args.motor_max_current,      # None = no limit checked
+        max_power=args.motor_max_power,          # None = no limit checked
+        pole_count=args.motor_pole_count if args.motor_pole_count is not None else 14,
         weight_g=args.motor_weight,
         size_mm=args.motor_size,
     )
@@ -2704,7 +2791,7 @@ def build_drone_from_args(args) -> DroneConfig:
         pitch_in=args.prop_pitch,
         max_rpm=getattr(args, "prop_max_rpm", 0) or 0,
         max_thrust_g=getattr(args, "prop_max_thrust", 0) or 0,
-        blades=args.prop_blades,
+        blades=args.prop_blades if args.prop_blades is not None else 2,
         table_csv=args.prop_table,
         PConst=args.prop_pconst,
         TConst=args.prop_tconst,
@@ -3006,6 +3093,282 @@ def _generate_pdf_report(path: str, report_title: str,
             story.append(Paragraph(safe or " ", mono))
     doc.build(story)
 
+
+# ============================================================
+# INLINE HELP  —  tooltips and Simple/Advanced field visibility
+# ============================================================
+
+# ------------------------------------------------------------------
+# FIELD HELP TEXT
+# ------------------------------------------------------------------
+# One entry per input.  Each value is:
+#     (short_label_help, typical_range_or_where_to_find_it)
+# Shown on hover over the "?" marker beside each field.
+#
+# Keep these in plain language — the audience is someone building their
+# first drone, not someone who already knows what an Oswald factor is.
+# ------------------------------------------------------------------
+MC_FIELD_HELP = {
+    # ---- Drone ----
+    "num_motors": ("How many motors the aircraft has.",
+                   "4 = quad, 6 = hex, 8 = octo. Coaxial X8 counts all 8."),
+    "weight": ("All-up weight WITHOUT payload: frame, motors, ESCs, props, "
+               "battery, flight controller, wiring — everything you always fly with.",
+               "Weigh the assembled aircraft on a kitchen scale. 5in quad ~700 g, "
+               "7in ~1200 g, 450-class ~1500 g."),
+    "payload_mass_g": ("Extra mass carried on this particular flight — camera, "
+                       "gimbal, sensor, cargo. Kept separate so you can sweep it.",
+                       "0 if you are flying clean."),
+    "area": ("Frontal cross-section area of the airframe, used only if you have "
+             "no better drag data.",
+             "Roughly body width x height. A 5in quad is about 0.01 m2."),
+    "speed": ("The forward airspeed the single-point run is evaluated at.",
+              "0 = hover. Typical cruise 8-15 m/s."),
+    "periph_current": ("Steady current drawn from the main pack by anything that "
+                       "is not a motor and not on a BEC rail.",
+                       "Usually 0 if you have listed your rails on the Avionics tab."),
+    "motor_configuration": ("flat = all motors on one plane (quad, hex, flat octo). "
+                            "coaxial = stacked motor pairs (X8).",
+                            "Coaxial pairs lose 10-20% efficiency from the lower "
+                            "prop working in the upper prop's wash."),
+    "max_tilt_deg": ("Maximum pitch angle the controller will command in forward "
+                     "flight. Limits top speed and wind resistance.",
+                     "Typical 25-45 deg. Cinematic rigs are often limited to 25-30."),
+    "drag_model_mode": ("auto = estimate drag from the body dimensions below. "
+                        "manual = use the Cd and area numbers you type in.",
+                        "Use manual with numbers from the drag coefficient "
+                        "calculator for a real measurement."),
+    "profile_drag": ("Drag coefficient for SIDE-ON airflow (moving sideways "
+                     "while hovering level).",
+                     "Blunt multirotor bodies are about 1.0-1.3."),
+    "profile_area": ("SIDE silhouette area, seen from the side of the aircraft.",
+                     "From the drag calculator's Side View, or length x height."),
+    "parasite_drag": ("Drag coefficient for FORWARD flight, nose-on.",
+                      "Blunt multirotor bodies are about 1.0-1.3."),
+    "parasite_area": ("FRONT silhouette area, seen from directly ahead.",
+                      "From the drag calculator's Front View, or width x height."),
+    "body_length_m": ("Length of the central body, front to back. Used by the "
+                      "auto drag estimate.", "Excludes arms. 5in quad ~0.12 m."),
+    "body_width_m": ("Width of the central body, side to side.",
+                     "Excludes arms. 5in quad ~0.08 m."),
+    "body_height_m": ("Height of the central body including the battery stack.",
+                      "5in quad ~0.05 m."),
+    "arm_length_m": ("Length of ONE arm, from body edge to motor centre.",
+                     "Roughly half the motor-to-motor diagonal."),
+    "arm_width_m": ("Width or diameter of one arm tube.",
+                    "Typical 0.01-0.03 m."),
+    "coaxial_spacing_m": ("Vertical gap between the upper and lower prop discs "
+                          "in a coaxial pair.",
+                          "Closer spacing = worse efficiency. Typical 0.05-0.12 m."),
+
+    # ---- Battery ----
+    "batt_unit_mode": ("cell = you specify one CELL and how many are wired "
+                       "together. pack = you specify a whole PACK and how many "
+                       "packs you wire together.",
+                       "Use pack if you bought ready-made LiPos."),
+    "batt_vmin": ("Lowest safe voltage PER CELL — the discharge cutoff.",
+                  "LiPo 3.0-3.5, Li-ion 2.8-3.0, LiFePO4 2.5."),
+    "batt_vnom": ("Nominal (average) voltage PER CELL. Used for energy in Wh.",
+                  "LiPo 3.7, Li-ion 3.6, LiFePO4 3.2."),
+    "batt_vmax": ("Fully charged voltage PER CELL.",
+                  "LiPo 4.2, Li-ion 4.2, LiFePO4 3.65."),
+    "batt_cell_capacity": ("Capacity of ONE cell in mAh. Used in cell mode.",
+                           "Common 18650 = 3000-3500 mAh."),
+    "batt_pack_capacity": ("Capacity of ONE pack in mAh, as printed on its label. "
+                           "Used in pack mode.",
+                           "Wiring packs in SERIES does not change this number."),
+    "batt_series": ("How many cells (or packs) are wired in SERIES. This sets "
+                    "voltage.", "6S LiPo = 6 x 4.2 = 25.2 V fully charged."),
+    "batt_parallel": ("How many cells (or packs) are wired in PARALLEL. This sets "
+                      "capacity.",
+                      "2 packs in parallel = double the mAh, same voltage."),
+    "batt_cells_series": ("Cells in series INSIDE one pack. Pack mode only.",
+                          "A 6S LiPo has 6."),
+    "batt_cells_parallel": ("Cells in parallel INSIDE one pack. Pack mode only.",
+                            "Most hobby LiPos have 1."),
+    "batt_cell_weight": ("Weight of ONE cell in grams. Cell mode only.",
+                         "18650 ~45-50 g."),
+    "batt_pack_weight": ("Weight of ONE pack in grams. Pack mode only.",
+                         "From the label or a scale. 6S 5000 mAh ~750 g."),
+    "batt_energy_density": ("Optional override for Wh/kg. Leave blank to let the "
+                            "sim compute it from capacity and weight.",
+                            "LiPo 130-200, Li-ion 200-260 Wh/kg. Above 300 means "
+                            "one of your inputs is wrong."),
+    "batt_dischg_pct": ("How much of the pack you actually use before landing.",
+                        "80% is normal. Going to 100% shortens pack life badly."),
+    "batt_r": ("Internal resistance of ONE cell, in milliohms. Drives voltage "
+               "sag and heating.",
+               "Fresh LiPo 2-5 mOhm/cell, aged 8-15. Higher = more sag."),
+    "batt_a_cont": ("Continuous current the pack can safely deliver, in amps.",
+                    "Leave blank and use C-rate instead if that is what the label gives."),
+    "batt_a_max": ("Short burst current limit, in amps.", "Usually 2x the continuous."),
+    "batt_c_cont": ("Continuous discharge C-rate from the label.",
+                    "Amps = C-rate x capacity in Ah. A 5 Ah 30C pack = 150 A."),
+    "batt_c_max": ("Burst C-rate from the label.", "Often marketing-inflated."),
+    "batt_chg": ("Maximum charge current in amps. Not used in flight physics.",
+                 "Typically 1C."),
+    "batt_chem": ("Chemistry label, for your own reference.", "LiPo, Li-ion, LiFePO4."),
+    "batt_soc_model": ("How pack voltage falls as it empties. auto uses a built-in "
+                       "curve, linear uses a straight line.",
+                       "Leave on auto unless you have measured your own curve."),
+    "batt_soc_curve_csv": ("Optional CSV of your own measured discharge curve.",
+                           "Columns: soc, ocv_cell, r_scale."),
+    "batt_soc_bp": ("State-of-charge breakpoints, 0 to 1, for a custom curve.",
+                    "Advanced. Leave blank for the built-in curve."),
+    "batt_ocv_cell_bp": ("Open-circuit cell voltage at each breakpoint above.",
+                         "Advanced. Leave blank."),
+    "batt_r_scale_bp": ("Resistance multiplier at each breakpoint. Cells get more "
+                        "resistive when nearly empty.",
+                        "Advanced. Leave blank."),
+
+    # ---- Motor ----
+    "motor_kv": ("Motor RPM per volt with no load. The single most important "
+                 "motor number.",
+                 "Printed on the motor. 5in racing 1800-2800, 7in 1200-1600, "
+                 "heavy-lift 200-500."),
+    "motor_r": ("Winding resistance in OHMS (not milliohms). Drives copper loss "
+                "and heat.",
+                "Small motors 0.05-0.2, large 0.01-0.05. If a datasheet gives "
+                "mOhm, divide by 1000."),
+    "motor_i0": ("No-load current: what the motor draws spinning free with no "
+                 "prop.", "Typical 0.3-1.5 A."),
+    "motor_v0": ("Voltage at which the no-load current was measured.",
+                 "From the datasheet, usually 10 V."),
+    "motor_rated_v": ("Voltage the manufacturer rates the motor for.",
+                      "Reference only."),
+    "motor_imax": ("Maximum continuous current per motor, in amps.",
+                   "From the datasheet. Used for the status check."),
+    "motor_pmax": ("Maximum continuous electrical power per motor, in watts.",
+                   "From the datasheet."),
+    "motor_pole_count": ("Number of magnet poles. Only affects the ERPM figure.",
+                         "Almost all hobby outrunners are 14."),
+    "motor_weight": ("Weight of ONE motor in grams.", "2207 ~32 g, 5010 ~180 g."),
+    "motor_size": ("Stator size label, for your reference.",
+                   "e.g. 2207 = 22 mm wide, 7 mm tall."),
+
+    # ---- ESC ----
+    "esc_voltage_rating": ("ESC voltage rating as a CELL COUNT (the S number), "
+                           "not volts.",
+                           "A 6S ESC has a rating of 6. Must be >= your pack's "
+                           "series count."),
+    "esc_cont_current": ("Continuous current per ESC in amps.",
+                         "From the label. A '35A ESC' means 35."),
+    "esc_max_current": ("Burst current per ESC in amps.", "Usually 1.3-2x continuous."),
+    "esc_idle_current": ("Current the ESC itself draws doing nothing.",
+                         "Typically 0.02-0.1 A."),
+    "esc_r": ("ESC internal resistance in ohms.",
+              "Typical 0.001-0.005. Leave default if unknown."),
+    "esc_weight": ("Weight of ONE ESC in grams.", "4-in-1 boards: divide by 4."),
+
+    # ---- Avionics ----
+    "avionics_voltage_tree": ("All the non-motor electronics, grouped by the "
+                              "voltage rail that feeds them.",
+                              "One row per rail. See the Avionics tab."),
+
+    # ---- Propeller ----
+    "prop_d": ("Propeller diameter in inches.",
+               "First number on the prop: a 5045 prop is 5.0 in."),
+    "prop_pitch": ("Propeller pitch in inches — how far it would screw forward "
+                   "in one turn.",
+                   "Second number: a 5045 prop is 4.5 in pitch."),
+    "prop_blades": ("Number of blades.",
+                    "2 = efficient, 3 = more thrust and grip, 5+ = loud and draggy."),
+    "prop_max_rpm": ("Manufacturer RPM limit. Used for a status check.",
+                     "Leave 0 if unknown."),
+    "prop_max_thrust": ("Maximum thrust ONE motor+prop can make, in grams.",
+                        "From a thrust test table. Used for the status check."),
+    "prop_table": ("Optional CSV of measured thrust vs power. Overrides the "
+                   "theoretical model and is far more accurate.",
+                   "Columns: Thrust_g, Power_W, RPM. From the motor datasheet."),
+    "prop_tconst": ("Thrust coefficient C_T, if you know it.",
+                    "Advanced. Leave blank to use momentum theory."),
+    "prop_pconst": ("Power coefficient C_P, if you know it.",
+                    "Advanced. Leave blank."),
+    "prop_weight": ("Weight of ONE propeller in grams.", "5in tri-blade ~4 g."),
+
+    # ---- Mission / environment ----
+    "mission": ("Optional mission JSON describing a multi-phase flight.",
+                "Use Browse to load one of the bundled examples."),
+    "orientation": ("forward = flying nose-first. hover = station-keeping or "
+                    "translating sideways.",
+                    "Use hover with speed 0 for pure hover endurance."),
+    "alt": ("Altitude above sea level, in metres. Thinner air means less thrust.",
+            "Your field elevation, not height above the ground."),
+    "temp": ("Air temperature in Celsius. Optional — blank uses the standard "
+             "atmosphere.", "Hot air is thinner, so hot days cost you thrust."),
+    "press": ("Air pressure in pascals. Optional — blank derives it from altitude.",
+              "Sea level standard is 101325 Pa."),
+    "wind": ("Wind speed in m/s.", "1 m/s = 2.24 mph = 1.94 knots."),
+    "wind_dir": ("Direction the wind is coming FROM, in degrees.",
+                 "Meteorological convention: 0 = from the north, 90 = from the east."),
+    "course_deg": ("The direction you are flying TOWARD, in degrees.",
+                   "If this matches wind direction you have a pure headwind."),
+    "climb_rate": ("Commanded climb rate in m/s. Costs extra power.", "0 for level flight."),
+    "descent_rate": ("Commanded descent rate in m/s.", "0 for level flight."),
+    "reserve_percent": ("Fraction of usable energy held back as a landing reserve.",
+                        "20% is a common minimum. Never plan to land at 0."),
+    "rth_reserve_Wh": ("Energy reserved for return-to-home, in watt-hours.",
+                       "Estimate: cruise power x return time."),
+    "diversion_reserve_Wh": ("Extra energy held for diverting to another landing "
+                             "site.", "0 unless operating under a flight plan."),
+    "transient_dt_s": ("Time step for acceleration modelling in missions.",
+                       "Advanced. 0.5 s is fine."),
+    "max_accel_mps2": ("Maximum acceleration used when changing speed between "
+                       "mission phases.", "Advanced. Typical 2 m/s2."),
+    "max_decel_mps2": ("Maximum deceleration between mission phases.",
+                       "Advanced. Typical 2.5 m/s2."),
+    "decel_regen_eff": ("Energy recovered while slowing down, 0 to 1.",
+                        "Advanced. Leave 0 — props are poor regenerators."),
+    "inflow_map_enabled": ("1 = correct rotor efficiency for forward speed. 0 = off.",
+                           "Advanced. Leave at 1 if you have breakpoints set."),
+    "inflow_mu_bp": ("Advance-ratio breakpoints for the inflow efficiency map.",
+                     "Advanced. Leave blank."),
+    "inflow_eff_bp": ("Efficiency at each advance ratio above.", "Advanced. Leave blank."),
+    "max_speed_plot": ("Highest speed shown on the performance charts.",
+                       "Set a bit above your expected top speed."),
+}
+
+# ------------------------------------------------------------------
+# SIMPLE MODE FIELD SET
+# ------------------------------------------------------------------
+# Fields visible in Simple mode.  Everything not listed here is hidden
+# until the user switches to Advanced.
+#
+# The rule used to pick these: a beginner sizing a first powertrain needs
+# weight, pack, motor Kv/resistance, prop size, and the environment.  They
+# do NOT need SoC breakpoint curves, inflow maps, or transient tuning.
+#
+# The whole Avionics tab is deliberately included: knowing what the
+# flight controller, VTX, camera and payload draw is essential to an
+# honest endurance number, and it is a common beginner mistake to omit it.
+# ------------------------------------------------------------------
+MC_SIMPLE_FIELDS = {
+    # Drone
+    "num_motors", "weight", "payload_mass_g", "speed", "motor_configuration",
+    "max_tilt_deg", "drag_model_mode", "coaxial_spacing_m",
+    "body_length_m", "body_width_m", "body_height_m", "arm_length_m", "arm_width_m",
+    "parasite_drag", "parasite_area", "profile_drag", "profile_area",
+    # Battery
+    "batt_unit_mode", "batt_vmin", "batt_vnom", "batt_vmax",
+    "batt_cell_capacity", "batt_pack_capacity",
+    "batt_cell_weight", "batt_pack_weight",
+    "batt_series", "batt_parallel", "batt_cells_series", "batt_cells_parallel",
+    "batt_dischg_pct", "batt_r", "batt_c_cont", "batt_a_cont", "batt_chem",
+    # Motor
+    "motor_kv", "motor_r", "motor_i0", "motor_imax", "motor_pmax", "motor_weight",
+    # ESC
+    "esc_voltage_rating", "esc_cont_current", "esc_max_current", "esc_weight",
+    # Avionics (whole tab stays in Simple mode by request)
+    "avionics_voltage_tree",
+    # Propeller
+    "prop_d", "prop_pitch", "prop_blades", "prop_max_thrust", "prop_table",
+    "prop_weight",
+    # Mission / environment
+    "mission", "orientation", "alt", "temp", "wind", "wind_dir", "course_deg",
+    "reserve_percent", "max_speed_plot",
+}
+
+
 def launch_gui():
     """
     Tkinter GUI — styled to match the fixed-wing simulator:
@@ -3026,6 +3389,35 @@ def launch_gui():
     def parse_float(name, s):
         try:
             return float(s)
+        except Exception:
+            raise ValueError(f"Invalid {name}: {s!r}")
+
+    def parse_float_opt(name, s, default=None):
+        """
+        Parse an OPTIONAL numeric field: a blank entry returns `default`
+        (None unless told otherwise) instead of raising.
+
+        Needed because many inputs are either mutually exclusive alternatives
+        — cell vs pack capacity/weight (chosen by unit mode), amp limits vs
+        C-rate limits — or are reference-only values used solely for status
+        checks.  A beginner should be able to leave those blank and still get
+        a working answer rather than a wall of validation errors.
+        """
+        t = str(s).strip()
+        if not t:
+            return default
+        try:
+            return float(t)
+        except Exception:
+            raise ValueError(f"Invalid {name}: {s!r}")
+
+    def parse_int_opt(name, s, default=None):
+        """Integer counterpart of parse_float_opt."""
+        t = str(s).strip()
+        if not t:
+            return default
+        try:
+            return int(float(t))
         except Exception:
             raise ValueError(f"Invalid {name}: {s!r}")
 
@@ -3058,7 +3450,7 @@ def launch_gui():
     #  ROOT WINDOW                                                        #
     # ------------------------------------------------------------------ #
     root = tk.Tk()
-    root.title("Multicopter Power Simulator")
+    root.title(f"Multicopter Power Simulator  v{SIM_VERSION}")
     root.minsize(1100, 700)
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
@@ -3162,6 +3554,21 @@ def launch_gui():
 
     view_menu = tk.Menu(menubar, tearoff=0)
     menubar.add_cascade(label="View", menu=view_menu)
+
+    # Help > About — makes the running version unambiguous.
+    help_menu = tk.Menu(menubar, tearoff=0)
+    menubar.add_cascade(label="Help", menu=help_menu)
+    help_menu.add_command(
+        label="About / Version",
+        command=lambda: messagebox.showinfo(
+            "About",
+            f"Multicopter Power Simulator\n"
+            f"Version {SIM_VERSION}\n"
+            f"{SIM_BUILD_NOTE}\n\n"
+            "If you do not see the 'Input detail: Simple / Advanced' selector\n"
+            "above the input tabs, or the blue ? help markers beside each\n"
+            "field, you are running an older copy of this script."),
+    )
 
     # -- Window Scale --
     _scale_var = tk.IntVar(value=100)
@@ -3363,6 +3770,13 @@ def launch_gui():
     v_inflow_eff_bp     = sv(",".join(f"{x:g}" for x in DEFAULT_INFLOW_EFF_BP))
     v_orientation       = sv("forward")
     v_max_speed_plot    = sv(30)
+    # UI complexity mode — "Simple" hides advanced inputs, "Advanced" shows all.
+    # This is a view setting only; it never changes a computed result.
+    v_ui_mode           = sv("Simple")
+    # Name of the configuration currently loaded, shown in the mode bar.
+    # The Output pane is overwritten by the first run, so the loaded config
+    # needs somewhere permanent to live.
+    v_loaded_cfg = sv("(no config loaded)")
 
     # config_vars collected for save/load  (populated after tab widgets are built)
     config_vars: dict = {}
@@ -3380,10 +3794,32 @@ def launch_gui():
     left = ttk.Frame(main)
     left.grid(row=0, column=0, sticky="nsew")
     left.columnconfigure(0, weight=1)
-    left.rowconfigure(0, weight=1)
+    # Row 0 = Simple/Advanced mode bar (fixed height)
+    # Row 1 = the input notebook (takes all remaining vertical space)
+    left.rowconfigure(1, weight=1)
 
     input_nb = ttk.Notebook(left)
-    input_nb.grid(row=0, column=0, sticky="nsew")
+
+    # ---- Simple / Advanced selector -------------------------------------
+    # Sits directly above the input tabs so it is the first thing a new user
+    # sees.  Simple mode is the default: it shows only the inputs needed to
+    # size a powertrain, which is roughly a third of the full set.
+    mode_bar = ttk.Frame(left)
+    mode_bar.grid(row=0, column=0, sticky="ew", pady=(0, 4))
+    ttk.Label(mode_bar, text="Input detail:").pack(side="left", padx=(2, 6))
+    for _m in ("Simple", "Advanced"):
+        ttk.Radiobutton(mode_bar, text=_m, value=_m,
+                        variable=v_ui_mode).pack(side="left", padx=(0, 8))
+    _mode_hint = ttk.Label(
+        mode_bar,
+        text="Simple hides advanced tuning inputs. Hover any ? for help.",
+        foreground="#666666", font=("TkDefaultFont", 8))
+    _mode_hint.pack(side="left", padx=(6, 0))
+    ttk.Label(mode_bar, text="Config:", foreground="#666666",
+              font=("TkDefaultFont", 8)).pack(side="left", padx=(12, 2))
+    ttk.Label(mode_bar, textvariable=v_loaded_cfg, foreground="#0B6BCB",
+              font=("TkDefaultFont", 8, "bold")).pack(side="left")
+    input_nb.grid(row=1, column=0, sticky="nsew")
 
     # --- Scrollable-tab registry so the single wheel binding can find the
     #     active canvas without iterating or calling bind_all repeatedly.
@@ -3443,7 +3879,9 @@ def launch_gui():
         _tab_canvases.append(cv)   # register so wheel handler can find it
         return inn
 
-    tab_drone    = make_scrollable_tab(input_nb, "Drone")
+    # Tab label is "Airframe" to match the fixed-wing simulator; the internal
+    # variable stays tab_drone so existing references keep working.
+    tab_drone    = make_scrollable_tab(input_nb, "Airframe")
     tab_batt     = make_scrollable_tab(input_nb, "Battery")
     tab_motor    = make_scrollable_tab(input_nb, "Motor")
     tab_esc      = make_scrollable_tab(input_nb, "ESC")
@@ -3470,11 +3908,60 @@ def launch_gui():
     # --------------------------------------------------------------------------
 
 
-    def add_row(parent, r, label, var, **kw):
-        ttk.Label(parent, text=label).grid(row=r, column=0, sticky="w", padx=6, pady=3)
+    # ------------------------------------------------------------------
+    # Registry of every input row, so Simple/Advanced mode can show or hide
+    # rows without rebuilding the GUI.  Each entry records the widgets that
+    # make up one row plus the grid position to restore it to.
+    # ------------------------------------------------------------------
+    _field_rows = []          # list of dicts: key, widgets, parent, row
+    _section_rows = []        # separators / section headings, with their keys
+
+    def _register_row(key, widgets, parent, row):
+        """Record a row so _apply_field_mode() can grid/ungrid it later."""
+        _field_rows.append({"key": key, "widgets": widgets,
+                            "parent": parent, "row": row})
+
+    def add_row(parent, r, label, var, key=None, **kw):
+        """
+        Add one labelled entry row, with an inline "?" help marker.
+
+        `key` ties the row to MC_FIELD_HELP (for the tooltip) and to
+        MC_SIMPLE_FIELDS (for Simple/Advanced visibility).  Rows with no key
+        are always shown and get no tooltip.
+        """
+        lbl = ttk.Label(parent, text=label)
+        lbl.grid(row=r, column=0, sticky="w", padx=6, pady=3)
         e = ttk.Entry(parent, textvariable=var, width=14, **kw)
         e.grid(row=r, column=1, sticky="ew", padx=6, pady=3)
+
+        widgets = [lbl, e]
+        help_entry = MC_FIELD_HELP.get(key) if key else None
+        if help_entry:
+            what, typical = help_entry
+            marker = ttk.Label(parent, text=" ? ", foreground="#0B6BCB",
+                               cursor="question_arrow",
+                               font=("TkDefaultFont", 9, "bold"))
+            marker.grid(row=r, column=2, sticky="w", padx=(0, 6))
+            _Tooltip(marker, f"{what}\n\nTypical: {typical}")
+            _Tooltip(lbl, f"{what}\n\nTypical: {typical}")
+            widgets.append(marker)
+
+        if key:
+            _register_row(key, widgets, parent, r)
         return e
+
+    def add_section(parent, r, text, keys=()):
+        """
+        Add a separator + grey section heading.  If `keys` is given, the whole
+        section is hidden in Simple mode when none of those keys are visible.
+        """
+        sep = ttk.Separator(parent, orient="horizontal")
+        sep.grid(row=r, column=0, columnspan=3, sticky="ew", pady=6)
+        lab = ttk.Label(parent, text=text, foreground="gray")
+        lab.grid(row=r + 1, column=0, columnspan=3, sticky="w", padx=6)
+        _section_rows.append({"keys": set(keys), "widgets": [sep, lab],
+                              "parent": parent, "row": r})
+        return r + 2
 
     # ===== DRONE TAB =====
     ttk.Label(tab_drone, text="Motor Configuration:").grid(
@@ -3482,14 +3969,19 @@ def launch_gui():
     motor_cfg_cb = ttk.Combobox(tab_drone, textvariable=v_motor_configuration,
                                 values=["flat","coaxial"], state="readonly", width=12)
     motor_cfg_cb.grid(row=0, column=1, sticky="w", padx=6, pady=4)
+    _mc_help = MC_FIELD_HELP["motor_configuration"]
+    _mc_mark = ttk.Label(tab_drone, text=" ? ", foreground="#0B6BCB",
+                         cursor="question_arrow", font=("TkDefaultFont", 9, "bold"))
+    _mc_mark.grid(row=0, column=2, sticky="w", padx=(0, 6))
+    _Tooltip(_mc_mark, f"{_mc_help[0]}\n\nTypical: {_mc_help[1]}")
 
     r = 1
-    add_row(tab_drone, r, "Num Motors",              v_num_motors);        r += 1
-    add_row(tab_drone, r, "Base Weight (g)",         v_weight);            r += 1
-    add_row(tab_drone, r, "Payload Mass (g)",        v_payload_mass);      r += 1
-    add_row(tab_drone, r, "Frontal Area (m²)",       v_area);              r += 1
-    add_row(tab_drone, r, "Cruise Speed (m/s)",      v_speed);             r += 1
-    add_row(tab_drone, r, "Peripheral Current (A)",  v_periph_current);    r += 1
+    add_row(tab_drone, r, "Num Motors",              v_num_motors, key="num_motors");        r += 1
+    add_row(tab_drone, r, "Base Weight (g)",         v_weight, key="weight");            r += 1
+    add_row(tab_drone, r, "Payload Mass (g)",        v_payload_mass, key="payload_mass_g");      r += 1
+    add_row(tab_drone, r, "Frontal Area (m²)",       v_area, key="area");              r += 1
+    add_row(tab_drone, r, "Cruise Speed (m/s)",      v_speed, key="speed");             r += 1
+    add_row(tab_drone, r, "Peripheral Current (A)",  v_periph_current, key="periph_current");    r += 1
 
     ttk.Separator(tab_drone, orient="horizontal").grid(
         row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
@@ -3503,23 +3995,28 @@ def launch_gui():
         state="readonly",
         width=12,
     )
-    drag_mode_cb.grid(row=r, column=1, sticky="w", padx=6, pady=3); r += 1
-    add_row(tab_drone, r, "Profile Cd",              v_profile_drag);      r += 1
-    add_row(tab_drone, r, "Profile Area (m²)",       v_profile_area);      r += 1
-    add_row(tab_drone, r, "Parasite Cd",             v_parasite_drag);     r += 1
-    add_row(tab_drone, r, "Parasite Area (m²)",      v_parasite_area);     r += 1
+    drag_mode_cb.grid(row=r, column=1, sticky="w", padx=6, pady=3)
+    _dm_help = MC_FIELD_HELP["drag_model_mode"]
+    _dm_mark = ttk.Label(tab_drone, text=" ? ", foreground="#0B6BCB",
+                         cursor="question_arrow", font=("TkDefaultFont", 9, "bold"))
+    _dm_mark.grid(row=r, column=2, sticky="w", padx=(0, 6))
+    _Tooltip(_dm_mark, f"{_dm_help[0]}\n\nTypical: {_dm_help[1]}"); r += 1
+    add_row(tab_drone, r, "Profile Cd",              v_profile_drag, key="profile_drag");      r += 1
+    add_row(tab_drone, r, "Profile Area (m²)",       v_profile_area, key="profile_area");      r += 1
+    add_row(tab_drone, r, "Parasite Cd",             v_parasite_drag, key="parasite_drag");     r += 1
+    add_row(tab_drone, r, "Parasite Area (m²)",      v_parasite_area, key="parasite_area");     r += 1
 
     ttk.Separator(tab_drone, orient="horizontal").grid(
         row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
     ttk.Label(tab_drone, text="── Body Geometry (optional) ──",
               foreground="gray").grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
-    body_len_e = add_row(tab_drone, r, "Body Length (m)",         v_body_length_m);     r += 1
-    body_w_e = add_row(tab_drone, r, "Body Width (m)",          v_body_width_m);      r += 1
-    body_h_e = add_row(tab_drone, r, "Body Height (m)",         v_body_height_m);     r += 1
-    arm_len_e = add_row(tab_drone, r, "Arm Length (m)",          v_arm_length_m);      r += 1
-    arm_w_e = add_row(tab_drone, r, "Arm Width (m)",           v_arm_width_m);       r += 1
-    add_row(tab_drone, r, "Max Tilt (deg)",          v_max_tilt_deg);      r += 1
-    coax_entry = add_row(tab_drone, r, "Coaxial Spacing (m)", v_coaxial_spacing_m); r += 1
+    body_len_e = add_row(tab_drone, r, "Body Length (m)",         v_body_length_m, key="body_length_m");     r += 1
+    body_w_e = add_row(tab_drone, r, "Body Width (m)",          v_body_width_m, key="body_width_m");      r += 1
+    body_h_e = add_row(tab_drone, r, "Body Height (m)",         v_body_height_m, key="body_height_m");     r += 1
+    arm_len_e = add_row(tab_drone, r, "Arm Length (m)",          v_arm_length_m, key="arm_length_m");      r += 1
+    arm_w_e = add_row(tab_drone, r, "Arm Width (m)",           v_arm_width_m, key="arm_width_m");       r += 1
+    add_row(tab_drone, r, "Max Tilt (deg)",          v_max_tilt_deg, key="max_tilt_deg");      r += 1
+    coax_entry = add_row(tab_drone, r, "Coaxial Spacing (m)", v_coaxial_spacing_m, key="coaxial_spacing_m"); r += 1
     coax_entry.configure(state="disabled")
 
     def _update_coax_state(event=None):
@@ -3543,33 +4040,38 @@ def launch_gui():
     unit_mode_cb = ttk.Combobox(tab_batt, textvariable=v_batt_unit_mode,
                                 values=["cell","pack"], state="readonly", width=10)
     unit_mode_cb.grid(row=0, column=1, sticky="w", padx=6, pady=4)
+    _um_help = MC_FIELD_HELP["batt_unit_mode"]
+    _um_mark = ttk.Label(tab_batt, text=" ? ", foreground="#0B6BCB",
+                         cursor="question_arrow", font=("TkDefaultFont", 9, "bold"))
+    _um_mark.grid(row=0, column=2, sticky="w", padx=(0, 6))
+    _Tooltip(_um_mark, f"{_um_help[0]}\n\nTypical: {_um_help[1]}")
 
     r = 1
-    add_row(tab_batt, r, "Vmin/cell (V)",            v_batt_vmin);         r += 1
-    add_row(tab_batt, r, "Vnom/cell (V)",            v_batt_vnom);         r += 1
-    add_row(tab_batt, r, "Vmax/cell (V)",            v_batt_vmax);         r += 1
-    cell_cap_e = add_row(tab_batt, r, "Cell Capacity (mAh)",   v_batt_cell_capacity); r += 1
-    pack_cap_e = add_row(tab_batt, r, "Pack Capacity (mAh)",   v_batt_pack_capacity); r += 1
-    cell_wt_e  = add_row(tab_batt, r, "Cell Weight (g)",       v_batt_cell_weight);   r += 1
-    pack_wt_e  = add_row(tab_batt, r, "Pack Weight (g)",       v_batt_pack_weight);   r += 1
-    add_row(tab_batt, r, "Energy Density (Wh/kg)",   v_batt_energy_density); r += 1
-    add_row(tab_batt, r, "Max Charge Current (A)",   v_batt_chg);          r += 1
-    add_row(tab_batt, r, "Cont Discharge (A)",       v_batt_a_cont);       r += 1
-    add_row(tab_batt, r, "Max Discharge (A)",        v_batt_a_max);        r += 1
-    add_row(tab_batt, r, "Cont C-rate",              v_batt_c_cont);       r += 1
-    add_row(tab_batt, r, "Max C-rate",               v_batt_c_max);        r += 1
-    add_row(tab_batt, r, "Usable Discharge (%)",     v_batt_dischg_pct);   r += 1
-    add_row(tab_batt, r, "Rcell (mΩ)",               v_batt_r);            r += 1
-    add_row(tab_batt, r, "SoC model",                v_batt_soc_model);    r += 1
-    add_row(tab_batt, r, "SoC curve CSV",            v_batt_soc_curve_csv); r += 1
-    add_row(tab_batt, r, "SoC breakpoints (0..1)",   v_batt_soc_bp);       r += 1
-    add_row(tab_batt, r, "OCV/cell breakpoints (V)", v_batt_ocv_cell_bp);  r += 1
-    add_row(tab_batt, r, "R-scale breakpoints",      v_batt_r_scale_bp);   r += 1
-    add_row(tab_batt, r, "Series Cells/Packs",       v_batt_series);       r += 1
-    add_row(tab_batt, r, "Parallel Cells/Packs",     v_batt_parallel);     r += 1
-    cells_s_e = add_row(tab_batt, r, "Cells in Series/Pack",  v_batt_cells_series);  r += 1
-    cells_p_e = add_row(tab_batt, r, "Cells in Parallel/Pack",v_batt_cells_parallel); r += 1
-    add_row(tab_batt, r, "Chemistry",                v_batt_chem);         r += 1
+    add_row(tab_batt, r, "Vmin/cell (V)",            v_batt_vmin, key="batt_vmin");         r += 1
+    add_row(tab_batt, r, "Vnom/cell (V)",            v_batt_vnom, key="batt_vnom");         r += 1
+    add_row(tab_batt, r, "Vmax/cell (V)",            v_batt_vmax, key="batt_vmax");         r += 1
+    cell_cap_e = add_row(tab_batt, r, "Cell Capacity (mAh)",   v_batt_cell_capacity, key="batt_cell_capacity"); r += 1
+    pack_cap_e = add_row(tab_batt, r, "Pack Capacity (mAh)",   v_batt_pack_capacity, key="batt_pack_capacity"); r += 1
+    cell_wt_e  = add_row(tab_batt, r, "Cell Weight (g)",       v_batt_cell_weight, key="batt_cell_weight");   r += 1
+    pack_wt_e  = add_row(tab_batt, r, "Pack Weight (g)",       v_batt_pack_weight, key="batt_pack_weight");   r += 1
+    add_row(tab_batt, r, "Energy Density (Wh/kg)",   v_batt_energy_density, key="batt_energy_density"); r += 1
+    add_row(tab_batt, r, "Max Charge Current (A)",   v_batt_chg, key="batt_chg");          r += 1
+    add_row(tab_batt, r, "Cont Discharge (A)",       v_batt_a_cont, key="batt_a_cont");       r += 1
+    add_row(tab_batt, r, "Max Discharge (A)",        v_batt_a_max, key="batt_a_max");        r += 1
+    add_row(tab_batt, r, "Cont C-rate",              v_batt_c_cont, key="batt_c_cont");       r += 1
+    add_row(tab_batt, r, "Max C-rate",               v_batt_c_max, key="batt_c_max");        r += 1
+    add_row(tab_batt, r, "Usable Discharge (%)",     v_batt_dischg_pct, key="batt_dischg_pct");   r += 1
+    add_row(tab_batt, r, "Rcell (mΩ)",               v_batt_r, key="batt_r");            r += 1
+    add_row(tab_batt, r, "SoC model",                v_batt_soc_model, key="batt_soc_model");    r += 1
+    add_row(tab_batt, r, "SoC curve CSV",            v_batt_soc_curve_csv, key="batt_soc_curve_csv"); r += 1
+    add_row(tab_batt, r, "SoC breakpoints (0..1)",   v_batt_soc_bp, key="batt_soc_bp");       r += 1
+    add_row(tab_batt, r, "OCV/cell breakpoints (V)", v_batt_ocv_cell_bp, key="batt_ocv_cell_bp");  r += 1
+    add_row(tab_batt, r, "R-scale breakpoints",      v_batt_r_scale_bp, key="batt_r_scale_bp");   r += 1
+    add_row(tab_batt, r, "Series Cells/Packs",       v_batt_series, key="batt_series");       r += 1
+    add_row(tab_batt, r, "Parallel Cells/Packs",     v_batt_parallel, key="batt_parallel");     r += 1
+    cells_s_e = add_row(tab_batt, r, "Cells in Series/Pack",  v_batt_cells_series, key="batt_cells_series");  r += 1
+    cells_p_e = add_row(tab_batt, r, "Cells in Parallel/Pack",v_batt_cells_parallel, key="batt_cells_parallel"); r += 1
+    add_row(tab_batt, r, "Chemistry",                v_batt_chem, key="batt_chem");         r += 1
 
     def on_unit_mode_change(event=None):
         mode = v_batt_unit_mode.get()
@@ -3586,25 +4088,25 @@ def launch_gui():
 
     # ===== MOTOR TAB =====
     r = 0
-    add_row(tab_motor, r, "Kv (RPM/V)",          v_motor_kv);         r += 1
-    add_row(tab_motor, r, "Idle Current I0 (A)",  v_motor_i0);         r += 1
-    add_row(tab_motor, r, "Idle Voltage V0 (V)",  v_motor_v0);         r += 1
-    add_row(tab_motor, r, "Rated Voltage (V)",    v_motor_rated_v);    r += 1
-    add_row(tab_motor, r, "Resistance Rm (Ω)",    v_motor_r);          r += 1
-    add_row(tab_motor, r, "Max Current (A)",      v_motor_imax);       r += 1
-    add_row(tab_motor, r, "Max Power (W)",        v_motor_pmax);       r += 1
-    add_row(tab_motor, r, "Pole Count",           v_motor_pole_count); r += 1
-    add_row(tab_motor, r, "Weight (g)",           v_motor_weight);     r += 1
-    add_row(tab_motor, r, "Size (e.g. 28x28mm)",  v_motor_size);       r += 1
+    add_row(tab_motor, r, "Kv (RPM/V)",          v_motor_kv, key="motor_kv");         r += 1
+    add_row(tab_motor, r, "Idle Current I0 (A)",  v_motor_i0, key="motor_i0");         r += 1
+    add_row(tab_motor, r, "Idle Voltage V0 (V)",  v_motor_v0, key="motor_v0");         r += 1
+    add_row(tab_motor, r, "Rated Voltage (V)",    v_motor_rated_v, key="motor_rated_v");    r += 1
+    add_row(tab_motor, r, "Resistance Rm (Ω)",    v_motor_r, key="motor_r");          r += 1
+    add_row(tab_motor, r, "Max Current (A)",      v_motor_imax, key="motor_imax");       r += 1
+    add_row(tab_motor, r, "Max Power (W)",        v_motor_pmax, key="motor_pmax");       r += 1
+    add_row(tab_motor, r, "Pole Count",           v_motor_pole_count, key="motor_pole_count"); r += 1
+    add_row(tab_motor, r, "Weight (g)",           v_motor_weight, key="motor_weight");     r += 1
+    add_row(tab_motor, r, "Size (e.g. 28x28mm)",  v_motor_size, key="motor_size");       r += 1
 
     # ===== ESC TAB =====
     r = 0
-    add_row(tab_esc, r, "Voltage Rating (V)",     v_esc_voltage_rating); r += 1
-    add_row(tab_esc, r, "Continuous Current (A)",  v_esc_cont_current);   r += 1
-    add_row(tab_esc, r, "Max Current (A)",         v_esc_max_current);    r += 1
-    add_row(tab_esc, r, "Idle Current (A)",        v_esc_idle_current);   r += 1
-    add_row(tab_esc, r, "Resistance (Ω)",          v_esc_r);              r += 1
-    add_row(tab_esc, r, "Weight (g)",              v_esc_weight);         r += 1
+    add_row(tab_esc, r, "Voltage Rating (S cells)",     v_esc_voltage_rating, key="esc_voltage_rating"); r += 1
+    add_row(tab_esc, r, "Continuous Current (A)",  v_esc_cont_current, key="esc_cont_current");   r += 1
+    add_row(tab_esc, r, "Max Current (A)",         v_esc_max_current, key="esc_max_current");    r += 1
+    add_row(tab_esc, r, "Idle Current (A)",        v_esc_idle_current, key="esc_idle_current");   r += 1
+    add_row(tab_esc, r, "Resistance (Ω)",          v_esc_r, key="esc_r");              r += 1
+    add_row(tab_esc, r, "Weight (g)",              v_esc_weight, key="esc_weight");         r += 1
 
     # ===== AVIONICS TAB =====
     tab_avionics.columnconfigure(0, weight=1)
@@ -3788,11 +4290,11 @@ def launch_gui():
 
     # ===== PROPELLER TAB =====
     r = 0
-    add_row(tab_prop, r, "Diameter (in)",         v_prop_d);          r += 1
-    add_row(tab_prop, r, "Pitch (in)",            v_prop_pitch);      r += 1
-    add_row(tab_prop, r, "Blades",                v_prop_blades);     r += 1
-    add_row(tab_prop, r, "Max RPM",               v_prop_max_rpm);    r += 1
-    add_row(tab_prop, r, "Max Thrust (g)",         v_prop_max_thrust); r += 1
+    add_row(tab_prop, r, "Diameter (in)",         v_prop_d, key="prop_d");          r += 1
+    add_row(tab_prop, r, "Pitch (in)",            v_prop_pitch, key="prop_pitch");      r += 1
+    add_row(tab_prop, r, "Blades",                v_prop_blades, key="prop_blades");     r += 1
+    add_row(tab_prop, r, "Max RPM",               v_prop_max_rpm, key="prop_max_rpm");    r += 1
+    add_row(tab_prop, r, "Max Thrust (g)",         v_prop_max_thrust, key="prop_max_thrust"); r += 1
     ttk.Separator(tab_prop, orient="horizontal").grid(
         row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
     ttk.Label(tab_prop, text="Prop/Motor CSV table (optional)").grid(
@@ -3803,9 +4305,9 @@ def launch_gui():
     ttk.Button(frow, text="Browse…",
                command=lambda: choose_file(v_prop_table, [("CSV","*.csv"),("All","*.*")])).grid(
         row=0, column=1, padx=(0,6)); r += 1
-    add_row(tab_prop, r, "TConst (optional)",     v_prop_tconst);     r += 1
-    add_row(tab_prop, r, "PConst (optional)",     v_prop_pconst);     r += 1
-    add_row(tab_prop, r, "Weight (g)",            v_prop_weight);     r += 1
+    add_row(tab_prop, r, "TConst (optional)",     v_prop_tconst, key="prop_tconst");     r += 1
+    add_row(tab_prop, r, "PConst (optional)",     v_prop_pconst, key="prop_pconst");     r += 1
+    add_row(tab_prop, r, "Weight (g)",            v_prop_weight, key="prop_weight");     r += 1
 
     # ===== MISSION / ENV TAB =====
     r = 0
@@ -3823,31 +4325,36 @@ def launch_gui():
     orientation_cb = ttk.Combobox(tab_mission, textvariable=v_orientation,
                                   values=["forward","hover"], state="readonly", width=12)
     ttk.Label(tab_mission, text="Orientation:").grid(row=r, column=0, sticky="w", padx=6, pady=3)
-    orientation_cb.grid(row=r, column=1, sticky="w", padx=6, pady=3); r += 1
+    orientation_cb.grid(row=r, column=1, sticky="w", padx=6, pady=3)
+    _or_help = MC_FIELD_HELP["orientation"]
+    _or_mark = ttk.Label(tab_mission, text=" ? ", foreground="#0B6BCB",
+                         cursor="question_arrow", font=("TkDefaultFont", 9, "bold"))
+    _or_mark.grid(row=r, column=2, sticky="w", padx=(0, 6))
+    _Tooltip(_or_mark, f"{_or_help[0]}\n\nTypical: {_or_help[1]}"); r += 1
 
-    add_row(tab_mission, r, "Altitude (m)",              v_alt);             r += 1
-    add_row(tab_mission, r, "Temperature (°C, optional)",v_temp);            r += 1
-    add_row(tab_mission, r, "Pressure (Pa, optional)",   v_press);           r += 1
-    add_row(tab_mission, r, "Wind speed (m/s)",           v_wind);            r += 1
-    add_row(tab_mission, r, "Wind direction FROM (deg)",  v_wind_dir);        r += 1
-    add_row(tab_mission, r, "Course heading (deg)",       v_course_deg);      r += 1
-    add_row(tab_mission, r, "Climb rate cmd (m/s)",       v_climb_rate);      r += 1
-    add_row(tab_mission, r, "Descent rate cmd (m/s)",     v_descent_rate);    r += 1
-    add_row(tab_mission, r, "Reserve percent (%)",        v_reserve_percent); r += 1
-    add_row(tab_mission, r, "RTH reserve (Wh)",           v_rth_reserve_Wh);  r += 1
-    add_row(tab_mission, r, "Diversion reserve (Wh)",     v_div_reserve_Wh);  r += 1
+    add_row(tab_mission, r, "Altitude (m)",              v_alt, key="alt");             r += 1
+    add_row(tab_mission, r, "Temperature (°C, optional)",v_temp, key="temp");            r += 1
+    add_row(tab_mission, r, "Pressure (Pa, optional)",   v_press, key="press");           r += 1
+    add_row(tab_mission, r, "Wind speed (m/s)",           v_wind, key="wind");            r += 1
+    add_row(tab_mission, r, "Wind direction FROM (deg)",  v_wind_dir, key="wind_dir");        r += 1
+    add_row(tab_mission, r, "Course heading (deg)",       v_course_deg, key="course_deg");      r += 1
+    add_row(tab_mission, r, "Climb rate cmd (m/s)",       v_climb_rate, key="climb_rate");      r += 1
+    add_row(tab_mission, r, "Descent rate cmd (m/s)",     v_descent_rate, key="descent_rate");    r += 1
+    add_row(tab_mission, r, "Reserve percent (%)",        v_reserve_percent, key="reserve_percent"); r += 1
+    add_row(tab_mission, r, "RTH reserve (Wh)",           v_rth_reserve_Wh, key="rth_reserve_Wh");  r += 1
+    add_row(tab_mission, r, "Diversion reserve (Wh)",     v_div_reserve_Wh, key="diversion_reserve_Wh");  r += 1
     ttk.Separator(tab_mission, orient="horizontal").grid(
         row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
     ttk.Label(tab_mission, text="── Transients & Inflow Map ──",
               foreground="gray").grid(row=r, column=0, columnspan=2, sticky="w", padx=6); r += 1
-    add_row(tab_mission, r, "Transient step dt (s)",      v_transient_dt_s);  r += 1
-    add_row(tab_mission, r, "Max accel (m/s²)",           v_max_accel_mps2);  r += 1
-    add_row(tab_mission, r, "Max decel (m/s²)",           v_max_decel_mps2);  r += 1
-    add_row(tab_mission, r, "Decel regen efficiency (0-1)", v_decel_regen_eff); r += 1
-    add_row(tab_mission, r, "Inflow map enabled (1/0)",   v_inflow_map_enabled); r += 1
-    add_row(tab_mission, r, "Inflow mu breakpoints",      v_inflow_mu_bp);    r += 1
-    add_row(tab_mission, r, "Inflow eta breakpoints",     v_inflow_eff_bp);   r += 1
-    add_row(tab_mission, r, "Max Speed for Plot (m/s)",   v_max_speed_plot);  r += 1
+    add_row(tab_mission, r, "Transient step dt (s)",      v_transient_dt_s, key="transient_dt_s");  r += 1
+    add_row(tab_mission, r, "Max accel (m/s²)",           v_max_accel_mps2, key="max_accel_mps2");  r += 1
+    add_row(tab_mission, r, "Max decel (m/s²)",           v_max_decel_mps2, key="max_decel_mps2");  r += 1
+    add_row(tab_mission, r, "Decel regen efficiency (0-1)", v_decel_regen_eff, key="decel_regen_eff"); r += 1
+    add_row(tab_mission, r, "Inflow map enabled (1/0)",   v_inflow_map_enabled, key="inflow_map_enabled"); r += 1
+    add_row(tab_mission, r, "Inflow mu breakpoints",      v_inflow_mu_bp, key="inflow_mu_bp");    r += 1
+    add_row(tab_mission, r, "Inflow eta breakpoints",     v_inflow_eff_bp, key="inflow_eff_bp");   r += 1
+    add_row(tab_mission, r, "Max Speed for Plot (m/s)",   v_max_speed_plot, key="max_speed_plot");  r += 1
 
     # ------------------------------------------------------------------ #
     #  Collect config_vars for save/load                                  #
@@ -3927,6 +4434,315 @@ def launch_gui():
     tab_weight_budget_out.columnconfigure(0, weight=1)
     tab_weight_budget_out.rowconfigure(0, weight=1)
     display_nb.add(tab_weight_budget_out, text="Weight Budget")
+
+    # ---- Airframe Diagram tab ----------------------------------------
+    # A plan-view sketch drawn from the entered dimensions. Its job is to make
+    # propeller overlap and tip clearance obvious at a glance, which numbers
+    # in a table do not.
+    tab_airframe_diagram_out = ttk.Frame(display_nb, padding=0)
+    tab_airframe_diagram_out.columnconfigure(0, weight=1)
+    tab_airframe_diagram_out.rowconfigure(0, weight=1)
+    display_nb.add(tab_airframe_diagram_out, text="Airframe Diagram")
+
+    ad_frame = ttk.LabelFrame(tab_airframe_diagram_out,
+                              text="Plan View (to scale)", padding=4)
+    ad_frame.grid(row=0, column=0, sticky="nsew")
+    ad_frame.columnconfigure(0, weight=1)
+    ad_frame.rowconfigure(0, weight=1)
+    ad_holder = ttk.Frame(ad_frame)
+    ad_holder.grid(row=0, column=0, sticky="nsew")
+    ad_holder.columnconfigure(0, weight=1)
+    ad_holder.rowconfigure(0, weight=1)
+    ad_placeholder = ttk.Label(
+        ad_holder,
+        text="Press Run Single-Point to draw the airframe.",
+        foreground="#888888")
+    ad_placeholder.grid(row=0, column=0)
+    _ad_canvas = {"widget": None}
+
+    # ================================================================
+    # SENSITIVITY  and  CONFIG COMPARISON tabs
+    # ================================================================
+    # Both work off the configuration from the most recent run, so they never
+    # re-read the input fields and cannot disagree with the numbers on screen.
+
+    tab_sensitivity_out = ttk.Frame(display_nb, padding=0)
+    tab_sensitivity_out.columnconfigure(0, weight=1)
+    tab_sensitivity_out.rowconfigure(1, weight=1)
+    display_nb.add(tab_sensitivity_out, text="Sensitivity")
+
+    sens_bar = ttk.Frame(tab_sensitivity_out, padding=(6, 6, 6, 0))
+    sens_bar.grid(row=0, column=0, sticky="ew")
+    ttk.Label(sens_bar, text="Output:").pack(side="left")
+    v_sens_metric = tk.StringVar(value="Flight time (min)")
+    ttk.Combobox(sens_bar, textvariable=v_sens_metric, state="readonly", width=22,
+                 values=["Flight time (min)", "Range (km)",
+                         "Total power (W)"]).pack(side="left", padx=(4, 10))
+    ttk.Label(sens_bar, text="Vary each input by ±10% and ±20%",
+              foreground="#666666", font=("TkDefaultFont", 8)).pack(side="left")
+
+    sens_body = ttk.Frame(tab_sensitivity_out, padding=4)
+    sens_body.grid(row=1, column=0, sticky="nsew")
+    sens_body.columnconfigure(0, weight=1)
+    sens_body.rowconfigure(0, weight=1)
+    sens_body.rowconfigure(1, weight=1)
+
+    _sens_cols = ("param", "m20", "m10", "base", "p10", "p20", "span")
+    sens_tv = ttk.Treeview(sens_body, columns=_sens_cols, show="headings", height=8)
+    for col, heading, width in [
+            ("param", "Input", 190), ("m20", "-20%", 85), ("m10", "-10%", 85),
+            ("base", "baseline", 85), ("p10", "+10%", 85), ("p20", "+20%", 85),
+            ("span", "swing", 95)]:
+        sens_tv.heading(col, text=heading)
+        sens_tv.column(col, width=width,
+                       anchor="w" if col == "param" else "center", stretch=True)
+    sens_tv.grid(row=0, column=0, sticky="nsew")
+    sens_tv.tag_configure("strong", font=("TkDefaultFont", 9, "bold"))
+
+    sens_plot = ttk.Frame(sens_body)
+    sens_plot.grid(row=1, column=0, sticky="nsew", pady=(6, 0))
+    sens_plot.columnconfigure(0, weight=1)
+    sens_plot.rowconfigure(0, weight=1)
+    sens_ph = ttk.Label(sens_plot,
+                        text="Run a single point, then press Run Sensitivity.",
+                        foreground="#888888")
+    sens_ph.grid(row=0, column=0)
+    _sens_canvas = {"widget": None}
+
+    def _sens_levers():
+        """
+        Inputs worth testing, with a mutator that scales each on a copy.
+
+        Only quantities a designer can actually trade are listed — swapping a
+        battery or a prop is a real decision; the air density is not.
+        """
+        def _scale_capacity(cfg, f):
+            cfg.battery.capacity_mAh *= f
+            cfg.battery.capacity_Ah *= f          # Wh is derived from this
+
+        return [
+            ("All-up weight",      lambda c, f: setattr(c, "drone_weight_g", c.drone_weight_g * f)),
+            ("Battery capacity",   _scale_capacity),
+            ("Motor Kv",           lambda c, f: setattr(c.motor, "kv", (c.motor.kv or 0) * f)),
+            ("Motor resistance",   lambda c, f: setattr(c.motor, "resistance", c.motor.resistance * f)),
+            ("Prop diameter",      lambda c, f: setattr(c.propeller, "diameter_in", c.propeller.diameter_in * f)),
+            ("Parasite area",      lambda c, f: setattr(c, "parasite_area", (c.parasite_area or 0.0) * f)),
+            ("Cruise speed",       lambda c, f: setattr(c, "cruise_speed", (c.cruise_speed or 0.0) * f)),
+            ("Avionics draw",      lambda c, f: setattr(c, "periph_current", (c.periph_current or 0.0) * f)),
+        ]
+
+    def run_sensitivity():
+        if not _last_run.get("drone"):
+            messagebox.showinfo("Sensitivity", "Run a single point first.")
+            return
+        base_cfg = _last_run["drone"]
+        speed = float(_last_run.get("speed", base_cfg.cruise_speed or 0.0))
+        orient = _last_run.get("orientation", "forward")
+        choice = v_sens_metric.get()
+
+        def evaluate(cfg):
+            cfg = base_cfg if cfg is None else cfg
+            spd = float(getattr(cfg, "cruise_speed", speed) or speed)
+            try:
+                if choice.startswith("Flight time"):
+                    return estimate_flight_time_minutes(cfg, spd, orientation=orient)
+                if choice.startswith("Range"):
+                    minutes = estimate_flight_time_minutes(cfg, spd, orientation=orient)
+                    m = compute_operating_metrics(cfg, spd, orient)
+                    gs = float(m.get("groundspeed_mps", spd))
+                    return minutes * 60.0 * gs / 1000.0
+                return float(compute_operating_metrics(cfg, spd, orient)["total_power_W"])
+            except Exception:
+                return None
+
+        evaluate.base_config = base_cfg
+        rows = core.sensitivity_sweep(_sens_levers(), evaluate)
+
+        for iid in sens_tv.get_children():
+            sens_tv.delete(iid)
+        if not rows:
+            messagebox.showinfo("Sensitivity",
+                                "The baseline configuration produced no usable result.")
+            return
+
+        decimals = 0 if choice.startswith("Total power") else 2
+        for i, row in enumerate(rows):
+            res = row["results"]
+
+            def cell(f):
+                v = res.get(f)
+                return "—" if v is None else f"{v:.{decimals}f}"
+
+            sens_tv.insert("", "end", tags=("strong",) if i == 0 else (), values=(
+                row["name"], cell(0.8), cell(0.9), f"{row['baseline']:.{decimals}f}",
+                cell(1.1), cell(1.2),
+                f"{row['span']:.{decimals}f}  ({row['span_pct']:.0f}%)"))
+
+        # Tornado chart: widest swing at the top.
+        fig = plt.Figure(figsize=(max(_view["plot_w"] * 0.7, 6.0), 4.2))
+        ax = fig.add_subplot(111)
+        names = [r["name"] for r in rows][::-1]
+        lows = [r["low"] - r["baseline"] for r in rows][::-1]
+        highs = [r["high"] - r["baseline"] for r in rows][::-1]
+        ypos = range(len(names))
+        ax.barh(list(ypos), [h - l for l, h in zip(lows, highs)],
+                left=lows, color="#90CAF9", edgecolor="#1565C0")
+        ax.axvline(0.0, color="#37474F", linewidth=1.2)
+        ax.set_yticks(list(ypos))
+        ax.set_yticklabels(names, fontsize=8)
+        ax.set_xlabel(f"change in {choice} vs baseline")
+        ax.set_title("Sensitivity (±20% on each input)", fontsize=10)
+        ax.grid(True, axis="x", linestyle=":", alpha=0.4)
+        fig.tight_layout()
+
+        old = _sens_canvas.get("widget")
+        if old is not None:
+            try:
+                old.get_tk_widget().destroy()
+            except Exception:
+                pass
+        sens_ph.grid_remove()
+        canvas = FigureCanvasTkAgg(fig, master=sens_plot)
+        canvas.draw()
+        canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        _sens_canvas["widget"] = canvas
+
+    ttk.Button(sens_bar, text="⚡  Run Sensitivity",
+               command=run_sensitivity).pack(side="right")
+
+    # ---------------- Config comparison ----------------
+    tab_compare_out = ttk.Frame(display_nb, padding=0)
+    tab_compare_out.columnconfigure(0, weight=1)
+    tab_compare_out.rowconfigure(1, weight=1)
+    display_nb.add(tab_compare_out, text="Compare")
+
+    cmp_bar = ttk.Frame(tab_compare_out, padding=(6, 6, 6, 0))
+    cmp_bar.grid(row=0, column=0, sticky="ew")
+    v_cmp_baseline = tk.StringVar(value="No baseline pinned")
+    ttk.Label(cmp_bar, text="Baseline:").pack(side="left")
+    ttk.Label(cmp_bar, textvariable=v_cmp_baseline, foreground="#0B6BCB",
+              font=("TkDefaultFont", 9, "bold")).pack(side="left", padx=(4, 12))
+
+    _cmp_cols = ("metric", "base", "curr", "delta", "pct")
+    cmp_tv = ttk.Treeview(tab_compare_out, columns=_cmp_cols,
+                          show="headings", height=18)
+    for col, heading, width in [("metric", "Metric", 220), ("base", "Baseline", 110),
+                                ("curr", "Current", 110), ("delta", "Change", 110),
+                                ("pct", "Change %", 100)]:
+        cmp_tv.heading(col, text=heading)
+        cmp_tv.column(col, width=width,
+                      anchor="w" if col == "metric" else "center", stretch=True)
+    cmp_tv.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+    cmp_tv.tag_configure("better", foreground="#1B5E20")
+    cmp_tv.tag_configure("worse", foreground="#B71C1C")
+    cmp_tv.tag_configure("flat", foreground="#616161")
+
+    _cmp_state = {"baseline": None, "label": None}
+
+    # (key, label, decimals, higher_is_better)
+    _CMP_KEYS = [
+        ("flight_time_min",   "Flight time (min)",     2,  1),
+        ("flight_range_km",   "Range (km)",            2,  1),
+        ("total_power_W",     "Total power (W)",       1, -1),
+        ("pack_current_A",    "Pack current (A)",      2, -1),
+        ("v_load_V",          "Loaded voltage (V)",    2,  1),
+        ("thrust_total_N",    "Total thrust (N)",      2,  1),
+        ("hover_efficiency_gW", "Hover efficiency (g/W)", 2, 1),
+        ("figure_of_merit",   "Figure of merit",       3,  1),
+        ("disk_loading_N_m2", "Disk loading (N/m²)",   1, -1),
+        ("motor_temp_est_C",  "Motor temp (°C)",       1, -1),
+        ("reserve_margin_Wh", "Reserve margin (Wh)",   2,  1),
+    ]
+
+    def _current_comparison_metrics():
+        """Flatten the last run into the flat dict the comparison expects."""
+        if not _last_run.get("drone"):
+            return None
+        cfg = _last_run["drone"]
+        speed = float(_last_run.get("speed", cfg.cruise_speed or 0.0))
+        orient = _last_run.get("orientation", "forward")
+        m = dict(_last_run.get("metrics") or {})
+        try:
+            minutes = estimate_flight_time_minutes(cfg, speed, orientation=orient)
+            m["flight_time_min"] = minutes
+            m["flight_range_km"] = minutes * 60.0 * float(
+                m.get("groundspeed_mps", speed)) / 1000.0
+        except Exception:
+            pass
+        return m
+
+    def pin_comparison_baseline():
+        metrics = _current_comparison_metrics()
+        if not metrics:
+            messagebox.showinfo("Compare", "Run a single point first.")
+            return
+        _cmp_state["baseline"] = metrics
+        label = str(v_loaded_cfg.get())
+        _cmp_state["label"] = label
+        v_cmp_baseline.set(f"{label}  (pinned)")
+        refresh_comparison()
+
+    def clear_comparison_baseline():
+        _cmp_state["baseline"] = None
+        _cmp_state["label"] = None
+        v_cmp_baseline.set("No baseline pinned")
+        for iid in cmp_tv.get_children():
+            cmp_tv.delete(iid)
+
+    def refresh_comparison():
+        """Redraw the delta table. Called after every run."""
+        for iid in cmp_tv.get_children():
+            cmp_tv.delete(iid)
+        base = _cmp_state.get("baseline")
+        if not base:
+            return
+        current = _current_comparison_metrics()
+        if not current:
+            return
+        rows = core.compare_metric_sets(
+            base, current, [(k, lbl, d) for k, lbl, d, _ in _CMP_KEYS])
+        better_map = {k: s for k, _, _, s in _CMP_KEYS}
+        for row in rows:
+            if not row["comparable"]:
+                cmp_tv.insert("", "end", tags=("flat",), values=(
+                    row["label"], "—", "—", "—", "—"))
+                continue
+            d = row["decimals"]
+            sign = better_map.get(row["key"], 1) * row["direction"]
+            tag = "better" if sign > 0 else ("worse" if sign < 0 else "flat")
+            cmp_tv.insert("", "end", tags=(tag,), values=(
+                row["label"],
+                f"{row['baseline']:.{d}f}", f"{row['current']:.{d}f}",
+                core.format_delta(row["delta"], d),
+                core.format_delta(row["delta_pct"], 1) + " %"
+                if row["delta_pct"] is not None else "—"))
+
+    ttk.Button(cmp_bar, text="📌  Pin Current as Baseline",
+               command=pin_comparison_baseline).pack(side="right")
+    ttk.Button(cmp_bar, text="✖  Clear Baseline",
+               command=clear_comparison_baseline).pack(side="right", padx=(0, 6))
+
+    def _refresh_airframe_diagram(cfg_obj):
+        """Redraw the plan view for the configuration just simulated."""
+        try:
+            fig = make_airframe_diagram_figure(
+                cfg_obj, figsize=(max(_view["plot_w"] * 0.7, 6.0), 6.5))
+        except Exception as exc:
+            ad_placeholder.configure(
+                text=f"Could not draw the airframe: {exc}")
+            ad_placeholder.grid(row=0, column=0)
+            return
+        old = _ad_canvas.get("widget")
+        if old is not None:
+            try:
+                old.get_tk_widget().destroy()
+            except Exception:
+                pass
+        ad_placeholder.grid_remove()
+        canvas = FigureCanvasTkAgg(fig, master=ad_holder)
+        canvas.draw()
+        canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        _ad_canvas["widget"] = canvas
 
 
     # ---- Plots panel ----
@@ -4121,85 +4937,217 @@ def launch_gui():
 
     def update_status_tables_from_metrics(config: DroneConfig, metrics: dict):
         _clear_status_tables()
-        Ipack = float(metrics.get("pack_current_A", 0.0))
-        Vload = float(metrics.get("v_load_V", 0.0))
-        Ptot  = float(metrics.get("total_power_W", 0.0))
+        batt = config.battery
+        nm   = max(int(config.num_motors), 1)
+        g0   = 9.80665
+
+        Ipack    = float(metrics.get("pack_current_A", 0.0))
+        Vload    = float(metrics.get("v_load_V",        0.0))
+        Ptot     = float(metrics.get("total_power_W",   0.0))
+        Pmotor   = float(metrics.get("motor_power_W",   0.0))
+        Periph   = float(metrics.get("periph_power_W",  0.0))
+        P_esc    = float(metrics.get("esc_loss_W",       0.0))
+        Iesc     = float(metrics.get("motor_I_per_esc_A",0.0))
         tip_mach = metrics.get("tip_mach", None)
 
-        Vmin = float(getattr(config.battery, "vmin_pack", 0.0))
+        # ── Battery Status ────────────────────────────────────────────────
+        Vmin  = float(getattr(batt, "vmin_pack", 0.0))
+        Vmax  = float(getattr(batt, "vmax_pack", 0.0))
+        Vdrop = Vmax - Vload
+        vsag_pct = Vdrop / max(Vmax, 1e-9) * 100
         tag_v = _status_color_tag(Vload, Vmin, "min") if Vmin > 0 else "na"
-        _insert_status_row(batt_table, "Pack voltage (loaded)", f"{Vload:.2f} V", f">= {Vmin:.2f} V", tag_v)
+        _insert_status_row(batt_table, "Pack voltage (loaded)",
+            f"{Vload:.2f} V", f">= {Vmin:.2f} V", tag_v,
+            f"Sag: {Vdrop:.2f} V ({vsag_pct:.1f}%)")
 
-        if getattr(config, 'max_tilt_deg', None) is not None and metrics.get('tilt_required_deg') is not None:
-            tilt_req = float(metrics['tilt_required_deg'])
+        if getattr(config, "max_tilt_deg", None) is not None and metrics.get("tilt_required_deg") is not None:
+            tilt_req = float(metrics["tilt_required_deg"])
             tilt_lim = float(config.max_tilt_deg)
             _insert_status_row(batt_table, "Tilt req vs max",
                 f"{tilt_req:.1f}° / {tilt_lim:.1f}°", f"<= {tilt_lim:.1f}°",
-                _status_color_tag(tilt_req, tilt_lim, 'max'))
+                _status_color_tag(tilt_req, tilt_lim, "max"))
 
-        Icont = float(getattr(config.battery, "discharge_cont_A", float("inf")))
-        Imax  = float(getattr(config.battery, "discharge_max_A",  float("inf")))
+        Icont  = float(getattr(batt, "discharge_cont_A", float("inf")))
+        Imax_b = float(getattr(batt, "discharge_max_A",  float("inf")))
         if math.isfinite(Icont):
-            _insert_status_row(batt_table, "Pack current", f"{Ipack:.2f} A",
-                f"<= {Icont:.2f} A (cont)", _status_color_tag(Ipack, Icont, "max"))
+            _insert_status_row(batt_table, "Pack current vs cont rating",
+                f"{Ipack:.2f} A", f"<= {Icont:.2f} A",
+                _status_color_tag(Ipack, Icont, "max"))
         else:
             _insert_status_row(batt_table, "Pack current", f"{Ipack:.2f} A", "cont: n/a", "na")
-        if math.isfinite(Imax):
-            _insert_status_row(batt_table, "Pack current (max)", f"{Ipack:.2f} A",
-                f"<= {Imax:.2f} A (max)", _status_color_tag(Ipack, Imax, "max"))
-        _insert_status_row(batt_table, "Total electrical power", f"{Ptot:.0f} W", "", "na")
+        if math.isfinite(Imax_b):
+            _insert_status_row(batt_table, "Pack current vs max rating",
+                f"{Ipack:.2f} A", f"<= {Imax_b:.2f} A",
+                _status_color_tag(Ipack, Imax_b, "max"))
 
-        Iesc      = float(metrics.get("motor_I_per_esc_A", 0.0))
-        Pmotor    = float(metrics.get("motor_power_W", 0.0))
-        Pmotor_pm = Pmotor / max(int(config.num_motors), 1)
-        _insert_status_row(motor_table, "Motor power / motor", f"{Pmotor_pm:.0f} W", "", "na")
-        if getattr(config.motor, "max_current", None) is not None:
-            _insert_status_row(motor_table, "Motor current / motor (est)", f"{Iesc:.2f} A",
-                f"<= {float(config.motor.max_current):.2f} A",
-                _status_color_tag(Iesc, float(config.motor.max_current), "max"))
+        cap_Ah = float(getattr(batt, "capacity_Ah", 0.0))
+        if cap_Ah > 0:
+            c_rate = Ipack / cap_Ah
+            c_lim  = Icont / cap_Ah if math.isfinite(Icont) else 999
+            _insert_status_row(batt_table, "Discharge C-rate",
+                f"{c_rate:.2f} C", f"<= {c_lim:.1f} C (cont)",
+                _status_color_tag(c_rate, c_lim, "max"),
+                "Continuous C-rate at this speed")
+
+        _insert_status_row(batt_table, "Total electrical power",
+            f"{Ptot:.0f} W", "—", "na")
+
+        if Ptot > 0:
+            _insert_status_row(batt_table, "Power split (Motor/ESC/Av)",
+                f"{Pmotor/Ptot*100:.0f}% / {P_esc/Ptot*100:.0f}% / {Periph/Ptot*100:.0f}%",
+                "—", "na", "Motor propulsion / ESC losses / Avionics")
+
+        rsv_margin = float(metrics.get("reserve_margin_Wh", float("nan")))
+        if math.isfinite(rsv_margin):
+            rsv_tag = "bad" if metrics.get("reserve_breached", False) else (
+                      "warn" if rsv_margin < 10.0 else "ok")
+            _insert_status_row(batt_table, "Energy reserve margin",
+                f"{rsv_margin:+.1f} Wh", ">= 0 Wh", rsv_tag,
+                "VIOLATION" if metrics.get("reserve_breached", False) else "OK")
+
+        # ── Motor / ESC Status ────────────────────────────────────────────
+        Pmotor_pm = Pmotor / nm
         if getattr(config.motor, "max_power", None) is not None:
-            _insert_status_row(motor_table, "Motor power / motor", f"{Pmotor_pm:.0f} W",
-                f"<= {float(config.motor.max_power):.0f} W",
-                _status_color_tag(Pmotor_pm, float(config.motor.max_power), "max"))
-        if metrics.get("motor_temp_est_C") is not None:
-            t_est = float(metrics["motor_temp_est_C"])
-            _insert_status_row(motor_table, "Motor temp estimate", f"{t_est:.1f} °C",
-                "<= 120 °C", _status_color_tag(t_est, 120.0, "max"),
-                f"Status: {metrics.get('thermal_status', 'n/a')}")
+            pmax_pm = float(config.motor.max_power)
+            _insert_status_row(motor_table, "Motor power / motor",
+                f"{Pmotor_pm:.0f} W", f"<= {pmax_pm:.0f} W",
+                _status_color_tag(Pmotor_pm, pmax_pm, "max"))
+        else:
+            _insert_status_row(motor_table, "Motor power / motor",
+                f"{Pmotor_pm:.0f} W", "—", "na")
+
+        if getattr(config.motor, "max_current", None) is not None:
+            imax_m = float(config.motor.max_current)
+            _insert_status_row(motor_table, "Motor current / motor (est)",
+                f"{Iesc:.2f} A", f"<= {imax_m:.2f} A",
+                _status_color_tag(Iesc, imax_m, "max"))
+
+        weight_N = config.drone_weight_g * g0 / 1000.0
+        hover_T  = float(metrics.get("hover_thrust_total_N", weight_N))
+        twr_hover = hover_T / max(weight_N, 1e-9)
+        _insert_status_row(motor_table, "Hover TWR (total thrust / weight)",
+            f"{twr_hover:.2f}:1", ">= 1.5:1",
+            "ok" if twr_hover >= 2.0 else ("warn" if twr_hover >= 1.5 else "bad"),
+            "< 1.5 is dangerously marginal; > 2.0 is recommended")
+
+        from_physics = float(metrics.get("thrust_total_N", weight_N))
+        twr_fwd = from_physics / max(weight_N, 1e-9)
+        _insert_status_row(motor_table, "Thrust-to-weight (this speed)",
+            f"{twr_fwd:.2f}:1", ">= 1.0:1",
+            "ok" if twr_fwd >= 1.0 else "bad",
+            "Drops in forward flight due to drag")
+
+        max_pay_g = (hover_T / g0 - config.drone_weight_g / 1000.0) * 1000.0
+        _insert_status_row(motor_table, "Max additional payload",
+            f"{max_pay_g:.0f} g", ">= 0 g",
+            "ok" if max_pay_g >= 0 else "bad",
+            "Remaining thrust capacity above current AUW")
+
+        T_motor = float(metrics.get("motor_temp_est_C", float("nan")))
+        T_head  = float(metrics.get("motor_thermal_headroom_C", float("nan")))
+        if math.isfinite(T_motor):
+            _insert_status_row(motor_table, "Motor temperature (est)",
+                f"{T_motor:.1f} °C", "<= 100 °C",
+                "ok" if T_motor < 80 else ("warn" if T_motor < 100 else "bad"),
+                f"Headroom: {T_head:.1f} °C  |  {metrics.get('thermal_status','n/a')}")
+        T_esc  = float(metrics.get("esc_temp_est_C", float("nan")))
+        T_batt = float(metrics.get("battery_temp_est_C", float("nan")))
+        if math.isfinite(T_esc):
+            _insert_status_row(motor_table, "ESC temperature (est)",
+                f"{T_esc:.1f} °C", "<= 90 °C",
+                "ok" if T_esc < 70 else ("warn" if T_esc < 90 else "bad"))
+        if math.isfinite(T_batt):
+            _insert_status_row(motor_table, "Battery temperature (est)",
+                f"{T_batt:.1f} °C", "<= 55 °C",
+                "ok" if T_batt < 40 else ("warn" if T_batt < 55 else "bad"))
+
         esc = getattr(config, "esc", None)
         if esc is not None:
-            _insert_status_row(motor_table, "ESC current (cont)", f"{Iesc:.2f} A",
-                f"<= {float(esc.continuous_rating_A):.2f} A",
+            # ESCConfig.voltage_rating is a CELL COUNT (an "S" rating), not volts.
+            # Compare against the pack's series-cell count, never a voltage.
+            esc_S  = int(esc.voltage_rating)
+            pack_S = int(batt.series_cells)
+            _insert_status_row(motor_table, "ESC voltage rating",
+                f"{esc_S}S  ({esc_S * batt.operating_voltage_max:.1f} V max)",
+                f">= {pack_S}S  ({batt.vmax_pack:.1f} V)",
+                "ok" if esc_S >= pack_S else "bad",
+                "ESC S-rating must meet or exceed the pack series count")
+            _insert_status_row(motor_table, "ESC current vs cont",
+                f"{Iesc:.2f} A", f"<= {float(esc.continuous_rating_A):.2f} A",
                 _status_color_tag(Iesc, float(esc.continuous_rating_A), "max"))
-            _insert_status_row(motor_table, "ESC current (max)", f"{Iesc:.2f} A",
-                f"<= {float(esc.max_current_A):.2f} A",
+            _insert_status_row(motor_table, "ESC current vs max",
+                f"{Iesc:.2f} A", f"<= {float(esc.max_current_A):.2f} A",
                 _status_color_tag(Iesc, float(esc.max_current_A), "max"))
-            _insert_status_row(motor_table, "ESC loss (total)",
-                f"{float(metrics.get('esc_loss_W',0)):.0f} W", "", "na")
+            _insert_status_row(motor_table, "ESC total loss",
+                f"{P_esc:.1f} W", "—", "na")
 
+        # ── Propeller / Hover Status ──────────────────────────────────────
         thrust_pm_N = float(metrics.get("thrust_per_motor_N", 0.0))
-        thrust_pm_g = thrust_pm_N * 1000.0 / 9.81
+        thrust_pm_g = thrust_pm_N * 1000.0 / g0
         max_thr_g   = float(getattr(config.propeller, "max_thrust_g", 0.0))
         if max_thr_g > 0:
-            _insert_status_row(prop_table_tv, "Thrust / motor", f"{thrust_pm_g:.0f} g",
-                f"<= {max_thr_g:.0f} g", _status_color_tag(thrust_pm_g, max_thr_g, "max"))
+            _insert_status_row(prop_table_tv, "Thrust / motor",
+                f"{thrust_pm_g:.0f} g", f"<= {max_thr_g:.0f} g",
+                _status_color_tag(thrust_pm_g, max_thr_g, "max"),
+                f"Margin: {max_thr_g-thrust_pm_g:.0f} g")
         else:
-            _insert_status_row(prop_table_tv, "Thrust / motor", f"{thrust_pm_g:.0f} g", "n/a", "na")
+            _insert_status_row(prop_table_tv, "Thrust / motor",
+                f"{thrust_pm_g:.0f} g", "—", "na")
+
         rpm = metrics.get("prop_rpm", None)
         mr  = getattr(config.propeller, "max_rpm", None)
-        if rpm is not None and float(rpm) > 0 and mr is not None:
-            _insert_status_row(prop_table_tv, "Prop RPM (est)", f"{float(rpm):.0f} rpm",
-                f"<= {float(mr):.0f} rpm", _status_color_tag(float(rpm), float(mr), "max"))
-        else:
-            _insert_status_row(prop_table_tv, "Prop RPM (est)", "n/a",
-                f"<= {float(mr):.0f} rpm" if mr else "n/a", "na")
+        if rpm is not None and float(rpm) > 0:
+            rpm_f = float(rpm)
+            if mr is not None and float(mr) > 0:
+                _insert_status_row(prop_table_tv, "Prop RPM (est)",
+                    f"{rpm_f:.0f} rpm", f"<= {float(mr):.0f} rpm",
+                    _status_color_tag(rpm_f, float(mr), "max"))
+            else:
+                _insert_status_row(prop_table_tv, "Prop RPM (est)",
+                    f"{rpm_f:.0f} rpm", "—", "na")
+
         if tip_mach is not None:
-            tip_mach_f = float(tip_mach)
+            tm = float(tip_mach)
             _insert_status_row(prop_table_tv, "Tip Mach",
-                f"{tip_mach_f:.3f}",
-                "<= 0.60",
-                _status_color_tag(tip_mach_f, 0.60, "max"),
-                "Above 0.6 can generate significant aeroacoustic noise")
+                f"{tm:.3f}", "<= 0.60",
+                _status_color_tag(tm, 0.60, "max"),
+                "Above 0.6 → significant aeroacoustic noise & efficiency loss")
+
+        dl = float(metrics.get("disk_loading_N_m2", float("nan")))
+        if math.isfinite(dl):
+            _insert_status_row(prop_table_tv, "Disk loading",
+                f"{dl:.1f} N/m²", "<= 200 N/m²",
+                "ok" if dl <= 100 else ("warn" if dl <= 200 else "bad"),
+                "High DL → less efficient hover; < 100 N/m² is good")
+
+        he = float(metrics.get("hover_efficiency_gW", float("nan")))
+        if math.isfinite(he):
+            _insert_status_row(prop_table_tv, "Hover efficiency",
+                f"{he:.2f} g/W", ">= 5 g/W",
+                "ok" if he >= 7 else ("warn" if he >= 4 else "bad"),
+                "Higher = more lift per watt; typical 5–12 g/W")
+
+        fm = float(metrics.get("figure_of_merit", float("nan")))
+        if math.isfinite(fm):
+            _insert_status_row(prop_table_tv, "Figure of merit",
+                f"{fm:.3f}", ">= 0.65",
+                "ok" if fm >= 0.70 else ("warn" if fm >= 0.55 else "bad"),
+                "Ideal = 1.0; well-designed prop 0.7–0.8")
+
+        v_wind_max = float(metrics.get("hover_wind_resistance_mps", float("nan")))
+        if math.isfinite(v_wind_max):
+            _insert_status_row(prop_table_tv, "Max hover wind resistance",
+                f"{v_wind_max:.1f} m/s  ({v_wind_max*1.944:.1f} kt)",
+                ">= 5 m/s",
+                "ok" if v_wind_max >= 8 else ("warn" if v_wind_max >= 4 else "bad"),
+                "Maximum wind the vehicle can hold position against")
+
+        sol = float(metrics.get("prop_solidity_sigma", float("nan")))
+        if math.isfinite(sol):
+            _insert_status_row(prop_table_tv, "Prop solidity σ",
+                f"{sol:.3f}", "0.05 – 0.15",
+                "ok" if 0.05 <= sol <= 0.15 else "warn",
+                "< 0.05 → lightly loaded blades; > 0.15 → high profile losses")
 
     # ---- Metrics panel ----
     metrics_container = ttk.Frame(tab_metrics_out, padding=4)
@@ -4226,29 +5174,74 @@ def launch_gui():
 
     def _metrics_clear():
         for iid in metrics_tv.get_children(): metrics_tv.delete(iid)
+        _metrics_section_stack["current"] = ""
+
+    # ---- Collapsible metrics sections --------------------------------
+    # Sections are real parent nodes, so Treeview gives expand/collapse for
+    # free. With 100+ rows a flat list is hard to scan; the sections a user
+    # cares about stay open and the rest fold away.
+    _metrics_section_stack = {"current": ""}
+    _metrics_open_state = {}          # section title -> open/closed, remembered
 
     def _metrics_add_section(title: str):
-        metrics_tv.insert("", "end", values=(f"── {title} ──", ""), tags=("section",))
+        """Start a new collapsible section and make later rows its children."""
+        node = metrics_tv.insert(
+            "", "end", text=str(title), values=(f"── {title} ──", ""),
+            tags=("section",), open=_metrics_open_state.get(str(title), True))
+        _metrics_section_stack["current"] = node
+        return node
+
+    def _metrics_row(metric: str, value: str):
+        """Add a row under the current section (or at top level if none)."""
+        metrics_tv.insert(_metrics_section_stack["current"], "end",
+                          values=(metric, value))
+
+    def _metrics_remember_open_state(_event=None):
+        """Persist which sections the user left open across re-runs."""
+        for node in metrics_tv.get_children(""):
+            title = str(metrics_tv.item(node, "text"))
+            if title:
+                _metrics_open_state[title] = bool(metrics_tv.item(node, "open"))
+
+    metrics_tv.bind("<<TreeviewOpen>>", _metrics_remember_open_state, add="+")
+    metrics_tv.bind("<<TreeviewClose>>", _metrics_remember_open_state, add="+")
+
+    def _metrics_expand_all():
+        for node in metrics_tv.get_children(""):
+            metrics_tv.item(node, open=True)
+        _metrics_remember_open_state()
+
+    def _metrics_collapse_all():
+        for node in metrics_tv.get_children(""):
+            metrics_tv.item(node, open=False)
+        _metrics_remember_open_state()
 
     def _metrics_add(metric: str, value: str):
-        metrics_tv.insert("", "end", values=(metric, value))
+        _metrics_row(metric, value)
+
 
     def update_metrics_tab(drone: DroneConfig, metrics: dict, speed_mps: float, orientation: str):
         _metrics_clear()
         def fmt(x, nd=2):
             try: return f"{float(x):.{nd}f}"
             except Exception: return "n/a"
+        def fmf(x, nd=2):
+            """Format float, returning '—' for NaN/None."""
+            try:
+                v = float(x)
+                return "—" if v != v else f"{v:.{nd}f}"
+            except Exception: return "—"
 
         batt = drone.battery
         nm   = max(int(drone.num_motors), 1)
         g0   = 9.80665
 
-        v_load       = float(metrics.get("v_load_V",         float("nan")))
-        I_pack       = float(metrics.get("pack_current_A",   float("nan")))
-        P_total      = float(metrics.get("total_power_W",    float("nan")))
-        P_motor_total= float(metrics.get("motor_power_W",    0.0))
-        P_periph     = float(metrics.get("periph_power_W",   0.0))
-        P_esc_loss   = float(metrics.get("esc_loss_W",       0.0))
+        v_load        = float(metrics.get("v_load_V",          float("nan")))
+        I_pack        = float(metrics.get("pack_current_A",    float("nan")))
+        P_total       = float(metrics.get("total_power_W",     float("nan")))
+        P_motor_total = float(metrics.get("motor_power_W",     0.0))
+        P_periph      = float(metrics.get("periph_power_W",    0.0))
+        P_esc_loss    = float(metrics.get("esc_loss_W",        0.0))
 
         cap_mAh     = float(batt.capacity_mAh)
         cap_Ah      = cap_mAh / 1000.0 if cap_mAh else 0.0
@@ -4257,10 +5250,10 @@ def launch_gui():
         usable_Wh   = float(batt.capacity_Wh) * usable_frac
         load_C      = (I_pack / cap_Ah) if cap_Ah > 0 else float("nan")
 
-        t_min   = estimate_flight_time_minutes(drone, speed_mps, orientation=orientation)
-        groundspeed_mps = float(metrics.get("groundspeed_mps", speed_mps))
-        range_m = (t_min * 60.0) * groundspeed_mps
-        range_mi= (range_m / 1000.0) * 0.621371
+        t_min          = estimate_flight_time_minutes(drone, speed_mps, orientation=orientation)
+        groundspeed_mps= float(metrics.get("groundspeed_mps", speed_mps))
+        range_m        = (t_min * 60.0) * groundspeed_mps
+        range_km       = range_m / 1000.0
 
         I_motor = float(metrics.get("motor_I_per_esc_A", float("nan")))
         rpm     = metrics.get("prop_rpm", None)
@@ -4268,6 +5261,7 @@ def launch_gui():
         kv      = getattr(drone.motor, "kv", None)
         Rm      = float(getattr(drone.motor, "resistance", 0.0))
         I0      = float(getattr(drone.motor, "idle_current", 0.0))
+        Kt      = 60.0 / (2.0 * math.pi * float(kv)) if kv and float(kv) > 0 else float("nan")
 
         V_emf = float("nan")
         if kv and kv > 0 and rpm == rpm:
@@ -4303,84 +5297,175 @@ def launch_gui():
         if getattr(drone, "esc", None) and getattr(drone.esc,"weight_g",None): drive_g += float(drone.esc.weight_g) * nm
         if getattr(drone.propeller, "weight_g", None): drive_g += float(drone.propeller.weight_g) * nm
 
-        D_m = float(getattr(drone.propeller,"diameter_in",0.0)) * 0.0254
-        A_total = math.pi * (D_m/2)**2 * nm
+        D_m     = float(getattr(drone.propeller,"diameter_in",0.0)) * 0.0254
+        A_disk  = math.pi * (D_m/2)**2          # per rotor
+        A_total = A_disk * nm                    # total disk area
 
         p2w_Wkg = (P_total / weight_kg) if weight_kg > 0 else float("nan")
         P_out   = max(0.0, P_total - P_esc_loss - P_periph)
         eff_tot = (P_out / P_total) if P_total > 0 else float("nan")
         tilt    = float(metrics.get("tilt_required_deg", float("nan")))
 
+        # ── Battery ───────────────────────────────────────────────────────
         _metrics_add_section("Battery")
-        _metrics_add("Load",              f"{fmt(load_C,2)} C")
-        _metrics_add("Voltage (loaded)",  f"{fmt(v_load,2)} V")
-        _metrics_add("Rated Voltage",     f"{fmt(batt.vmax_pack,2)} V")
-        _metrics_add("Energy (usable)",   f"{fmt(usable_Wh,1)} Wh")
-        _metrics_add("Energy (total)",    f"{fmt(float(batt.capacity_Wh),1)} Wh")
-        _metrics_add("Total Capacity",    f"{fmt(cap_mAh,0)} mAh")
-        _metrics_add("Usable Capacity",   f"{fmt(usable_mAh,0)} mAh")
-        _metrics_add("SoC",               f"{fmt(metrics.get('soc_percent', 100.0),1)} %")
-        _metrics_add("SoC model source",  f"{metrics.get('soc_model_source', 'linear-fallback')}")
-        _metrics_add("Flight Time",       f"{fmt(t_min,2)} min")
-        _metrics_add("Battery Weight",    f"{fmt(batt.weight_g,0)} g")
+        Vmax  = float(getattr(batt,"vmax_pack", 0.0))
+        Vmin  = float(getattr(batt,"vmin_pack", 0.0))
+        Vsag  = Vmax - v_load
+        _metrics_add("Chemistry",              f"{getattr(batt,'chemistry','—') or '—'}")
+        _metrics_add("Configuration",          f"{batt.series_cells}S × {batt.parallel_cells}P  ({batt.total_cells} cells total)")
+        _metrics_add("Pack Voltage (no load)", f"{fmt(Vmax,2)} V")
+        _metrics_add("Pack Voltage (cutoff)",  f"{fmt(Vmin,2)} V")
+        _metrics_add("Pack Voltage (loaded)",  f"{fmt(v_load,2)} V  (sag: {fmt(Vsag,2)} V / {fmt(Vsag/max(Vmax,1e-9)*100,1)}%)")
+        _metrics_add("Pack Resistance",        f"{fmt(getattr(batt,'pack_resistance',0)*1000,1)} mΩ")
+        _metrics_add("Discharge C-rate",       f"{fmt(load_C,2)} C")
+        if cap_Ah > 0 and math.isfinite(float(getattr(batt,'discharge_cont_A',float('inf')))):
+            c_cont = float(batt.discharge_cont_A) / cap_Ah
+            _metrics_add("Cont C-rate limit",  f"{fmt(c_cont,1)} C  ({fmt(float(batt.discharge_cont_A),1)} A)")
+        _metrics_add("Total Capacity",         f"{fmt(cap_mAh,0)} mAh  ({fmt(cap_Ah,3)} Ah)")
+        _metrics_add("Usable Capacity",        f"{fmt(usable_mAh,0)} mAh  ({fmt(usable_frac*100,0)}% of pack)")
+        _metrics_add("Energy (total)",         f"{fmt(float(batt.capacity_Wh),2)} Wh")
+        _metrics_add("Energy (usable)",        f"{fmt(usable_Wh,2)} Wh")
+        _metrics_add("Energy Density",         f"{fmt(getattr(batt,'energy_density_Wh_per_kg',0),0)} Wh/kg")
+        _metrics_add("Battery Weight",         f"{fmt(batt.weight_g,0)} g  ({fmt(batt.weight_g/max(weight_kg*1000,1e-9)*100,1)}% of AUW)")
+        _metrics_add("SoC",                    f"{fmt(metrics.get('soc_percent',100.0),1)} %  [{metrics.get('soc_model_source','linear')}]")
+        _metrics_add("Pack Current",           f"{fmt(I_pack,2)} A")
+        _metrics_add("Flight Time",            f"{fmt(t_min,2)} min  ({fmt(t_min/60,3)} h)")
 
+        # ── Motor @ Operating Point ───────────────────────────────────────
         _metrics_add_section("Motor @ Operating Point")
-        _metrics_add("Current",            f"{fmt(I_motor,2)} A")
-        _metrics_add("Voltage",            f"{fmt(V_motor,2)} V")
-        _metrics_add("RPM",                f"{fmt(rpm,0)} rpm")
-        _metrics_add("Thrust (per motor)", f"{fmt(thrust_pm_g,0)} g")
-        _metrics_add("Thrust (total)",     f"{fmt((thrust_total_N/g0)*1000,0)} g")
-        _metrics_add("Electric Power",     f"{fmt(P_elec_motor,1)} W")
-        _metrics_add("Mechanical Power",   f"{fmt(P_mech_motor,1)} W")
-        _metrics_add("Throttle (log)",     f"{fmt(throttle_log*100,0)} %")
-        _metrics_add("Throttle (linear)",  f"{fmt(throttle_linear*100,0)} %")
-        _metrics_add("Efficiency",         f"{fmt(motor_eff*100,1)} %")
-        _metrics_add("Resistance Rm",      f"{fmt(Rm*1000,1)} mΩ")
-        _metrics_add("Specific Thrust",    f"{fmt(spec_thrust,2)} g/W")
-        _metrics_add("Hover Efficiency",   f"{fmt(metrics.get('hover_efficiency_gW', float('nan')),2)} g/W")
-        _metrics_add("Figure of Merit",    f"{fmt(metrics.get('figure_of_merit', float('nan')),3)}")
-        _metrics_add("Ideal Hover Power",  f"{fmt(metrics.get('hover_ideal_power_W', float('nan')),1)} W")
-        _metrics_add("Actual Induced Pwr", f"{fmt(metrics.get('actual_induced_power_W', float('nan')),1)} W")
-        _metrics_add("Est. Temperature",   f"{fmt(T_est,0)} °C")
-        _metrics_add("Thermal Status",     f"{metrics.get('thermal_status', 'n/a')}")
-        _metrics_add("Thermal Headroom",   f"{fmt(metrics.get('motor_thermal_headroom_C', float('nan')),1)} °C")
+        _metrics_add("Kv constant",            f"{fmt(kv,0) if kv else '—'} rpm/V")
+        _metrics_add("Kt constant",            f"{fmf(Kt,4)} Nm/A  (torque per amp)")
+        _metrics_add("No-load current I₀",     f"{fmt(I0,2)} A")
+        _metrics_add("Resistance Rm",          f"{fmt(Rm*1000,1)} mΩ")
+        if getattr(drone.motor,'pole_count',None):
+            _metrics_add("Pole count",         f"{drone.motor.pole_count}")
+        _metrics_add("Max current (rated)",    f"{fmf(getattr(drone.motor,'max_current',float('nan')),0)} A")
+        _metrics_add("Max power (rated)",      f"{fmf(getattr(drone.motor,'max_power',float('nan')),0)} W")
+        _metrics_add("Back-EMF (est)",         f"{fmf(V_emf,2)} V  ({fmt(rpm,0)} rpm / {fmt(kv,0) if kv else '—'} KV)")
+        _metrics_add("Terminal Voltage",       f"{fmt(V_motor,2)} V")
+        _metrics_add("Current / motor",        f"{fmt(I_motor,2)} A")
+        _metrics_add("Electric Power / motor", f"{fmt(P_elec_motor,1)} W")
+        _metrics_add("Mechanical Power / motor",f"{fmt(P_mech_motor,1)} W")
+        _metrics_add("Motor efficiency",       f"{fmt(motor_eff*100,1)} %  (P_mech / P_elec)")
+        _metrics_add("Copper loss / motor",    f"{fmt(I_motor**2 * Rm if I_motor==I_motor else float('nan'),2)} W  (I²Rm)")
+        _metrics_add("Throttle (linear)",      f"{fmt(throttle_linear*100,0)} %")
+        _metrics_add("Throttle (log scale)",   f"{fmt(throttle_log*100,0)} %")
+        _metrics_add("RPM",                    f"{fmt(rpm,0)} rpm")
+        _metrics_add("Thrust / motor",         f"{fmt(thrust_pm_g,0)} g  ({fmt(thrust_pm_N,3)} N)")
+        _metrics_add("Thrust total",           f"{fmt((thrust_total_N/g0)*1000,0)} g  ({fmt(thrust_total_N,2)} N)")
+        _metrics_add("Specific Thrust",        f"{fmt(spec_thrust,2)} g/W")
+        _metrics_add("Hover Efficiency",       f"{fmt(metrics.get('hover_efficiency_gW',float('nan')),2)} g/W")
+        _metrics_add("Figure of Merit",        f"{fmt(metrics.get('figure_of_merit',float('nan')),3)}")
+        _metrics_add("Ideal Hover Power",      f"{fmt(metrics.get('hover_ideal_power_W',float('nan')),1)} W")
+        _metrics_add("Actual Induced Power",   f"{fmt(metrics.get('actual_induced_power_W',float('nan')),1)} W")
+        _metrics_add("Est. Temperature", f"{T_est:.1f} °C")
+        _metrics_add("Thermal Headroom",       f"{fmt(metrics.get('motor_thermal_headroom_C',float('nan')),1)} °C  (to 120 °C)")
+        _metrics_add("Thermal Status",         f"{metrics.get('thermal_status','n/a')}")
 
-        _metrics_add_section("Total Drive")
-        _metrics_add("Drive Weight",       f"{fmt(drive_g,0)} g")
-        _metrics_add("Thrust-Weight Ratio",f"{fmt(twr,2)} : 1")
-        _metrics_add("Total Current",      f"{fmt(I_pack,2)} A")
-        _metrics_add("P(in)",              f"{fmt(P_total,1)} W")
-        _metrics_add("P(out)",             f"{fmt(P_out,1)} W")
-        _metrics_add("Total Efficiency",   f"{fmt(eff_tot*100,1)} %")
-        _metrics_add("Power / Weight",     f"{fmt(p2w_Wkg,1)} W/kg")
-
-        _metrics_add_section("Multicopter")
-        _metrics_add("Vehicle Weight",     f"{fmt(weight_kg*1000,0)} g")
-        _metrics_add("Tilt Angle",         f"{fmt(tilt,1)} °")
-        _metrics_add("Speed",              f"{fmt(speed_mps*3.6,1)} km/h  ({fmt(speed_mps*2.237,1)} mph)")
-        _metrics_add("Ground Speed",       f"{fmt(groundspeed_mps,2)} m/s")
-        _metrics_add("Head / Cross Wind",  f"{fmt(metrics.get('wind_head_mps', float('nan')),2)} / {fmt(metrics.get('wind_cross_mps', float('nan')),2)} m/s")
-        _metrics_add("Estimated Range",    f"{fmt(range_m,0)} m  ({fmt(range_mi,2)} mi)")
-        _metrics_add("Total Disc Area",    f"{fmt(A_total*1e4,0)} cm²  ({fmt(A_total/(0.0254**2),0)} in²)")
-        _metrics_add("Disk Loading",       f"{fmt(metrics.get('disk_loading_N_m2', float('nan')),1)} N/m²")
-        _metrics_add("Tip Speed",          f"{fmt(metrics.get('tip_speed_mps', float('nan')),1)} m/s")
-        _metrics_add("Tip Mach",           f"{fmt(metrics.get('tip_mach', float('nan')),3)}"
-                                           f"{'  (significant aeroacoustic noise likely)' if metrics.get('noise_significant', False) else ''}")
-        _metrics_add("Wind Resistance (hover)", f"{fmt(metrics.get('hover_wind_resistance_mps', float('nan')),2)} m/s")
-        _metrics_add("Prop Solidity σ",    f"{fmt(metrics.get('prop_solidity_sigma', float('nan')),3)}")
-        _metrics_add("Blade Chord (est)",  f"{fmt(metrics.get('blade_chord_est_m', float('nan'))*1000.0,1)} mm")
-        _metrics_add("Advance Ratio μ",    f"{fmt(metrics.get('advance_ratio_mu', float('nan')),3)}")
-        _metrics_add("Inflow Efficiency η",f"{fmt(metrics.get('inflow_efficiency', float('nan')),3)}")
-        _metrics_add("Inflow Power Mult.", f"{fmt(metrics.get('inflow_power_multiplier', float('nan')),3)}")
-        _metrics_add("Commanded Airspeed", f"{fmt(metrics.get('commanded_airspeed_mps', float('nan')),2)} m/s")
-        _metrics_add("Acceleration",       f"{fmt(metrics.get('accel_mps2', float('nan')),2)} m/s²")
-        _metrics_add("Kinetic Power Term", f"{fmt(metrics.get('kinetic_power_W', float('nan')),1)} W")
-        _metrics_add("Reserve Target/Margin", f"{fmt(metrics.get('reserve_target_Wh', float('nan')),1)} / {fmt(metrics.get('reserve_margin_Wh', float('nan')),1)} Wh")
-        _metrics_add("Reserve Status",     "VIOLATION" if metrics.get("reserve_breached", False) else "OK")
-        _metrics_add("Transient Segment",  f"{metrics.get('segment_type', 'steady')}")
-        _metrics_add("Thermal (M/ESC/Batt)", f"{fmt(metrics.get('motor_temp_est_C', float('nan')),1)} / {fmt(metrics.get('esc_temp_est_C', float('nan')),1)} / {fmt(metrics.get('battery_temp_est_C', float('nan')),1)} °C")
+        # ── Total Drive & Power ───────────────────────────────────────────
+        _metrics_add_section("Total Drive & Power")
+        _metrics_add("Drive Weight",           f"{fmt(drive_g,0)} g  ({nm} motors + ESC + props)")
+        _metrics_add("Thrust-Weight Ratio",    f"{fmt(twr,3)} : 1")
+        hover_TWR = float(metrics.get("hover_thrust_total_N", thrust_total_N)) / max(weight_kg * g0, 1e-9)
+        _metrics_add("Hover TWR",              f"{fmt(hover_TWR,3)} : 1  (static, no drag)")
         max_pay_g = (thrust_total_N/g0 - weight_kg)*1000 if thrust_total_N==thrust_total_N else float("nan")
-        _metrics_add("Max Extra Payload",  f"{fmt(max_pay_g,0)} g")
+        _metrics_add("Max Extra Payload",      f"{fmt(max_pay_g,0)} g")
+        _metrics_add("Total Current",          f"{fmt(I_pack,2)} A")
+        _metrics_add("Motor Power (total)",    f"{fmt(P_motor_total,1)} W  ({nm} motors)")
+        _metrics_add("ESC Losses (total)",     f"{fmt(P_esc_loss,1)} W")
+        _metrics_add("Avionics Power",         f"{fmt(P_periph,1)} W")
+        _metrics_add("Total Power In P(in)",   f"{fmt(P_total,1)} W")
+        _metrics_add("Propulsion P(out)",      f"{fmt(P_out,1)} W")
+        _metrics_add("System Efficiency",      f"{fmt(eff_tot*100,1)} %  (P_out/P_in)")
+        _metrics_add("Power / Weight",         f"{fmt(p2w_Wkg,1)} W/kg")
+        if P_total > 0:
+            _metrics_add("Power split",        f"Motor {P_motor_total/P_total*100:.0f}%  ESC {P_esc_loss/P_total*100:.0f}%  Avionics {P_periph/P_total*100:.0f}%")
+
+        # ── Propeller & Rotor ─────────────────────────────────────────────
+        _metrics_add_section("Propeller & Rotor")
+        D_in    = float(getattr(drone.propeller,"diameter_in",0.0))
+        P_in_p  = float(getattr(drone.propeller,"pitch_in",0.0))
+        blades  = int(getattr(drone.propeller,"blades",2))
+        pd_ratio= (P_in_p * 0.0254) / max(D_m, 1e-9)
+        # tip_mach and tip_speed_mps can be None when RPM is unavailable;
+        # .get() returns None (not the default) when key exists with value None.
+        _tm = metrics.get("tip_mach");     tip_mach = float(_tm) if _tm is not None else float("nan")
+        _ts = metrics.get("tip_speed_mps"); tip_spd  = float(_ts) if _ts is not None else float("nan")
+        _metrics_add("Diameter",               f"{D_in:.1f} in  ({D_m*100:.1f} cm)")
+        _metrics_add("Pitch",                  f"{P_in_p:.1f} in  ({P_in_p*2.54:.1f} cm)")
+        _metrics_add("Blades",                 f"{blades}")
+        _metrics_add("Pitch / Diameter ratio", f"{pd_ratio:.3f}")
+        _metrics_add("Disk Area / rotor",      f"{A_disk*1e4:.1f} cm²  ({A_disk*1550:.1f} in²)")
+        _metrics_add("Total Disk Area",        f"{A_total*1e4:.1f} cm²  (all {nm} rotors)")
+        _metrics_add("Disk Loading",           f"{fmt(metrics.get('disk_loading_N_m2',float('nan')),1)} N/m²")
+        _metrics_add("RPM",                    f"{fmt(rpm,0)} rpm")
+        _metrics_add("Tip Speed", f"{tip_spd:.2f} m/s  ({tip_spd*3.6:.1f} km/h  /  {tip_spd*1.944:.1f} kt)")
+        _metrics_add("Tip Mach",               f"{fmf(tip_mach,4)}{'  ⚠ significant noise' if tip_mach==tip_mach and tip_mach>0.6 else ''}")
+        _metrics_add("Advance Ratio μ",        f"{fmt(metrics.get('advance_ratio_mu',float('nan')),3)}")
+        _metrics_add("Prop Solidity σ",        f"{fmt(metrics.get('prop_solidity_sigma',float('nan')),3)}")
+        _metrics_add("Blade Chord (est)",      f"{fmt(metrics.get('blade_chord_est_m',float('nan'))*1000,1)} mm")
+        _metrics_add("Inflow Efficiency η",    f"{fmt(metrics.get('inflow_efficiency',float('nan')),3)}")
+        _metrics_add("Inflow Power Multiplier",f"{fmt(metrics.get('inflow_power_multiplier',float('nan')),3)}")
+
+        # ── Flight Performance ────────────────────────────────────────────
+        _metrics_add_section("Flight Performance")
+        _metrics_add("Orientation",            f"{orientation}")
+        _metrics_add("Airspeed", f"{speed_mps:.2f} m/s  ({speed_mps*3.6:.1f} km/h  /  {speed_mps*1.944:.1f} kt)")
+        _metrics_add("Ground Speed", f"{groundspeed_mps:.2f} m/s  ({groundspeed_mps*3.6:.1f} km/h  /  {groundspeed_mps*1.944:.1f} kt)")
+        _metrics_add("Head / Cross Wind",      f"{fmf(metrics.get('wind_head_mps',float('nan')),2)} / {fmf(metrics.get('wind_cross_mps',float('nan')),2)} m/s")
+        _metrics_add("Tilt Angle",             f"{fmf(tilt,1)} °")
+        if getattr(drone,'max_tilt_deg',None) is not None:
+            _metrics_add("Tilt Limit",         f"{float(drone.max_tilt_deg):.1f} °")
+        _metrics_add("Estimated Range", f"{range_km:.2f} km  ({range_km*0.6214:.2f} mi  /  {range_km*0.5400:.2f} nm)")
+        _metrics_add("Flight Time",            f"{fmt(t_min,2)} min  ({fmt(t_min/60,3)} h)")
+        # Hover endurance (always useful to know)
+        try:
+            t_hover = estimate_flight_time_minutes(drone, 0.0, orientation="hover")
+            _metrics_add("Hover Endurance",    f"{fmt(t_hover,2)} min")
+        except Exception:
+            pass
+        # Specific range and endurance
+        if P_total > 0 and groundspeed_mps > 0:
+            SR = groundspeed_mps / P_total * 3600.0  # m/Wh
+            SE = 60.0 / P_total                       # min/Wh
+            _metrics_add("Specific Range",     f"{SR/1000:.3f} km/Wh  ({SR:.0f} m/Wh)")
+            _metrics_add("Specific Endurance", f"{SE:.3f} min/Wh")
+        _metrics_add("Acceleration",           f"{fmf(metrics.get('accel_mps2',float('nan')),2)} m/s²")
+        _metrics_add("Kinetic Power Term",     f"{fmf(metrics.get('kinetic_power_W',float('nan')),1)} W")
+        _metrics_add("Reserve Target",         f"{fmf(metrics.get('reserve_target_Wh',float('nan')),1)} Wh")
+        _metrics_add("Reserve Margin",         f"{fmf(metrics.get('reserve_margin_Wh',float('nan')),1)} Wh  ({'VIOLATION' if metrics.get('reserve_breached',False) else 'OK'})")
+        _metrics_add("Transient Segment",      f"{metrics.get('segment_type','steady')}")
+        _metrics_add("Hover Wind Resistance",  f"{fmt(metrics.get('hover_wind_resistance_mps',float('nan')),2)} m/s  ({fmt(metrics.get('hover_wind_resistance_mps',0)*1.944,1)} kt)")
+
+        # ── Thermal ───────────────────────────────────────────────────────
+        _metrics_add_section("Thermal Estimates")
+        _metrics_add("Motor temperature",      f"{fmf(T_est,1)} °C  [limit: 120 °C]")
+        _metrics_add("Motor headroom",         f"{fmf(metrics.get('motor_thermal_headroom_C',float('nan')),1)} °C")
+        _metrics_add("ESC temperature",        f"{fmf(metrics.get('esc_temp_est_C',float('nan')),1)} °C")
+        _metrics_add("Battery temperature",    f"{fmf(metrics.get('battery_temp_est_C',float('nan')),1)} °C")
+        _metrics_add("Thermal status",         f"{metrics.get('thermal_status','n/a')}")
+        _metrics_add("Motor copper loss",      f"{fmf(metrics.get('motor_copper_loss_W_per_motor',float('nan')),2)} W/motor")
+        _metrics_add("Battery I²R loss",       f"{fmf(metrics.get('battery_loss_W',float('nan')),3)} W")
+
+        # ── Environment & Design ──────────────────────────────────────────
+        _metrics_add_section("Environment & Design")
+        rho = float(getattr(drone,'air_density',1.225))
+        rho_drop = (1.225 - rho) / 1.225 * 100
+        _metrics_add("Air Density",            f"{rho:.4f} kg/m³  ({rho_drop:+.1f}% vs ISA SL)")
+        try:
+            T0_k, L_k = 288.15, 0.0065
+            da_m = T0_k / L_k * (1.0 - (rho/1.225)**(1.0/(1.0 - L_k*287.05/g0)))
+            _metrics_add("Density Altitude",   f"{da_m:.0f} m  ({da_m*3.281:.0f} ft)")
+        except Exception:
+            pass
+        _metrics_add("Vehicle AUW",            f"{fmt(weight_kg*1000,0)} g  ({fmt(weight_kg,3)} kg)")
+        payload_g = float(getattr(drone,'payload_mass_g',0.0) or 0.0)
+        if payload_g > 0:
+            _metrics_add("Payload",            f"{fmt(payload_g,0)} g  ({payload_g/max(weight_kg*1000,1e-9)*100:.1f}% of AUW)")
+        _metrics_add("Battery mass fraction",  f"{batt.weight_g/max(weight_kg*1000,1e-9)*100:.1f}%")
+        _metrics_add("Drive mass fraction",    f"{drive_g/max(weight_kg*1000,1e-9)*100:.1f}%")
+        _metrics_add("Motor configuration",    f"{getattr(drone,'motor_configuration','flat').title()}")
+        _metrics_add("Energy density (batt)",  f"{fmt(getattr(batt,'energy_density_Wh_per_kg',0),0)} Wh/kg")
 
     # ---- Mission Plots panel ----
     mission_container = ttk.Frame(tab_mission_plots_out, padding=4)
@@ -4562,16 +5647,16 @@ def launch_gui():
             operating_voltage_min  = parse_float("Vmin/cell", v_batt_vmin.get()),
             operating_voltage_nominal = parse_float("Vnom/cell", v_batt_vnom.get()),
             operating_voltage_max  = parse_float("Vmax/cell", v_batt_vmax.get()),
-            cell_capacity_mAh      = parse_float("Cell capacity", v_batt_cell_capacity.get()),
-            pack_capacity_mAh      = parse_float("Pack capacity", v_batt_pack_capacity.get()),
-            cell_weight_g          = parse_float("Cell weight", v_batt_cell_weight.get()),
-            pack_weight_g          = parse_float("Pack weight", v_batt_pack_weight.get()),
-            unit_energy_density    = parse_float("Energy density", v_batt_energy_density.get()),
-            charge_current_max     = parse_float("Max charge current", v_batt_chg.get()),
-            discharge_cont_A       = parse_float("Cont discharge", v_batt_a_cont.get()),
-            discharge_max_A        = parse_float("Max discharge", v_batt_a_max.get()),
-            discharge_c_cont       = parse_float("Cont C-rate", v_batt_c_cont.get()),
-            discharge_c_max        = parse_float("Max C-rate", v_batt_c_max.get()),
+            cell_capacity_mAh      = parse_float_opt("Cell capacity", v_batt_cell_capacity.get()),
+            pack_capacity_mAh      = parse_float_opt("Pack capacity", v_batt_pack_capacity.get()),
+            cell_weight_g          = parse_float_opt("Cell weight", v_batt_cell_weight.get()),
+            pack_weight_g          = parse_float_opt("Pack weight", v_batt_pack_weight.get()),
+            unit_energy_density    = parse_float_opt("Energy density", v_batt_energy_density.get()),
+            charge_current_max     = parse_float_opt("Max charge current", v_batt_chg.get()),
+            discharge_cont_A       = parse_float_opt("Cont discharge", v_batt_a_cont.get()),
+            discharge_max_A        = parse_float_opt("Max discharge", v_batt_a_max.get()),
+            discharge_c_cont       = parse_float_opt("Cont C-rate", v_batt_c_cont.get()),
+            discharge_c_max        = parse_float_opt("Max C-rate", v_batt_c_max.get()),
             discharge_percent      = parse_float("Discharge %", v_batt_dischg_pct.get()),
             resistance_cell_mOhm   = parse_float("Rcell", v_batt_r.get()),
             unit_mode              = v_batt_unit_mode.get().strip().lower(),
@@ -4587,14 +5672,14 @@ def launch_gui():
         )
         motor = MotorConfig(
             kv            = parse_float("Kv", v_motor_kv.get()),
-            idle_current  = parse_float("Idle current", v_motor_i0.get()),
-            idle_voltage  = parse_float("Idle voltage", v_motor_v0.get()),
-            rated_voltage = parse_int("Rated voltage", v_motor_rated_v.get()),
+            idle_current  = parse_float_opt("Idle current", v_motor_i0.get(), 0.0),
+            idle_voltage  = parse_float_opt("Idle voltage", v_motor_v0.get(), 10.0),
+            rated_voltage = parse_int_opt("Rated voltage", v_motor_rated_v.get(), 0),
             resistance    = parse_float("Motor resistance", v_motor_r.get()),
-            max_current   = parse_float("Motor max current", v_motor_imax.get()),
-            max_power     = parse_float("Motor max power", v_motor_pmax.get()),
-            pole_count    = parse_int("Pole count", v_motor_pole_count.get()),
-            weight_g      = parse_float("Motor weight", v_motor_weight.get()),
+            max_current   = parse_float_opt("Motor max current", v_motor_imax.get()),
+            max_power     = parse_float_opt("Motor max power", v_motor_pmax.get()),
+            pole_count    = parse_int_opt("Pole count", v_motor_pole_count.get(), 14),
+            weight_g      = parse_float_opt("Motor weight", v_motor_weight.get()),
             size_mm       = v_motor_size.get().strip() or None,
         )
         esc = None
@@ -4603,12 +5688,12 @@ def launch_gui():
                v_esc_r.get().strip(), v_esc_weight.get().strip()]
         if any(_ef):
             esc = ESCConfig(
-                voltage_rating       = parse_int("ESC voltage rating", v_esc_voltage_rating.get()),
-                continuous_current_A = parse_float("ESC cont current", v_esc_cont_current.get()),
-                max_current_A        = parse_float("ESC max current", v_esc_max_current.get()),
-                idle_current_A       = parse_float("ESC idle current", v_esc_idle_current.get()),
-                resistance           = parse_float("ESC resistance", v_esc_r.get()),
-                weight_g             = parse_float("ESC weight", v_esc_weight.get()),
+                voltage_rating       = parse_int_opt("ESC voltage rating", v_esc_voltage_rating.get(), 0),
+                continuous_current_A = parse_float_opt("ESC cont current", v_esc_cont_current.get(), 0.0),
+                max_current_A        = parse_float_opt("ESC max current", v_esc_max_current.get(), 0.0),
+                idle_current_A       = parse_float_opt("ESC idle current", v_esc_idle_current.get(), 0.0),
+                resistance           = parse_float_opt("ESC resistance", v_esc_r.get(), 0.0),
+                weight_g             = parse_float_opt("ESC weight", v_esc_weight.get()),
             )
         avionics = AvionicsConfig(voltage_tree=_get_voltage_tree_from_table())
 
@@ -4624,16 +5709,16 @@ def launch_gui():
         prop = PropellerConfig(
             diameter_in  = parse_float("Prop diameter", v_prop_d.get()),
             pitch_in     = parse_float("Prop pitch", v_prop_pitch.get()),
-            max_rpm      = parse_float("Prop max RPM", v_prop_max_rpm.get()),
-            max_thrust_g = parse_float("Prop max thrust", v_prop_max_thrust.get()),
-            blades       = parse_int("Prop blades", v_prop_blades.get()),
+            max_rpm      = parse_float_opt("Prop max RPM", v_prop_max_rpm.get(), 0.0),
+            max_thrust_g = parse_float_opt("Prop max thrust", v_prop_max_thrust.get(), 0.0),
+            blades       = parse_int_opt("Prop blades", v_prop_blades.get(), 2),
             table_csv    = prop_table_path,
             TConst       = float(tc) if tc else None,
             PConst       = float(pc) if pc else None,
-            weight_g     = parse_float("Prop weight", v_prop_weight.get()),
+            weight_g     = parse_float_opt("Prop weight", v_prop_weight.get()),
         )
         base_weight_g = parse_float("Weight", v_weight.get())
-        payload_mass_g = max(parse_float("Payload mass", v_payload_mass.get()), 0.0)
+        payload_mass_g = max(parse_float_opt("Payload mass", v_payload_mass.get(), 0.0), 0.0)
         drone = DroneConfig(
             num_motors               = parse_int("Num motors", v_num_motors.get()),
             battery                  = batt,
@@ -4738,6 +5823,10 @@ def launch_gui():
             max_spd = parse_float("Max speed plot", v_max_speed_plot.get())
             _last_run["drone"]   = drone
             _last_run["max_spd"] = max_spd
+            # Speed and orientation are needed by the Sensitivity and Compare
+            # tabs, which re-evaluate the same operating point.
+            _last_run["speed"] = speed
+            _last_run["orientation"] = orientation
             # Capture sweep data for CSV/Excel export
             _mc_v = [0.5 + (max_spd-0.5)*i/200 for i in range(201)]
             _last_run_sweep.clear()
@@ -4755,6 +5844,8 @@ def launch_gui():
             })
             _last_run_cfg[0] = drone
             update_weight_budget(drone)
+            _refresh_airframe_diagram(drone)
+            refresh_comparison()
             fig = make_performance_figure(
                 drone, max_speed=max_spd,
                 figsize=(_view["plot_w"], _view["plot_h"]))
@@ -4906,6 +5997,11 @@ def launch_gui():
             json.dump(data, f, indent=2)
 
     def load_config_from_file(path: str) -> None:
+        # Keep the mode-bar label in step with whatever was just loaded.
+        try:
+            v_loaded_cfg.set(os.path.basename(str(path)))
+        except Exception:
+            pass
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         for k, val in data.get("vars", {}).items():
@@ -4922,6 +6018,52 @@ def launch_gui():
                                for v, ci in d.items()])
             except Exception: pass
         on_unit_mode_change()
+        # Re-apply visibility: a loaded config may switch cell/pack mode,
+        # and the newly-restored values must respect the current UI mode.
+        _apply_field_mode()
+
+
+
+
+    # ------------------------------------------------------------------
+    # SIMPLE / ADVANCED MODE
+    # ------------------------------------------------------------------
+    def _apply_field_mode(*_a):
+        """
+        Show or hide input rows according to the Simple/Advanced setting.
+
+        Simple mode grids only the rows whose key is in MC_SIMPLE_FIELDS.
+        Advanced mode grids everything.  Rows are removed with grid_remove(),
+        which preserves their grid options so re-showing is a plain grid().
+        Hidden fields keep their values, so switching modes never changes a
+        result — it only changes what you can see.
+        """
+        simple = (v_ui_mode.get() == "Simple")
+        for row in _field_rows:
+            show = (not simple) or (row["key"] in MC_SIMPLE_FIELDS)
+            for w in row["widgets"]:
+                try:
+                    if show: w.grid()
+                    else:    w.grid_remove()
+                except Exception:
+                    pass
+        # A section heading is hidden when every field under it is hidden.
+        for sec in _section_rows:
+            show = (not simple) or (not sec["keys"]) or bool(sec["keys"] & MC_SIMPLE_FIELDS)
+            for w in sec["widgets"]:
+                try:
+                    if show: w.grid()
+                    else:    w.grid_remove()
+                except Exception:
+                    pass
+
+
+    v_ui_mode.trace_add("write", _apply_field_mode)
+    _apply_field_mode()          # apply the default (Simple) at startup
+
+
+    # Startup banner: states the version and points at the two new UI features,
+    # so a stale copy of the script is immediately obvious.
 
     def prompt_save_config():
         path = filedialog.asksaveasfilename(
@@ -5107,6 +6249,21 @@ def launch_gui():
                command=_do_generate_report).grid(row=0, column=6, padx=4, pady=4)
 
     root.protocol("WM_DELETE_WINDOW", exit_app)
+
+
+    _banner_lines = [
+        f"Multicopter Power Simulator  v{SIM_VERSION}",
+        "=" * 46,
+        "Input detail is set to Simple (selector above the input tabs).",
+        "Hover the blue ? beside any field for an explanation and a",
+        "typical value. Switch to Advanced to reveal every input.",
+        "Metrics sections collapse - click a section heading to fold it.",
+        "",
+    ]
+    _banner_lines.append("Load Config -> examples/configs/ for ready-made aircraft.")
+    _banner_lines.append("Run Mission (JSON) -> examples/missions/ for flight profiles.")
+    out_print("\n".join(_banner_lines) + "\n")
+
     root.mainloop()
 
 # -------------------------------
@@ -5211,6 +6368,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prop_blades", type=int, default=2)
     parser.add_argument("--prop_weight", type=float, required=False, help="Propeller weight per motor (g)")
     parser.add_argument("--prop_weight_g", dest="prop_weight", type=float, required=False, help=argparse.SUPPRESS)
+    # These two were read via getattr() in build_drone_from_args() but never
+    # defined as arguments, so they always fell back to 0 and their status
+    # checks were silently skipped in every CLI and batch run.
+    parser.add_argument("--prop_max_rpm", type=float, default=None,
+                        help="Manufacturer prop RPM limit, used for a status check.")
+    parser.add_argument("--prop_max_thrust", type=float, default=None,
+                        help="Max thrust of one motor+prop (g), used for a status check.")
     parser.add_argument("--prop_table", type=str, default=None)
     parser.add_argument("--prop_tconst", type=float, default=None, help="Prop thrust coefficient (C_T-like)")
     parser.add_argument("--prop_pconst", type=float, default=None, help="Prop power coefficient (C_P-like)")
@@ -5265,22 +6429,71 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 def validate_required_cli_args(args):
     """
-    In CLI mode, we keep the same overall required parameters as before.
-    (GUI mode bypasses these.)
+    Check that CLI mode has the arguments the physics genuinely needs.
+
+    Only truly load-bearing inputs are required.  Anything that is either
+    (a) an alternative to another input, or (b) used solely for a status
+    check, is optional — demanding all of them made batch runs and the
+    bundled example configs fail for no physical reason.
+
+    Mutually exclusive alternatives, checked separately below:
+      * cell_capacity / cell_weight   vs  pack_capacity / pack_weight
+        (whichever matches --battery_unit_mode)
+      * discharge_cont_A              vs  discharge_c_cont
     """
     required = [
-        "num_motors", "weight", "area",
-        "battery_operating_voltage_min", "battery_operating_voltage_nominal", "battery_operating_voltage_max",
-        "battery_cell_capacity", "battery_cell_weight_g", "battery_energy_density",
-        "battery_charge_current_max", "battery_discharge_cont_A",
+        "num_motors", "weight",
+        "battery_operating_voltage_min", "battery_operating_voltage_nominal",
+        "battery_operating_voltage_max",
         "battery_resistance_cell", "battery_series_units",
-        "motor_kv", "motor_idle_current", "motor_resistance", "motor_max_current", "motor_max_power",
+        "motor_kv", "motor_resistance",
         "prop_diameter", "prop_pitch",
     ]
     missing = [k for k in required if getattr(args, k) is None]
+
+    # Capacity: need whichever pair matches the unit mode.
+    unit_mode = str(getattr(args, "battery_unit_mode", "cell") or "cell").strip().lower()
+    if unit_mode == "pack":
+        if getattr(args, "battery_pack_capacity", None) is None:
+            missing.append("battery_pack_capacity")
+    else:
+        if getattr(args, "battery_cell_capacity", None) is None:
+            missing.append("battery_cell_capacity")
+
+    # Current limit: either an absolute amp figure or a C-rate is enough.
+    if (getattr(args, "battery_discharge_cont_A", None) is None
+            and getattr(args, "battery_discharge_c_cont", None) is None):
+        missing.append("battery_discharge_cont_A (or --battery_discharge_c_cont)")
     if missing:
         raise SystemExit(f"Missing required CLI args: {', '.join('--' + m for m in missing)}\n"
                          f"Tip: run with --gui to use the graphical interface.")
+
+
+
+def _load_mission_or_exit(path: str) -> "MissionProfile":
+    """
+    Load a mission JSON for a CLI run, failing with a readable message.
+
+    A mistyped path or a malformed file is ordinary user error, so it should
+    produce a one-line explanation rather than a Python traceback.
+    """
+    import os
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"Mission file not found: {path}\n"
+            "Check the path, or try one of the bundled examples in "
+            "examples/missions/."
+        )
+    try:
+        return MissionProfile.from_json(path)
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Mission file {path} is not valid JSON: {e}")
+    except (KeyError, TypeError, ValueError) as e:
+        raise SystemExit(
+            f"Mission file {path} could not be read: {e}\n"
+            "Each entry in \"phases\" needs a name and either a duration or a "
+            "distance. See examples/missions/ for working files."
+        )
 
 
 def main():
@@ -5300,7 +6513,7 @@ def main():
     print(f"Using air density = {drone.air_density:.3f} kg/m^3 at {args.altitude:.1f} m altitude")
 
     if args.mission:
-        mission = MissionProfile.from_json(args.mission)
+        mission = _load_mission_or_exit(args.mission)
         mission.reserve_percent = float(args.reserve_percent)
         mission.rth_reserve_Wh = float(args.rth_reserve_Wh)
         mission.diversion_reserve_Wh = float(args.diversion_reserve_Wh)

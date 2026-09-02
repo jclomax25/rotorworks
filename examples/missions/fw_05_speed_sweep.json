@@ -1,0 +1,53 @@
+{
+  "_comment": "Diagnostic mission: three minutes at each of four cruise speeds. Compare the power drawn in each phase against the best-endurance and best-range speeds reported on the Metrics tab.",
+  "reserve_percent": 20,
+  "rth_reserve_Wh": 0,
+  "diversion_reserve_Wh": 0,
+  "wind_direction_deg": 0,
+  "phases": [
+    {
+      "name": "Climb out",
+      "speed": 16.0,
+      "duration": 90,
+      "altitude": 150,
+      "climb_rate_mps": 2.0
+    },
+    {
+      "name": "Cruise 14 m/s",
+      "speed": 14.0,
+      "duration": 180,
+      "altitude": 150
+    },
+    {
+      "name": "Cruise 18 m/s",
+      "speed": 18.0,
+      "duration": 180,
+      "altitude": 150
+    },
+    {
+      "name": "Cruise 22 m/s",
+      "speed": 22.0,
+      "duration": 180,
+      "altitude": 150
+    },
+    {
+      "name": "Cruise 26 m/s",
+      "speed": 26.0,
+      "duration": 180,
+      "altitude": 150
+    },
+    {
+      "name": "Descend",
+      "speed": 17.0,
+      "duration": 100,
+      "altitude": 30,
+      "descent_rate_mps": 1.5
+    },
+    {
+      "name": "Approach and land",
+      "speed": 15.0,
+      "duration": 45,
+      "altitude": 0
+    }
+  ]
+}

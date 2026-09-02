@@ -15,9 +15,9 @@ Two tools in one application:
       • EK3_DRAG_BCOEF_X  [kg/m²]  – ArduPilot EKF frontal ballistic coeff
       • EK3_DRAG_BCOEF_Y  [kg/m²]  – ArduPilot EKF side ballistic coeff
       • parasite_area / parasite_drag_coefficient  – for the multicopter sim
-        (forward-flight drag, driven by frontal cross-section)
+        (forward-flight drag, from the FRONT silhouette)
       • profile_area  / profile_drag_coefficient   – for the multicopter sim
-        (hover lateral drag, driven by top cross-section)
+        (lateral/hover drag, from the SIDE silhouette)
 
   Tab 2 — Propeller Drag (MCOEF)
     Physics-based estimate of EK3_DRAG_MCOEF from actuator-disk theory.
@@ -698,11 +698,16 @@ class BodyDragTab(ttk.Frame):
 
     Multicopter sim mapping
     -----------------------
-    Forward-flight drag model uses parasite_area × parasite_drag_coefficient.
-    Hover lateral drag uses profile_area × profile_drag_coefficient.
-    Frontal area → parasite  (dominant in forward flight)
-    Top area     → profile   (dominant in hover lateral motion)
-    Side area    → BCOEF_Y only (ArduPilot EKF Y-axis)
+    The simulator applies:
+        forward flight :  F = ½ρV² × parasite_area × parasite_drag_coefficient
+        hover/lateral  :  F = ½ρV² × profile_area  × profile_drag_coefficient
+
+    So the mapping is driven by which silhouette meets the airflow:
+        FRONT area → parasite_area  (nose-on, forward flight)
+        SIDE  area → profile_area   (side-on, lateral translation in hover)
+        TOP   area → vertical/descent drag; reported for reference only.
+
+    Front and side also feed ArduPilot's EK3_DRAG_BCOEF_X and _Y.
     """
 
     def __init__(self, parent: tk.Widget, **kwargs):
@@ -723,9 +728,9 @@ class BodyDragTab(ttk.Frame):
         self.side  = ViewCanvas(view_nb, "Side")
         self.top   = ViewCanvas(view_nb, "Top")
 
-        view_nb.add(self.front, text="  Front View  (BCOEF_X / parasite)  ")
-        view_nb.add(self.side,  text="  Side View   (BCOEF_Y)              ")
-        view_nb.add(self.top,   text="  Top View    (profile / hover)       ")
+        view_nb.add(self.front, text="  Front View  (BCOEF_X / parasite_area)  ")
+        view_nb.add(self.side,  text="  Side View   (BCOEF_Y / profile_area)   ")
+        view_nb.add(self.top,   text="  Top View    (reference / optional)     ")
 
         # ---- Results panel ----
         res_outer = ttk.LabelFrame(self, text="Results & Outputs", padding=10)
@@ -794,10 +799,10 @@ class BodyDragTab(ttk.Frame):
         # Notes
         note = (
             "Notes:\n"
-            "• parasite_area = frontal area (forward flight drag)\n"
-            "• profile_area  = top area  (hover lateral drag)\n"
+            "• parasite_area = FRONT area (forward-flight drag)\n"
+            "• profile_area  = SIDE  area (lateral drag while hovering)\n"
             "• Both use the same body Cd entered above\n"
-            "• Side area feeds BCOEF_Y only (ArduPilot EKF)"
+            "• Top area is reference only (vertical/descent drag)"
         )
         ttk.Label(res_outer, text=note, foreground="#666666",
                   font=("TkDefaultFont", 8), justify="left").grid(
@@ -828,6 +833,8 @@ class BodyDragTab(ttk.Frame):
         top_a   = self.top.get_area_m2()     # optional
 
         # Front and side are required; top is optional (produces profile_area)
+        # Front and side are both required: front drives parasite_area and
+        # BCOEF_X, side drives profile_area and BCOEF_Y.  Top is optional.
         missing = []
         if front_a is None:
             missing.append("Front view: complete scale + polygon")
@@ -844,11 +851,13 @@ class BodyDragTab(ttk.Frame):
         bcoef_x = mass_kg / (cd * front_a)
         bcoef_y = mass_kg / (cd * side_a)
 
-        # Multicopter sim:
-        #   parasite  → forward-flight drag → driven by frontal area
-        #   profile   → hover lateral drag  → driven by top area
+        # Multicopter sim mapping:
+        #   parasite_area ← FRONT silhouette (forward flight, nose-on)
+        #   profile_area  ← SIDE  silhouette (lateral translation in hover)
+        # The top-view area is NOT used for either of these; it describes
+        # vertical/descent drag and is reported for reference only.
         par_area  = front_a
-        prof_area = top_a    # may be None
+        prof_area = side_a
 
         def fmt_a(v: Optional[float]) -> str:
             if v is None:
@@ -866,10 +875,8 @@ class BodyDragTab(ttk.Frame):
 
         self._lbl_par_area.configure(text=fmt_a(par_area))
         self._lbl_par_cd.configure(text=f"{cd:.2f}")
-        self._lbl_prof_area.configure(
-            text=fmt_a(prof_area) if prof_area else "measure top view first")
-        self._lbl_prof_cd.configure(
-            text=f"{cd:.2f}" if prof_area else "—")
+        self._lbl_prof_area.configure(text=fmt_a(prof_area))
+        self._lbl_prof_cd.configure(text=f"{cd:.2f}")
 
         self._last_results = {
             "mass_kg":           mass_kg,
@@ -884,8 +891,8 @@ class BodyDragTab(ttk.Frame):
             "multicopter_sim": {
                 "parasite_area":             round(par_area, 6),
                 "parasite_drag_coefficient": round(cd, 4),
-                "profile_area":              round(prof_area, 6) if prof_area else None,
-                "profile_drag_coefficient":  round(cd, 4) if prof_area else None,
+                "profile_area":              round(prof_area, 6),
+                "profile_drag_coefficient":  round(cd, 4),
             },
         }
 

@@ -1,0 +1,57 @@
+{
+  "_comment": "ISR-style profile: transit 10 km out, loiter on station for 30 minutes in a 20-degree banked orbit at best-endurance speed, then transit home. Loiter speed is deliberately slower than cruise.",
+  "reserve_percent": 25,
+  "rth_reserve_Wh": 20,
+  "diversion_reserve_Wh": 0,
+  "wind_direction_deg": 180,
+  "phases": [
+    {
+      "name": "Climb out",
+      "speed": 16.0,
+      "duration": 150,
+      "altitude": 300,
+      "climb_rate_mps": 2.0
+    },
+    {
+      "name": "Transit to station",
+      "speed": 20.0,
+      "distance": 10000,
+      "altitude": 300,
+      "course_deg": 180
+    },
+    {
+      "name": "Loiter orbit 1",
+      "speed": 15.0,
+      "duration": 900,
+      "altitude": 300,
+      "bank_deg": 20
+    },
+    {
+      "name": "Loiter orbit 2",
+      "speed": 15.0,
+      "duration": 900,
+      "altitude": 300,
+      "bank_deg": 20
+    },
+    {
+      "name": "Transit home",
+      "speed": 20.0,
+      "distance": 10000,
+      "altitude": 300,
+      "course_deg": 0
+    },
+    {
+      "name": "Descend",
+      "speed": 17.0,
+      "duration": 200,
+      "altitude": 30,
+      "descent_rate_mps": 1.5
+    },
+    {
+      "name": "Approach and land",
+      "speed": 15.0,
+      "duration": 45,
+      "altitude": 0
+    }
+  ]
+}

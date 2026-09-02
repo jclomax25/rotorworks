@@ -1,0 +1,33 @@
+{
+  "_comment": "Simplest possible mission: climb to 30 m, hover 8 minutes, land. Use this to check pure hover endurance against your battery reserve.",
+  "reserve_percent": 20,
+  "rth_reserve_Wh": 0,
+  "diversion_reserve_Wh": 0,
+  "wind_direction_deg": 0,
+  "transient_dt_s": 0.5,
+  "max_accel_mps2": 2.0,
+  "max_decel_mps2": 2.5,
+  "decel_regen_eff": 0.0,
+  "phases": [
+    {
+      "name": "Takeoff climb",
+      "speed": 0.0,
+      "duration": 20,
+      "altitude": 30,
+      "climb_rate_mps": 1.5
+    },
+    {
+      "name": "Hover on station",
+      "speed": 0.0,
+      "duration": 480,
+      "altitude": 30
+    },
+    {
+      "name": "Descend and land",
+      "speed": 0.0,
+      "duration": 30,
+      "altitude": 0,
+      "descent_rate_mps": 1.0
+    }
+  ]
+}

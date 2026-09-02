@@ -1,0 +1,61 @@
+{
+  "_comment": "Out-and-back delivery with a hover drop at the far end. Wind is from the west, so the outbound leg is a headwind and the return is a tailwind. Note the sim does not drop payload mass mid-flight \u2014 for a true loaded/unloaded comparison, run this twice with different Payload Mass values.",
+  "reserve_percent": 25,
+  "rth_reserve_Wh": 10,
+  "diversion_reserve_Wh": 5,
+  "wind_direction_deg": 270,
+  "transient_dt_s": 0.5,
+  "max_accel_mps2": 2.0,
+  "max_decel_mps2": 2.5,
+  "decel_regen_eff": 0.0,
+  "phases": [
+    {
+      "name": "Takeoff climb (loaded)",
+      "speed": 0.0,
+      "duration": 35,
+      "altitude": 60,
+      "climb_rate_mps": 1.8
+    },
+    {
+      "name": "Outbound cruise",
+      "speed": 13.0,
+      "distance": 2500,
+      "altitude": 60,
+      "course_deg": 90
+    },
+    {
+      "name": "Descend to drop",
+      "speed": 0.0,
+      "duration": 40,
+      "altitude": 5,
+      "descent_rate_mps": 1.2
+    },
+    {
+      "name": "Hover and release",
+      "speed": 0.0,
+      "duration": 25,
+      "altitude": 5
+    },
+    {
+      "name": "Climb out",
+      "speed": 0.0,
+      "duration": 35,
+      "altitude": 60,
+      "climb_rate_mps": 1.8
+    },
+    {
+      "name": "Return cruise",
+      "speed": 13.0,
+      "distance": 2500,
+      "altitude": 60,
+      "course_deg": 270
+    },
+    {
+      "name": "Descend and land",
+      "speed": 0.0,
+      "duration": 45,
+      "altitude": 0,
+      "descent_rate_mps": 1.2
+    }
+  ]
+}

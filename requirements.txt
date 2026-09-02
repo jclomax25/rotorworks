@@ -1,5 +1,13 @@
+# Core simulation and plotting (required)
 numpy>=1.21
 scipy>=1.8
 pandas>=1.4
 matplotlib>=3.6
-reportlab>=4.0
+
+# Optional — feature-specific
+Pillow>=9.0        # photo loading in drag_coefficient_calculator.py
+openpyxl>=3.0      # "Export Excel" button
+reportlab>=3.6     # "Generate Report" (PDF) button
+
+# NOTE: tkinter ships with the Python standard library and is NOT a pip
+# install. On Debian/Ubuntu: sudo apt install python3-tk

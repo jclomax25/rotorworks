@@ -1,0 +1,92 @@
+{
+  "_comment": "Mapping mission: 3 km transit, four 2 km survey lines, 3 km home. Carries both a 15 Wh return-to-home and a 10 Wh diversion reserve on top of 25%.",
+  "reserve_percent": 25,
+  "rth_reserve_Wh": 15,
+  "diversion_reserve_Wh": 10,
+  "wind_direction_deg": 225,
+  "phases": [
+    {
+      "name": "Climb to survey altitude",
+      "speed": 17.0,
+      "duration": 120,
+      "altitude": 150,
+      "climb_rate_mps": 2.0
+    },
+    {
+      "name": "Transit to area",
+      "speed": 20.0,
+      "distance": 3000,
+      "altitude": 150,
+      "course_deg": 45
+    },
+    {
+      "name": "Survey line 1",
+      "speed": 18.0,
+      "distance": 2000,
+      "altitude": 150,
+      "course_deg": 90
+    },
+    {
+      "name": "Turn 1",
+      "speed": 17.0,
+      "duration": 18,
+      "altitude": 150,
+      "bank_deg": 25
+    },
+    {
+      "name": "Survey line 2",
+      "speed": 18.0,
+      "distance": 2000,
+      "altitude": 150,
+      "course_deg": 270
+    },
+    {
+      "name": "Turn 2",
+      "speed": 17.0,
+      "duration": 18,
+      "altitude": 150,
+      "bank_deg": 25
+    },
+    {
+      "name": "Survey line 3",
+      "speed": 18.0,
+      "distance": 2000,
+      "altitude": 150,
+      "course_deg": 90
+    },
+    {
+      "name": "Turn 3",
+      "speed": 17.0,
+      "duration": 18,
+      "altitude": 150,
+      "bank_deg": 25
+    },
+    {
+      "name": "Survey line 4",
+      "speed": 18.0,
+      "distance": 2000,
+      "altitude": 150,
+      "course_deg": 270
+    },
+    {
+      "name": "Transit home",
+      "speed": 20.0,
+      "distance": 3000,
+      "altitude": 150,
+      "course_deg": 225
+    },
+    {
+      "name": "Descend",
+      "speed": 17.0,
+      "duration": 100,
+      "altitude": 30,
+      "descent_rate_mps": 1.5
+    },
+    {
+      "name": "Approach and land",
+      "speed": 15.0,
+      "duration": 45,
+      "altitude": 0
+    }
+  ]
+}

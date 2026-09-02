@@ -1,0 +1,78 @@
+{
+  "_comment": "Fly a 1.5 km square circuit with 30-degree banked turns between legs. The banked turns raise load factor and stall speed \u2014 watch the Status tab.",
+  "reserve_percent": 20,
+  "rth_reserve_Wh": 0,
+  "diversion_reserve_Wh": 0,
+  "wind_direction_deg": 0,
+  "phases": [
+    {
+      "name": "Climb out",
+      "speed": 16.0,
+      "duration": 80,
+      "altitude": 100,
+      "climb_rate_mps": 2.0
+    },
+    {
+      "name": "Leg 1 north",
+      "speed": 19.0,
+      "distance": 1500,
+      "altitude": 100,
+      "course_deg": 0
+    },
+    {
+      "name": "Turn 1",
+      "speed": 18.0,
+      "duration": 12,
+      "altitude": 100,
+      "bank_deg": 30
+    },
+    {
+      "name": "Leg 2 east",
+      "speed": 19.0,
+      "distance": 1500,
+      "altitude": 100,
+      "course_deg": 90
+    },
+    {
+      "name": "Turn 2",
+      "speed": 18.0,
+      "duration": 12,
+      "altitude": 100,
+      "bank_deg": 30
+    },
+    {
+      "name": "Leg 3 south",
+      "speed": 19.0,
+      "distance": 1500,
+      "altitude": 100,
+      "course_deg": 180
+    },
+    {
+      "name": "Turn 3",
+      "speed": 18.0,
+      "duration": 12,
+      "altitude": 100,
+      "bank_deg": 30
+    },
+    {
+      "name": "Leg 4 west",
+      "speed": 19.0,
+      "distance": 1500,
+      "altitude": 100,
+      "course_deg": 270
+    },
+    {
+      "name": "Descend",
+      "speed": 17.0,
+      "duration": 70,
+      "altitude": 30,
+      "descent_rate_mps": 1.5
+    },
+    {
+      "name": "Approach and land",
+      "speed": 15.0,
+      "duration": 40,
+      "altitude": 0
+    }
+  ]
+}

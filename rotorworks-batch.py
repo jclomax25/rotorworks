@@ -516,14 +516,335 @@ def choose_best_result(
     raise ValueError(f"Unsupported objective: {objective}")
 
 
+# ============================================================
+# SIMPLE / ADVANCED PARAMETER TIERS
+# ============================================================
+# These mirror the Simple/Advanced toggle in the two GUIs, expressed in the
+# simulators' CLI argument names.
+#
+# The tier is a GUARD RAIL, not a physics switch: the simulators compute the
+# same numbers either way.  What it controls is which parameters this batch
+# driver will let you set or sweep.  In "simple" mode, touching an advanced
+# parameter is an error, so a beginner running a sizing study cannot silently
+# perturb an inflow-map breakpoint or a SoC curve and wonder why the answers
+# moved.  Use "advanced" to unlock everything.
+
+SIMPLE_ARGS_MULTICOPTER = {
+    # Airframe
+    "num_motors", "weight", "payload_mass_g", "speed", "area",
+    "motor_configuration", "coaxial_spacing_m", "max_tilt_deg",
+    "drag_model_mode", "parasite_drag", "parasite_area",
+    "profile_drag", "profile_area",
+    "body_length_m", "body_width_m", "body_height_m",
+    "arm_length_m", "arm_width_m",
+    # Battery
+    "battery_unit_mode", "battery_chemistry",
+    "battery_operating_voltage_min", "battery_operating_voltage_nominal",
+    "battery_operating_voltage_max",
+    "battery_cell_capacity", "battery_pack_capacity",
+    "battery_cell_weight_g", "battery_pack_weight_g",
+    "battery_series_units", "battery_parallel_units",
+    "battery_cells_series_per_unit", "battery_cells_parallel_per_unit",
+    "battery_discharge_percent", "battery_resistance_cell",
+    "battery_discharge_cont_A", "battery_discharge_c_cont",
+    # Motor
+    "motor_kv", "motor_resistance", "motor_idle_current",
+    "motor_max_current", "motor_max_power", "motor_weight",
+    # ESC
+    "esc_voltage_rating", "esc_cont_current", "esc_max_current", "esc_weight",
+    # Avionics (kept in Simple deliberately — rail loads matter for endurance)
+    "avionics_voltage_tree",
+    # Propeller
+    "prop_diameter", "prop_pitch", "prop_blades", "prop_table", "prop_weight",
+    "prop_max_thrust",
+    # Mission / environment
+    "mission", "orientation", "altitude", "temperature",
+    "wind", "wind_direction_deg", "course_deg", "reserve_percent",
+}
+
+SIMPLE_ARGS_FIXEDWING = {
+    # Airframe
+    "weight", "payload_mass_g", "num_motors", "cruise_speed",
+    "wing_span", "wing_area", "CD0", "CL_max", "oswald",
+    "mu_roll", "mu_brake", "CL_takeoff", "prop_efficiency",
+    # Battery
+    "battery_unit_mode", "battery_chemistry",
+    "battery_operating_voltage_min", "battery_operating_voltage_nominal",
+    "battery_operating_voltage_max",
+    "battery_cell_capacity", "battery_pack_capacity",
+    "battery_cell_weight_g", "battery_pack_weight_g",
+    "battery_series_units", "battery_parallel_units",
+    "battery_cells_series_per_unit", "battery_cells_parallel_per_unit",
+    "battery_discharge_percent", "battery_resistance_cell",
+    "battery_discharge_cont_A", "battery_discharge_c_cont",
+    "battery_soc_model",
+    # Motor
+    "motor_kv", "motor_resistance", "motor_idle_current",
+    "motor_max_current", "motor_max_power", "motor_weight",
+    # ESC
+    "esc_voltage_rating", "esc_cont_current", "esc_max_current", "esc_weight",
+    # Avionics (rail loads matter for an honest endurance figure)
+    "avionics_voltage_tree",
+    # Propeller
+    "prop_diameter", "prop_pitch", "prop_blades", "prop_table",
+    "prop_max_thrust", "prop_weight",
+    # Mission / environment
+    "mission", "altitude", "temperature",
+    "wind", "wind_direction_deg", "course_deg", "bank_deg", "reserve_percent",
+}
+
+
+def simple_args_for(sim: str) -> set:
+    """Return the Simple-tier CLI argument names for a simulator."""
+    return SIMPLE_ARGS_MULTICOPTER if sim == "multicopter" else SIMPLE_ARGS_FIXEDWING
+
+
+def enforce_mode(sim: str, mode: str, arg_names, context: str) -> None:
+    """
+    Reject advanced-tier parameters when running in simple mode.
+
+    `context` names where the offending parameter came from (a --set override,
+    a sweep variable, a design variable) so the message is actionable.
+    """
+    if str(mode).strip().lower() != "simple":
+        return
+    allowed = simple_args_for(sim)
+    offenders = sorted({str(a) for a in arg_names} - allowed)
+    if offenders:
+        raise SystemExit(
+            f"[mode=simple] These {context} are advanced-tier parameters for "
+            f"--sim {sim}:\n"
+            + "".join(f"  --{o}\n" for o in offenders)
+            + "Re-run with --mode advanced to use them, or drop them.\n"
+            "Simple mode restricts you to the same inputs the GUI shows in "
+            "its Simple view; it does not change the physics."
+        )
+
+
+# ============================================================
+# GUI CONFIG  ->  CLI ARGS
+# ============================================================
+# The GUIs save {"schema": ..., "vars": {...}, "avionics_*": [...]}, keyed by
+# GUI variable names.  The simulators' CLI uses different names.  These maps
+# let the batch driver consume the very same config files the GUI writes,
+# including the bundled examples in examples/configs/.
+
+GUI_TO_CLI_MULTICOPTER = {
+    "num_motors": "num_motors", "weight": "weight",
+    "payload_mass_g": "payload_mass_g", "area": "area", "speed": "speed",
+    "periph_current": "periph_current",
+    "motor_configuration": "motor_configuration",
+    "coaxial_spacing_m": "coaxial_spacing_m", "max_tilt_deg": "max_tilt_deg",
+    "drag_model_mode": "drag_model_mode",
+    "profile_drag": "profile_drag", "profile_area": "profile_area",
+    "parasite_drag": "parasite_drag", "parasite_area": "parasite_area",
+    "body_length_m": "body_length_m", "body_width_m": "body_width_m",
+    "body_height_m": "body_height_m", "arm_length_m": "arm_length_m",
+    "arm_width_m": "arm_width_m",
+    "batt_unit_mode": "battery_unit_mode", "batt_chem": "battery_chemistry",
+    "batt_vmin": "battery_operating_voltage_min",
+    "batt_vnom": "battery_operating_voltage_nominal",
+    "batt_vmax": "battery_operating_voltage_max",
+    "batt_cell_capacity": "battery_cell_capacity",
+    "batt_pack_capacity": "battery_pack_capacity",
+    "batt_cell_weight": "battery_cell_weight_g",
+    "batt_pack_weight": "battery_pack_weight_g",
+    "batt_energy_density": "battery_energy_density",
+    "batt_chg": "battery_charge_current_max",
+    "batt_a_cont": "battery_discharge_cont_A",
+    "batt_a_max": "battery_discharge_max_A",
+    "batt_c_cont": "battery_discharge_c_cont",
+    "batt_c_max": "battery_discharge_c_max",
+    "batt_dischg_pct": "battery_discharge_percent",
+    "batt_r": "battery_resistance_cell",
+    "batt_series": "battery_series_units",
+    "batt_parallel": "battery_parallel_units",
+    "batt_cells_series": "battery_cells_series_per_unit",
+    "batt_cells_parallel": "battery_cells_parallel_per_unit",
+    "batt_soc_model": "battery_soc_model",
+    "batt_soc_curve_csv": "battery_soc_curve_csv",
+    "batt_soc_bp": "battery_soc_bp",
+    "batt_ocv_cell_bp": "battery_ocv_cell_bp",
+    "batt_r_scale_bp": "battery_r_scale_bp",
+    "motor_kv": "motor_kv", "motor_i0": "motor_idle_current",
+    "motor_v0": "motor_idle_voltage", "motor_rated_v": "motor_rated_voltage",
+    "motor_r": "motor_resistance", "motor_imax": "motor_max_current",
+    "motor_pmax": "motor_max_power", "motor_pole_count": "motor_pole_count",
+    "motor_weight": "motor_weight", "motor_size": "motor_size",
+    "esc_voltage_rating": "esc_voltage_rating",
+    "esc_cont_current": "esc_cont_current",
+    "esc_max_current": "esc_max_current",
+    "esc_idle_current": "esc_idle_current",
+    "esc_r": "esc_resistance", "esc_weight": "esc_weight",
+    "avionics_voltage_tree": "avionics_voltage_tree",
+    "prop_d": "prop_diameter", "prop_pitch": "prop_pitch",
+    "prop_blades": "prop_blades", "prop_table": "prop_table",
+    "prop_max_rpm": "prop_max_rpm", "prop_max_thrust": "prop_max_thrust",
+    "prop_tconst": "prop_tconst", "prop_pconst": "prop_pconst",
+    "prop_weight": "prop_weight",
+    "mission": "mission", "orientation": "orientation",
+    "alt": "altitude", "temp": "temperature", "press": "pressure",
+    "wind": "wind", "wind_dir": "wind_direction_deg",
+    "course_deg": "course_deg",
+    "climb_rate": "climb_rate_mps", "descent_rate": "descent_rate_mps",
+    "reserve_percent": "reserve_percent",
+    "rth_reserve_Wh": "rth_reserve_Wh",
+    "diversion_reserve_Wh": "diversion_reserve_Wh",
+    "transient_dt_s": "transient_dt_s",
+    "max_accel_mps2": "max_accel_mps2", "max_decel_mps2": "max_decel_mps2",
+    "decel_regen_eff": "decel_regen_eff",
+    "inflow_map_enabled": "inflow_map_enabled",
+    "inflow_mu_bp": "inflow_mu_bp", "inflow_eff_bp": "inflow_eff_bp",
+}
+
+GUI_TO_CLI_FIXEDWING = {
+    "weight": "weight", "payload_mass_g": "payload_mass_g",
+    "num_motors": "num_motors", "cruise_speed": "cruise_speed",
+    "periph_cur": "periph_current",
+    "wing_span": "wing_span", "wing_area": "wing_area",
+    "CD0": "CD0", "CL_max": "CL_max", "oswald": "oswald",
+    "mu_roll": "mu_roll", "mu_brake": "mu_brake",
+    "CL_takeoff": "CL_takeoff", "prop_eff": "prop_efficiency",
+    "batt_unit_mode": "battery_unit_mode", "batt_chem": "battery_chemistry",
+    "batt_vmin": "battery_operating_voltage_min",
+    "batt_vnom": "battery_operating_voltage_nominal",
+    "batt_vmax": "battery_operating_voltage_max",
+    "batt_cell_cap": "battery_cell_capacity",
+    "batt_pack_cap": "battery_pack_capacity",
+    "batt_cell_wt": "battery_cell_weight_g",
+    "batt_pack_wt": "battery_pack_weight_g",
+    "batt_dens": "battery_energy_density",
+    "batt_chg": "battery_charge_current_max",
+    "batt_a_cont": "battery_discharge_cont_A",
+    "batt_a_max": "battery_discharge_max_A",
+    "batt_c_cont": "battery_discharge_c_cont",
+    "batt_c_max": "battery_discharge_c_max",
+    "batt_dischg_pct": "battery_discharge_percent",
+    "batt_r": "battery_resistance_cell",
+    "batt_series": "battery_series_units",
+    "batt_parallel": "battery_parallel_units",
+    "batt_cells_s": "battery_cells_series_per_unit",
+    "batt_cells_p": "battery_cells_parallel_per_unit",
+    "batt_soc_model": "battery_soc_model",
+    "batt_soc_curve_csv": "battery_soc_curve_csv",
+    "batt_soc_bp": "battery_soc_bp",
+    "batt_ocv_cell_bp": "battery_ocv_cell_bp",
+    "batt_r_scale_bp": "battery_r_scale_bp",
+    "motor_kv": "motor_kv", "motor_i0": "motor_idle_current",
+    "motor_v0": "motor_idle_voltage", "motor_rated_v": "motor_rated_voltage",
+    "motor_r": "motor_resistance", "motor_imax": "motor_max_current",
+    "motor_pmax": "motor_max_power", "motor_poles": "motor_pole_count",
+    "motor_wt": "motor_weight",
+    "esc_vrating": "esc_voltage_rating",
+    "esc_cont": "esc_cont_current",
+    "esc_max": "esc_max_current",
+    "esc_idle": "esc_idle_current",
+    "esc_r": "esc_resistance",
+    "esc_wt": "esc_weight",
+    "prop_d": "prop_diameter", "prop_pitch": "prop_pitch",
+    "prop_blades": "prop_blades", "prop_table": "prop_table",
+    "prop_maxrpm": "prop_max_rpm", "prop_maxthr": "prop_max_thrust",
+    "prop_tconst": "prop_tconst", "prop_pconst": "prop_pconst",
+    "prop_wt": "prop_weight", "motor_size": "motor_size",
+    "pressure": "pressure",
+    "mission": "mission", "altitude": "altitude", "temp": "temperature",
+    "wind": "wind", "wind_dir": "wind_direction_deg",
+    "course_deg": "course_deg", "bank_deg": "bank_deg",
+    "climb_rate": "climb_rate_mps", "descent_rate": "descent_rate_mps",
+    "reserve_percent": "reserve_percent",
+    "rth_reserve_Wh": "rth_reserve_Wh",
+    "diversion_reserve_Wh": "diversion_reserve_Wh",
+}
+
+
+def _avionics_rows_to_string(rows) -> Optional[str]:
+    """
+    Convert saved avionics rail rows into the simulator's
+    --avionics_voltage_tree string form:  "5.0:(2,0.9), 12.0:(1.5,0.85)".
+    """
+    parts = []
+    for r in rows or []:
+        try:
+            v = float(r["voltage"]); i = float(r["current"]); e = float(r["eff"])
+        except Exception:
+            continue
+        parts.append(f"{v:g}:({i:g},{e:g})")
+    return ", ".join(parts) if parts else None
+
+
+def load_gui_config(path: Optional[str], sim: str) -> Dict[str, Any]:
+    """
+    Load a GUI-saved configuration JSON and translate it into simulator CLI
+    arguments, so batch runs can reuse the exact configs the GUI produces
+    (including the bundled examples in examples/configs/).
+
+    Blank GUI fields are dropped rather than passed through as empty strings,
+    because the simulators treat "absent" and "empty" differently.
+    """
+    if not path:
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict) or "vars" not in data:
+        raise SystemExit(
+            f"{path} does not look like a GUI config file "
+            "(expected a top-level 'vars' object). "
+            "For a plain CLI-argument file use --base-args-file instead."
+        )
+
+    mapping = GUI_TO_CLI_MULTICOPTER if sim == "multicopter" else GUI_TO_CLI_FIXEDWING
+    out: Dict[str, Any] = {}
+    for gui_key, raw in (data.get("vars") or {}).items():
+        cli_key = mapping.get(gui_key)
+        if not cli_key:
+            continue                      # GUI-only field with no CLI equivalent
+        s = "" if raw is None else str(raw).strip()
+        if s == "":
+            continue                      # blank means "not supplied"
+        out[cli_key] = smart_cast(s)
+
+    # Avionics rails are stored structurally; fold them into the CLI string form.
+    rails = data.get("avionics_rails") or data.get("avionics_rows")
+    av = _avionics_rows_to_string(rails)
+    if av:
+        out["avionics_voltage_tree"] = av
+
+    return out
+
+
 def build_base_args(args: argparse.Namespace) -> Dict[str, Any]:
-    base = load_json_object(args.base_args_file)
-    base.update(parse_set_items(args.set or []))
+    """
+    Assemble the simulator CLI arguments for a run, lowest priority first:
+
+        1. --gui-config      a config JSON saved by either GUI (translated)
+        2. --base-args-file  a plain object of simulator CLI args
+        3. --set k=v         individual overrides
+
+    The chosen --mode is then enforced against the parameters the user named
+    explicitly (sources 2 and 3).  Keys coming from a GUI config are exempt:
+    that file describes a whole aircraft and legitimately carries advanced
+    fields, so rejecting it would make the bundled examples unusable in
+    simple mode.
+    """
+    mode = getattr(args, "mode", "advanced")
+
+    base: Dict[str, Any] = {}
+    base.update(load_gui_config(getattr(args, "gui_config", None), args.sim))
+
+    explicit = load_json_object(args.base_args_file)
+    explicit.update(parse_set_items(args.set or []))
+    enforce_mode(args.sim, mode, explicit.keys(), "explicitly supplied parameters")
+
+    base.update(explicit)
     return base
 
 
 def command_sweep(args: argparse.Namespace) -> int:
     base_args = build_base_args(args)
+    # The swept variable is the whole point of the run, so it must satisfy the
+    # chosen tier as well.
+    enforce_mode(args.sim, getattr(args, "mode", "advanced"),
+                 [args.sweep_var], "sweep variables")
     sim_script = resolve_sim_script(args.sim, args.sim_script)
 
     if args.values:
@@ -603,6 +924,12 @@ def command_size(args: argparse.Namespace) -> int:
     out_dir = ensure_dir(Path(args.output_dir))
 
     design_specs = args.design_var or []
+    # Design variables are set on every run, so they must satisfy the tier too.
+    enforce_mode(
+        args.sim, getattr(args, "mode", "advanced"),
+        [parse_design_var_spec(s)[0] for s in design_specs],
+        "design variables",
+    )
     if not design_specs:
         raise ValueError("At least one --design-var is required for sizing mode.")
 
@@ -713,6 +1040,12 @@ def command_batch(args: argparse.Namespace) -> int:
     out_dir = ensure_dir(Path(args.output_dir))
 
     runs_data = load_json_object(args.runs_file)
+    # Every override in the runs file is a parameter this batch will set.
+    _override_keys = set()
+    for _r in (runs_data.get("runs") or []):
+        _override_keys.update((_r.get("overrides") or {}).keys())
+    enforce_mode(args.sim, getattr(args, "mode", "advanced"),
+                 _override_keys, "run-file overrides")
     runs = runs_data.get("runs", None)
     if not isinstance(runs, list):
         raise ValueError("Runs JSON must contain {'runs': [...]} with list of run objects.")
@@ -802,6 +1135,21 @@ def make_parser() -> argparse.ArgumentParser:
         sp.add_argument("--sim", choices=["fixedwing", "multicopter"], required=True)
         sp.add_argument("--sim-script", default=None, help="Optional path to simulator script.")
         sp.add_argument("--base-args-file", default=None, help="JSON file with base CLI args object.")
+        sp.add_argument(
+            "--gui-config",
+            default=None,
+            help="Config JSON saved by the GUI (or one of examples/configs/*.json). "
+                 "Translated into simulator CLI arguments automatically.",
+        )
+        sp.add_argument(
+            "--mode",
+            choices=["simple", "advanced"],
+            default="advanced",
+            help="Which parameter tier this run may touch. 'simple' restricts you to "
+                 "the same inputs the GUI shows in Simple view and errors on anything "
+                 "advanced; 'advanced' (default) allows every parameter. This is a "
+                 "guard rail only - it never changes the physics or the results.",
+        )
         sp.add_argument(
             "--set",
             action="append",

@@ -1,0 +1,61 @@
+{
+  "_comment": "Takeoff, fly a 400 m square (one leg per compass heading), return to hover, land. With wind set, each leg sees a different head/cross component \u2014 a good way to see how wind direction changes leg-by-leg power.",
+  "reserve_percent": 20,
+  "rth_reserve_Wh": 0,
+  "diversion_reserve_Wh": 0,
+  "wind_direction_deg": 0,
+  "transient_dt_s": 0.5,
+  "max_accel_mps2": 2.0,
+  "max_decel_mps2": 2.5,
+  "decel_regen_eff": 0.0,
+  "phases": [
+    {
+      "name": "Takeoff climb",
+      "speed": 0.0,
+      "duration": 25,
+      "altitude": 40,
+      "climb_rate_mps": 1.6
+    },
+    {
+      "name": "Leg 1 north",
+      "speed": 10.0,
+      "distance": 400,
+      "altitude": 40,
+      "course_deg": 0
+    },
+    {
+      "name": "Leg 2 east",
+      "speed": 10.0,
+      "distance": 400,
+      "altitude": 40,
+      "course_deg": 90
+    },
+    {
+      "name": "Leg 3 south",
+      "speed": 10.0,
+      "distance": 400,
+      "altitude": 40,
+      "course_deg": 180
+    },
+    {
+      "name": "Leg 4 west",
+      "speed": 10.0,
+      "distance": 400,
+      "altitude": 40,
+      "course_deg": 270
+    },
+    {
+      "name": "Hover to position",
+      "speed": 0.0,
+      "duration": 20,
+      "altitude": 40
+    },
+    {
+      "name": "Descend and land",
+      "speed": 0.0,
+      "duration": 40,
+      "altitude": 0,
+      "descent_rate_mps": 1.0
+    }
+  ]
+}

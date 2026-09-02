@@ -1,0 +1,61 @@
+{
+  "_comment": "Diagnostic mission: two minutes at each of several speeds. Read the Mission Plots tab to see how power and current change with speed, and where your most efficient cruise actually is.",
+  "reserve_percent": 20,
+  "rth_reserve_Wh": 0,
+  "diversion_reserve_Wh": 0,
+  "wind_direction_deg": 0,
+  "transient_dt_s": 0.5,
+  "max_accel_mps2": 2.0,
+  "max_decel_mps2": 2.5,
+  "decel_regen_eff": 0.0,
+  "phases": [
+    {
+      "name": "Takeoff climb",
+      "speed": 0.0,
+      "duration": 20,
+      "altitude": 50,
+      "climb_rate_mps": 1.5
+    },
+    {
+      "name": "Hover reference",
+      "speed": 0.0,
+      "duration": 120,
+      "altitude": 50
+    },
+    {
+      "name": "Cruise 5 m/s",
+      "speed": 5.0,
+      "duration": 120,
+      "altitude": 50,
+      "course_deg": 0
+    },
+    {
+      "name": "Cruise 10 m/s",
+      "speed": 10.0,
+      "duration": 120,
+      "altitude": 50,
+      "course_deg": 0
+    },
+    {
+      "name": "Cruise 15 m/s",
+      "speed": 15.0,
+      "duration": 120,
+      "altitude": 50,
+      "course_deg": 0
+    },
+    {
+      "name": "Cruise 20 m/s",
+      "speed": 20.0,
+      "duration": 120,
+      "altitude": 50,
+      "course_deg": 0
+    },
+    {
+      "name": "Descend and land",
+      "speed": 0.0,
+      "duration": 35,
+      "altitude": 0,
+      "descent_rate_mps": 1.5
+    }
+  ]
+}

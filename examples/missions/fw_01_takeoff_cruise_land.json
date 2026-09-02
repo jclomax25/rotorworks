@@ -1,0 +1,35 @@
+{
+  "_comment": "Simplest fixed-wing mission: climb, cruise 8 km, descend, land. The fixed-wing equivalent of takeoff-hover-land.",
+  "reserve_percent": 20,
+  "rth_reserve_Wh": 0,
+  "diversion_reserve_Wh": 0,
+  "wind_direction_deg": 0,
+  "phases": [
+    {
+      "name": "Climb out",
+      "speed": 16.0,
+      "duration": 90,
+      "altitude": 120,
+      "climb_rate_mps": 2.0
+    },
+    {
+      "name": "Cruise",
+      "speed": 19.0,
+      "distance": 8000,
+      "altitude": 120
+    },
+    {
+      "name": "Descend",
+      "speed": 17.0,
+      "duration": 90,
+      "altitude": 30,
+      "descent_rate_mps": 1.5
+    },
+    {
+      "name": "Approach and land",
+      "speed": 15.0,
+      "duration": 45,
+      "altitude": 0
+    }
+  ]
+}

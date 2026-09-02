@@ -1,0 +1,90 @@
+{
+  "_comment": "Classic lawnmower mapping pattern: transit out, four survey lines at slow photo-capture speed with turns between, then transit home. Includes an 8 Wh return-to-home reserve on top of the 25% margin.",
+  "reserve_percent": 25,
+  "rth_reserve_Wh": 8,
+  "diversion_reserve_Wh": 0,
+  "wind_direction_deg": 45,
+  "transient_dt_s": 0.5,
+  "max_accel_mps2": 1.5,
+  "max_decel_mps2": 2.0,
+  "decel_regen_eff": 0.0,
+  "phases": [
+    {
+      "name": "Takeoff climb",
+      "speed": 0.0,
+      "duration": 40,
+      "altitude": 80,
+      "climb_rate_mps": 2.0
+    },
+    {
+      "name": "Transit to survey area",
+      "speed": 12.0,
+      "distance": 800,
+      "altitude": 80,
+      "course_deg": 45
+    },
+    {
+      "name": "Survey line 1",
+      "speed": 7.0,
+      "distance": 500,
+      "altitude": 80,
+      "course_deg": 90
+    },
+    {
+      "name": "Turn 1",
+      "speed": 4.0,
+      "distance": 40,
+      "altitude": 80,
+      "course_deg": 0
+    },
+    {
+      "name": "Survey line 2",
+      "speed": 7.0,
+      "distance": 500,
+      "altitude": 80,
+      "course_deg": 270
+    },
+    {
+      "name": "Turn 2",
+      "speed": 4.0,
+      "distance": 40,
+      "altitude": 80,
+      "course_deg": 0
+    },
+    {
+      "name": "Survey line 3",
+      "speed": 7.0,
+      "distance": 500,
+      "altitude": 80,
+      "course_deg": 90
+    },
+    {
+      "name": "Turn 3",
+      "speed": 4.0,
+      "distance": 40,
+      "altitude": 80,
+      "course_deg": 0
+    },
+    {
+      "name": "Survey line 4",
+      "speed": 7.0,
+      "distance": 500,
+      "altitude": 80,
+      "course_deg": 270
+    },
+    {
+      "name": "Return to home",
+      "speed": 12.0,
+      "distance": 800,
+      "altitude": 80,
+      "course_deg": 225
+    },
+    {
+      "name": "Descend and land",
+      "speed": 0.0,
+      "duration": 60,
+      "altitude": 0,
+      "descent_rate_mps": 1.5
+    }
+  ]
+}
