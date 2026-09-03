@@ -576,3 +576,53 @@ def test_clearing_the_baseline_empties_the_table(request, which):
     gui.pump()
     assert tree.get_children() == (), "Clear left rows behind"
 
+
+
+@pytest.mark.parametrize("which", ["mc", "fw"])
+def test_running_with_a_measured_table_loaded(request, which, paths):
+    """
+    Regression: the Status tab's table-range check referenced a metrics
+    variable that does not exist in the multicopter, raising
+    "name 'm' is not defined". It only fired when a table was actually
+    loaded, and no GUI test loaded one — so every test passed while the
+    feature was broken for exactly the users who had test data.
+    """
+    table = os.path.join(paths["root"], "tests", "data",
+                         "motor_prop_table.csv" if which == "mc"
+                         else "fw_motor_prop_table.csv")
+    assert os.path.exists(table), "sample table missing"
+
+    gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
+
+    # Drive the real user path: click the Browse button on the same grid row
+    # as the "Prop/Motor CSV table" label, with the file dialog stubbed to
+    # return our sample. Setting a StringVar directly is fragile because the
+    # entry lives in a nested frame beside the button.
+    widgets = gui.refresh()
+    label_row = None
+    for label in (w for w in widgets if isinstance(w, ttk.Label)):
+        if "CSV table" in str(label.cget("text")):
+            label_row = label.grid_info().get("row")
+            break
+    assert label_row is not None, "propeller CSV table label not found"
+
+    # The Browse button sits in the same frame as its label, though not
+    # necessarily on the same grid row (it shares a row with the entry).
+    label_widget = next(w for w in widgets if isinstance(w, ttk.Label)
+                        and "CSV table" in str(w.cget("text")))
+    browse = None
+    for button in (w for w in widgets if isinstance(w, ttk.Button)):
+        if "Browse" not in str(button.cget("text")):
+            continue
+        if button.master is label_widget.master or \
+                button.master.master is label_widget.master:
+            browse = button
+            break
+    assert browse is not None, "Browse button for the CSV table not found"
+
+    gui.set_open_dialog(table)
+    browse.invoke()
+    gui.pump()
+
+    errs = gui.click("Single-Point")
+    assert errs == [], f"running with a table raised: {errs[:1]}"

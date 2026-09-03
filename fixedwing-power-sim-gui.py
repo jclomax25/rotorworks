@@ -96,8 +96,8 @@ ramp_speed = core.ramp_speed
 
 # Build identifier. Shown in the title bar, the Output pane and Help > About
 # so you can always tell which copy of the script you are running.
-SIM_VERSION = "2.12.0"
-SIM_BUILD_NOTE = "Airspeed-dependent thrust available; climb rates corrected"
+SIM_VERSION = "2.12.2"
+SIM_BUILD_NOTE = "Table-path inflow double-count fixed; table range warnings"
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
@@ -5266,6 +5266,35 @@ def launch_gui():
         _ins_row(aero_tv, "Specific range",
                  f"{SR:.1f} m/Wh  ({SR/1000:.3f} km/Wh)", "—", "na",
                  "Higher = more distance per Wh — optimize at best-range speed")
+
+        # ---- Measured-table sanity -----------------------------------
+        # A table describes ONE propeller. Pairing it with a different prop,
+        # or running far outside the thrust it was measured over, silently
+        # turns every table-based number into a deep extrapolation.
+        _tbl = getattr(cfg.propeller, "table", None)
+        if _tbl is not None and "Thrust_g" in _tbl:
+            _t_lo = float(_tbl["Thrust_g"].min())
+            _t_hi = float(_tbl["Thrust_g"].max())
+            _n_mot = max(int(getattr(cfg, "num_motors", 1) or 1), 1)
+            # This simulator's status function names its metrics dict `m`.
+            _t_op = float(m.get("thrust_required_N", 0.0)) * 1000.0 / 9.80665 / _n_mot
+            _frac = (_t_op / _t_lo * 100.0) if _t_lo > 0 else 0.0
+            if _t_op < _t_lo:
+                _tag = "bad" if _frac < 50.0 else "warn"
+                _ins_row(aero_tv, "Table thrust range",
+                    f"operating at {_t_op:.0f} g ({_frac:.0f}% of table minimum)",
+                    f"{_t_lo:.0f}-{_t_hi:.0f} g measured", _tag,
+                    "Far below the tested range — table values are extrapolated. "
+                    "Check the table matches this propeller.")
+            elif _t_op > _t_hi:
+                _ins_row(aero_tv, "Table thrust range",
+                    f"operating at {_t_op:.0f} g (above table maximum)",
+                    f"{_t_lo:.0f}-{_t_hi:.0f} g measured", "bad",
+                    "Beyond the tested range — the motor may not deliver this.")
+            else:
+                _ins_row(aero_tv, "Table thrust range",
+                    f"operating at {_t_op:.0f} g",
+                    f"within {_t_lo:.0f}-{_t_hi:.0f} g measured", "ok")
 
         Re = float(m.get("reynolds_number", 0.0))
         re_tag = "ok" if Re >= 200000 else ("warn" if Re >= 70000 else "bad")

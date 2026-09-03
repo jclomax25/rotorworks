@@ -87,8 +87,8 @@ ramp_speed = core.ramp_speed
 
 # Build identifier. Shown in the title bar, the Output pane and Help > About
 # so you can always tell which copy of the script you are running.
-SIM_VERSION = "2.12.0"
-SIM_BUILD_NOTE = "Airspeed-dependent thrust available; climb rates corrected"
+SIM_VERSION = "2.12.2"
+SIM_BUILD_NOTE = "Table-path inflow double-count fixed; table range warnings"
 import matplotlib.pyplot as plt
 
 # -------------------------------
@@ -1606,9 +1606,32 @@ def power_required(config: DroneConfig,
         airspeed_for_inflow = max(float(speed_mps), 0.0)
 
     if config.propeller.table is not None:
-        # A measured table already embeds the real operating point, so no
-        # analytic inflow correction is applied on top of it.
-        motor_power_W = interpolate_motor_power(config, thrust_per_motor_N)
+        # A bench table is STATIC data, measured in hover. Reading it directly
+        # is right for hover and wrong at speed: it makes power depend on
+        # thrust alone, and since thrust only rises with tilt the power curve
+        # becomes monotonic. That removes the power bucket entirely and pins
+        # the best-endurance search to its lower bound.
+        #
+        # Use the table for what it genuinely measures — the combined
+        # motor+propeller efficiency at that thrust —
+        #
+        #     eta(T) = P_ideal_hover(T) / P_table(T)
+        #
+        # then apply it to the forward-flight ideal power. In hover the two
+        # forms coincide, so hover results are unchanged.
+        static_power_W = interpolate_motor_power(config, thrust_per_motor_N)
+        if airspeed_for_inflow > 0.5 and static_power_W > 0.0:
+            A = disk_area(config.propeller.diameter_in)
+            v_hover = math.sqrt(max(thrust_per_motor_N, 0.0) /
+                                max(2.0 * config.air_density * A, 1e-9))
+            ideal_hover = thrust_per_motor_N * v_hover
+            eta_measured = min(max(ideal_hover / static_power_W, 0.15), 0.90)
+            vi = induced_velocity_forward_flight(
+                v_hover, airspeed_for_inflow, incidence_rad)
+            v_through = airspeed_for_inflow * math.sin(incidence_rad)
+            motor_power_W = (thrust_per_motor_N * (v_through + vi)) / eta_measured
+        else:
+            motor_power_W = static_power_W
     elif config.motor.kv is not None:
         motor_power_W = motor_power_from_params(
             config, thrust_per_motor_N,
@@ -1688,13 +1711,19 @@ def _compute_operating_metrics_core(drone: DroneConfig,
     inflow_mult, mu_adv, eta_inflow = rotor_inflow_power_multiplier(
         drone, airspeed_mps=airspeed, rpm=rpm_est, orientation=orientation
     )
-    if orientation == "forward":
-        # Recompute propulsion power with inflow multiplier applied.
-        motor_power_W = power_required(drone, airspeed, orientation, inflow_multiplier=inflow_mult)
-        total_power_W, v_load, pack_current_A, esc_note, motor_I_esc_A = total_power_with_esc(
-            drone, motor_power_W=motor_power_W, periph_power_W=periph_power_W, soc=soc_eval
-        )
-        esc_loss_W = max(0.0, float(total_power_W) - float(motor_power_W) - float(periph_power_W))
+    # The inflow map is NOT applied on top of the power already computed.
+    #
+    # It dates from when power_required used the static hover induced velocity
+    # at every speed and needed an empirical correction. Since forward-flight
+    # inflow is now solved properly (Glauert), applying the map as well
+    # double-counts the same physics.
+    #
+    # It also only triggered when an RPM was available — i.e. only with a
+    # measured table — which made compute_operating_metrics disagree with
+    # estimate_flight_time_minutes by up to 10% for exactly those runs, so the
+    # reported endurance did not match the reported power.
+    #
+    # mu and eta_inflow are still computed and reported as diagnostics.
     tilt_req = required_tilt_deg(drone, airspeed, orientation)
 
     hover_thrust_total_N = thrust_required(drone, 0.0, "hover")
@@ -5141,6 +5170,36 @@ def launch_gui():
                 ">= 5 m/s",
                 "ok" if v_wind_max >= 8 else ("warn" if v_wind_max >= 4 else "bad"),
                 "Maximum wind the vehicle can hold position against")
+
+        # ---- Measured-table sanity -----------------------------------
+        # A table describes ONE propeller. Pairing it with a different prop,
+        # or running far outside the thrust it was measured over, silently
+        # turns every table-based number into a deep extrapolation.
+        _tbl = getattr(config.propeller, "table", None)
+        if _tbl is not None and "Thrust_g" in _tbl:
+            _t_lo = float(_tbl["Thrust_g"].min())
+            _t_hi = float(_tbl["Thrust_g"].max())
+            _n_mot = max(int(getattr(config, "num_motors", 1) or 1), 1)
+            # This simulator's status function names its metrics dict
+            # `metrics`; there is no `m` in scope here.
+            _t_op = float(metrics.get("thrust_per_motor_N", 0.0)) * 1000.0 / 9.80665
+            _frac = (_t_op / _t_lo * 100.0) if _t_lo > 0 else 0.0
+            if _t_op < _t_lo:
+                _tag = "bad" if _frac < 50.0 else "warn"
+                _insert_status_row(prop_table_tv, "Table thrust range",
+                    f"operating at {_t_op:.0f} g ({_frac:.0f}% of table minimum)",
+                    f"{_t_lo:.0f}-{_t_hi:.0f} g measured", _tag,
+                    "Far below the tested range — table values are extrapolated. "
+                    "Check the table matches this propeller.")
+            elif _t_op > _t_hi:
+                _insert_status_row(prop_table_tv, "Table thrust range",
+                    f"operating at {_t_op:.0f} g (above table maximum)",
+                    f"{_t_lo:.0f}-{_t_hi:.0f} g measured", "bad",
+                    "Beyond the tested range — the motor may not deliver this.")
+            else:
+                _insert_status_row(prop_table_tv, "Table thrust range",
+                    f"operating at {_t_op:.0f} g",
+                    f"within {_t_lo:.0f}-{_t_hi:.0f} g measured", "ok")
 
         sol = float(metrics.get("prop_solidity_sigma", float("nan")))
         if math.isfinite(sol):

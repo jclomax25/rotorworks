@@ -1,7 +1,7 @@
 # RotorWorks UAV Power Simulators
 
 **UASforge / dronefoundry**  
-*Simulators v2.12.0*
+*Simulators v2.12.2*
 
 A suite of cross-platform UAV powertrain performance tools:
 
@@ -665,7 +665,7 @@ sudo apt install python3-tk
 ### I do not see the Simple/Advanced selector or the `?` help markers
 
 You are running an older copy of the script. Check with **Help → About /
-Version** — this release is **v2.12.0**, and the version also appears in the
+Version** — this release is **v2.12.2**, and the version also appears in the
 window title bar and at the top of the Output pane on startup.
 
 From a terminal:
@@ -746,6 +746,36 @@ comparable — this is expected, not a regression.
   because propeller efficiency now varies with advance ratio.
 - Fixed-wing glide distance now uses Cruise Altitude rather than the field
   elevation.
+
+**v2.12.2**
+- **Fixed a crash on every multicopter run with a propeller table loaded.**
+  The Status tab's new table-range check referenced a metrics variable that
+  does not exist in the multicopter, raising `name 'm' is not defined`. It
+  only fired when a table was present, and no GUI test loaded one — so the
+  whole suite passed while the feature was broken for exactly the users who
+  had test data. There is now a GUI test that loads a table via the Browse
+  button and runs.
+
+**v2.12.1**
+- **Multicopter table runs double-counted the forward-flight inflow.** The
+  legacy empirical inflow map was still being applied on top of the Glauert
+  correction added in 2.6.0. It only triggered when an RPM was available —
+  that is, only with a measured table — so `compute_operating_metrics` and
+  `estimate_flight_time_minutes` disagreed by up to 10% for exactly those
+  runs, and reported endurance did not match reported power. The map is no
+  longer applied; advance ratio and inflow efficiency are still reported as
+  diagnostics.
+- **Multicopter table runs lost the power bucket.** Reading a static hover
+  table directly made power depend on thrust alone, so the curve rose
+  monotonically and best-endurance pinned to the search minimum. The table now
+  supplies the measured efficiency, which is applied to forward-flight
+  momentum theory — the same treatment the fixed-wing got in 2.11.0. Hover is
+  unchanged, since the two forms coincide there.
+- **New Status check: "Table thrust range".** Warns when the operating point
+  sits outside the thrust the table actually measured, and flags it red below
+  50% of the table minimum. Pairing a table with a different propeller is easy
+  to do by accident and silently turns every table figure into a deep
+  extrapolation.
 
 **v2.12.0**
 - **Fixed-wing thrust available now falls with airspeed.** It previously
