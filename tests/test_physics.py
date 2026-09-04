@@ -1069,3 +1069,210 @@ def test_thrust_available_never_exceeds_static(fw):
     static = fw.thrust_available_N(config, 0.0)
     for v in range(0, 70, 5):
         assert fw.thrust_available_N(config, float(v)) <= static + 1e-9
+
+
+# ======================================================================
+# FIGURES MUST NOT LEAK
+# ======================================================================
+
+def test_embedded_figures_do_not_enter_the_pyplot_registry(fw, fw_plane, mc, mc_quad):
+    """
+    Regression: figures for the GUI were built with pyplot.subplots(), which
+    keeps every one alive in a module-level registry until something closes
+    it. Nothing ever did, so a long GUI session accumulated figures
+    indefinitely and matplotlib warned "More than 20 figures have been
+    opened".
+
+    Embedded figures are now built directly from matplotlib.figure.Figure, so
+    they are freed with their canvas.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    plt.close("all")
+    assert plt.get_fignums() == []
+
+    for _ in range(15):
+        fw.make_performance_figure(fw_plane, max_speed=35, figsize=(8, 6))
+        fw.make_airframe_diagram_figure(fw_plane, figsize=(6, 5))
+        mc.make_performance_figure(mc_quad, max_speed=20, figsize=(8, 6))
+        mc.make_airframe_diagram_figure(mc_quad, figsize=(6, 5))
+
+    assert plt.get_fignums() == [], (
+        f"{len(plt.get_fignums())} figures retained after 60 builds — "
+        "an embedded figure is going through pyplot again")
+
+
+def test_make_figure_matches_pyplot_subplots_shape():
+    """
+    The helper stands in for pyplot.subplots(), so its return shape must match
+    — including the squeeze behaviour call sites depend on.
+    """
+    import numpy as np
+    import sys as _sys
+    _root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    if _root not in _sys.path:
+        _sys.path.insert(0, _root)
+    import rotorworks_core as core
+
+    fig, ax = core.make_figure()
+    assert not isinstance(ax, np.ndarray), "single subplot should not be an array"
+
+    fig, axes = core.make_figure(1, 2, figsize=(6, 3))
+    assert axes.shape == (2,)
+
+    fig, axes = core.make_figure(2, 3, figsize=(6, 4))
+    assert axes.shape == (2, 3)
+
+
+def test_figures_still_render_after_the_registry_change(fw, fw_plane):
+    """The helper must produce working figures, not just leak-free ones."""
+    figure = fw.make_performance_figure(fw_plane, max_speed=35, figsize=(8, 6))
+    assert figure is not None
+    assert len(figure.axes) >= 4, "performance figure lost its panels"
+    for axis in figure.axes:
+        assert axis.get_xlabel() or axis.get_title() or axis.lines, \
+            "an empty panel was produced"
+
+
+# ======================================================================
+# WIND DURING A MISSION
+# ======================================================================
+
+def _heavy_lift(mc):
+    batt = mc.BatteryConfig(
+        chemistry="LiPo", operating_voltage_min=3.3,
+        operating_voltage_nominal=3.7, operating_voltage_max=4.2,
+        unit_mode="pack", pack_capacity_mAh=16000, pack_weight_g=2100,
+        series_units=2, parallel_units=1, cells_series_per_unit=6,
+        discharge_percent=80, resistance_cell_mOhm=3.0, discharge_c_cont=15)
+    drone = mc.DroneConfig(
+        num_motors=8, battery=batt,
+        motor=mc.MotorConfig(kv=170, idle_current=0.6, idle_voltage=10,
+                             rated_voltage=12, resistance=0.045,
+                             max_current=45, max_power=2000, weight_g=410),
+        propeller=mc.PropellerConfig(diameter_in=22, pitch_in=7.2, max_rpm=0,
+                                     max_thrust_g=9500, blades=2, weight_g=110),
+        drone_weight_g=11500,
+        profile_drag_coefficient=None, profile_area=None,
+        parasite_drag_coefficient=None, parasite_area=None, frontal_area=None,
+        cruise_speed=8.0, periph_current=0.5,
+        motor_configuration="coaxial", coaxial_spacing_m=0.10, max_tilt_deg=20,
+        body_length_m=0.45, body_width_m=0.40, body_height_m=0.20,
+        arm_length_m=0.40, arm_width_m=0.030)
+    drone.air_density = mc.compute_air_density(0)
+    drone.derive_drag_from_geometry_if_missing()
+    return drone
+
+
+def _square_mission(mc, tmp_path, speed=10.0):
+    import json
+    payload = {"wind_direction_deg": 0, "phases": [
+        {"name": "Takeoff", "speed": 0.0, "duration": 25, "altitude": 40},
+        {"name": "North", "speed": speed, "distance": 400, "altitude": 40, "course_deg": 0},
+        {"name": "East", "speed": speed, "distance": 400, "altitude": 40, "course_deg": 90},
+        {"name": "South", "speed": speed, "distance": 400, "altitude": 40, "course_deg": 180},
+        {"name": "West", "speed": speed, "distance": 400, "altitude": 40, "course_deg": 270},
+    ]}
+    path = tmp_path / "square.json"
+    path.write_text(json.dumps(payload))
+    return mc.MissionProfile.from_json(str(path))
+
+
+def test_wind_does_not_abort_a_flyable_leg(mc, tmp_path):
+    """
+    Regression: a distance leg starting from a hover has an airspeed below the
+    headwind for the first second or two of its acceleration ramp, so its
+    instantaneous groundspeed is zero. The guard judged the phase on that
+    instant and reported "zero groundspeed with distance phase", killing a
+    perfectly flyable 10 m/s leg into a 3 m/s headwind (7 m/s steady
+    groundspeed).
+    """
+    drone = _heavy_lift(mc)
+    mission = _square_mission(mc, tmp_path, speed=10.0)
+    results, _worst, _series = mc.simulate_mission(drone, mission, wind_mps=3.0)
+    for name, _t, _d, status in results:
+        assert "Invalid" not in status, f"{name}: {status}"
+
+
+def test_wind_still_blocks_a_genuinely_impossible_leg(mc, tmp_path):
+    """A headwind above the commanded airspeed must still be reported."""
+    drone = _heavy_lift(mc)
+    mission = _square_mission(mc, tmp_path, speed=10.0)
+    results, _worst, _series = mc.simulate_mission(drone, mission, wind_mps=15.0)
+    statuses = [s for _n, _t, _d, s in results]
+    assert any("Invalid" in s for s in statuses), \
+        "a 15 m/s headwind on a 10 m/s leg should be impossible"
+
+
+def test_leg_times_order_correctly_by_heading(mc, tmp_path):
+    """
+    Into wind is slowest, downwind fastest, and the two crosswind legs match.
+    A wind model that is wired up incorrectly rarely gets all three right.
+    """
+    drone = _heavy_lift(mc)
+    mission = _square_mission(mc, tmp_path, speed=10.0)
+    results, _worst, _series = mc.simulate_mission(drone, mission, wind_mps=3.0)
+    times = {name: t for name, t, _d, _s in results}
+
+    assert times["North"] > times["East"] > times["South"], \
+        f"headings not ordered by wind: {times}"
+    assert times["East"] == pytest.approx(times["West"], rel=0.05), \
+        "the two crosswind legs should take about the same time"
+
+
+# ======================================================================
+# HOVER-ATTITUDE THRUST AND THRUST-TO-WEIGHT
+# ======================================================================
+
+def test_hover_thrust_equals_weight_at_zero_speed(mc, mc_quad):
+    """At rest there is no drag, so thrust must be exactly the weight."""
+    weight_N = mc_quad.drone_weight_g * 9.81 / 1000.0
+    assert mc.thrust_required(mc_quad, 0.0, "hover") == pytest.approx(weight_N, rel=1e-9)
+
+
+def test_hover_drag_adds_in_quadrature_not_linearly(mc, mc_quad):
+    """
+    Regression: hover thrust was weight + drag. Drag is HORIZONTAL and weight
+    is vertical, so they combine as a vector magnitude. The linear sum
+    overstated thrust badly at speed — on a 16.5 kg X8 at 18 m/s it gave
+    187 N against a true 164 N.
+    """
+    weight_N = mc_quad.drone_weight_g * 9.81 / 1000.0
+    for speed in (5.0, 10.0, 18.0):
+        drag_N = mc.drag_force_required(mc_quad, speed, "hover")
+        got = mc.thrust_required(mc_quad, speed, "hover")
+        assert got == pytest.approx(math.hypot(weight_N, drag_N), rel=1e-9)
+        assert got < weight_N + drag_N, "linear sum is back"
+
+
+def test_hover_thrust_rises_only_slightly_with_speed(mc, mc_quad):
+    """
+    Because drag adds in quadrature and is small next to weight, the
+    hover-attitude curve should be nearly flat — not the steep rise the
+    linear sum produced.
+    """
+    at_rest = mc.thrust_required(mc_quad, 0.0, "hover")
+    at_speed = mc.thrust_required(mc_quad, 18.0, "hover")
+    assert at_speed >= at_rest
+    assert at_speed < 1.15 * at_rest, "hover-attitude thrust rises too steeply"
+
+
+def test_thrust_to_weight_uses_available_thrust(mc, mc_quad):
+    """
+    Regression: thrust-to-weight compared REQUIRED thrust with weight, which
+    is ~1 by definition in steady flight and told a designer nothing. It must
+    compare what the propulsion system CAN produce.
+    """
+    weight_N = mc_quad.drone_weight_g * 9.81 / 1000.0
+    available_N = mc.available_total_thrust_N(mc_quad)
+    assert available_N > 0, "the reference quad should have a thrust limit"
+
+    twr = available_N / weight_N
+    assert twr > 1.5, f"available TWR {twr:.2f} is implausibly low for this quad"
+
+    required_N = mc.compute_operating_metrics(mc_quad, 0.0, "hover")["thrust_total_N"]
+    assert required_N / weight_N == pytest.approx(1.0, abs=0.02), \
+        "required thrust over weight should sit at 1 in hover, which is why it " \
+        "is useless as a design metric"

@@ -96,7 +96,7 @@ ramp_speed = core.ramp_speed
 
 # Build identifier. Shown in the title bar, the Output pane and Help > About
 # so you can always tell which copy of the script you are running.
-SIM_VERSION = "2.12.2"
+SIM_VERSION = "2.16.0"
 SIM_BUILD_NOTE = "Table-path inflow double-count fixed; table range warnings"
 import matplotlib
 import matplotlib.pyplot as plt
@@ -2169,7 +2169,7 @@ def make_performance_figure(config: FixedWingConfig,
         CDs.append(CD)
         LDs.append(af.ld_ratio(CL))
 
-    fig, axes = plt.subplots(2, 3, figsize=figsize)
+    fig, axes = core.make_figure(2, 3, figsize=figsize)
     fig.suptitle("Fixed-Wing UAV Performance", fontsize=13, fontweight="bold")
 
     # ---- 1. Time & Range ----
@@ -2261,7 +2261,7 @@ def make_airframe_diagram_figure(config: "FixedWingConfig", figsize: tuple = (9,
     past_tip = layout["tip_overhang_m"] > 0
     disc_colour = "#C62828" if (overlap or past_tip) else "#2E7D32"
 
-    fig, ax = _plt.subplots(figsize=figsize)
+    fig, ax = core.make_figure(figsize=figsize)
 
     # Conventional plan view: span across X, chord down Y, nose toward -Y.
     ax.add_patch(_Rectangle((-span / 2.0, -chord / 2.0), span, chord,
@@ -2346,7 +2346,7 @@ def make_motor_operating_point_figure(config: FixedWingConfig, metrics: dict, fi
     """
     if config.propeller.table is None:
         # Return empty figure if no propeller table
-        fig, ax = plt.subplots(1, 1, figsize=figsize)
+        fig, ax = core.make_figure(1, 1, figsize=figsize)
         ax.text(0.5, 0.5, "Propeller table not available\nCannot plot operating curves",
                 ha="center", va="center", transform=ax.transAxes, fontsize=12)
         ax.axis("off")
@@ -2355,7 +2355,7 @@ def make_motor_operating_point_figure(config: FixedWingConfig, metrics: dict, fi
     df = config.propeller.table
     thrust_N = float(metrics.get("thrust_required_N", 0.0))
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+    fig, (ax1, ax2) = core.make_figure(1, 2, figsize=figsize)
     
     # Get data from propeller table
     thrust_g = df["Thrust_g"].values if "Thrust_g" in df.columns else []
@@ -2995,7 +2995,16 @@ def _export_excel_file(path: str, sweep: dict, metrics: list, weight_budget: lis
 def _generate_pdf_report(path: str, report_title: str,
                           inputs_rows: list, metrics_rows: list,
                           status_sections: list, log_text: str,
-                          figures: list, weight_budget: list) -> None:
+                          figures: list, weight_budget: list,
+                          extra_sections: Optional[list] = None) -> None:
+    """
+    Build the PDF report.
+
+    `extra_sections` is a list of (title, headers, rows) tuples appended after
+    the weight budget — used for the sensitivity sweep and the comparison
+    against a pinned baseline, so a report captures the whole analysis rather
+    than only the single operating point.
+    """
     from reportlab.lib.pagesizes import A4
     from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
                                     Table, TableStyle, PageBreak, Image,
@@ -3114,6 +3123,25 @@ def _generate_pdf_report(path: str, report_title: str,
         for line in log_text.splitlines():
             safe = line.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
             story.append(Paragraph(safe or " ", mono))
+    # Extra analysis sections: sensitivity and baseline comparison.
+    for _title, _headers, _rows in (extra_sections or []):
+        if not _rows:
+            continue
+        story.append(PageBreak())
+        story.append(Paragraph(_title, sH1))
+        _data = [list(_headers)] + [list(r) for r in _rows]
+        _tbl = Table(_data, hAlign="LEFT")
+        _tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("GRID", (0, 0), (-1, -1), 0.25, DGREY),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LGREY]),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(_tbl)
+
     doc.build(story)
 
 
@@ -4617,6 +4645,7 @@ def launch_gui():
             messagebox.showinfo("Compare", "Run a single point first.")
             return
         _cmp_state["baseline"] = metrics
+        _cmp_state["from_mission"] = bool(_last_run.get("from_mission"))
         label = str(v_loaded_cfg.get())
         _cmp_state["label"] = label
         v_cmp_baseline.set(f"{label}  (pinned)")
@@ -4638,6 +4667,17 @@ def launch_gui():
             return
         current = _current_comparison_metrics()
         if not current:
+            return
+        # A mission's worst-case point and a single-point run are different
+        # quantities; comparing them would produce differences that look like
+        # design changes but are just a change of run type.
+        if bool(_cmp_state.get("from_mission")) != bool(_last_run.get("from_mission")):
+            cmp_tv.insert("", "end", tags=("flat",), values=(
+                "Baseline is a "
+                + ("mission" if _cmp_state.get("from_mission") else "single-point")
+                + " run; current is a "
+                + ("mission" if _last_run.get("from_mission") else "single-point")
+                + " run.", "—", "—", "—", "re-pin to compare like with like"))
             return
         rows = core.compare_metric_sets(
             base, current, [(k, lbl, d) for k, lbl, d, _ in _CMP_KEYS])
@@ -4931,7 +4971,7 @@ def launch_gui():
         totals = [r[3] for r in data_rows]
         grand  = sum(totals)
         COLORS = ["#2E75B6","#ED7D31","#A9D18E","#FFC000","#5B9BD5","#FF7F7F"]
-        fig, axes = _plt.subplots(1, 2, figsize=(7, max(3, len(labels)*0.6+1)))
+        fig, axes = core.make_figure(1, 2, figsize=(7, max(3, len(labels)*0.6+1)))
         fig.patch.set_facecolor("white")
         ax = axes[0]
         left_ = 0.0
@@ -5787,8 +5827,10 @@ def launch_gui():
             # Cache for View-menu re-render
             _last_run["cfg"]     = cfg
             _last_run["max_v"]   = max_v
+            refresh_comparison()
             # Needed by the Sensitivity tab, which re-evaluates this point.
             _last_run["speed"]   = V_cruise
+            _last_run["from_mission"] = False
             _last_run["metrics"] = m
             _last_run["wind"]    = wind_speed
 
@@ -5916,6 +5958,8 @@ def launch_gui():
             # Populate status with worst-case metrics
             if worst_m:
                 update_status(cfg, worst_m)
+                _last_run["metrics"] = dict(worst_m)
+                _last_run["from_mission"] = True
 
             # Rebuild metrics from worst-case point
             if worst_m:
@@ -6065,6 +6109,28 @@ def launch_gui():
                 if fig not in figs:
                     figs.append(fig)
             wb   = _extract_weight_budget(cfg) if cfg else []
+            # The airframe diagram has its own canvas, so add it explicitly.
+            _ad = _ad_canvas.get("widget")
+            if _ad is not None and _ad.figure not in figs:
+                figs.append(_ad.figure)
+
+            # Tabular analysis: whatever is on the Sensitivity and Compare
+            # tabs right now. Empty tabs contribute nothing.
+            def _tree_rows(tree):
+                return [list(tree.item(i, "values")) for i in tree.get_children("")]
+
+            _extra = []
+            _sens_rows = _tree_rows(sens_tv)
+            if _sens_rows:
+                _extra.append(("Sensitivity",
+                               ["Input", "-20%", "-10%", "baseline",
+                                "+10%", "+20%", "swing"], _sens_rows))
+            _cmp_rows = _tree_rows(cmp_tv)
+            if _cmp_rows:
+                _extra.append(("Comparison against pinned baseline",
+                               ["Metric", "Baseline", "Current",
+                                "Change", "Change %"], _cmp_rows))
+
             _generate_pdf_report(
                 path            = path,
                 report_title    = _report_title,
@@ -6074,6 +6140,7 @@ def launch_gui():
                 log_text        = _get_log_text(),
                 figures         = figs,
                 weight_budget   = wb,
+                extra_sections = _extra,
             )
             messagebox.showinfo("Report generated", f"PDF report saved to:\n{path}")
         except Exception as e:

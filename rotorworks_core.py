@@ -59,6 +59,8 @@ __all__ = [
     "pack_voltage_under_load", "soc_after_energy_draw",
     # wind
     "wind_components_mps", "groundspeed_along_track_mps",
+    # rotor inflow
+    "induced_velocity_forward_flight",
     # transient flight
     "kinetic_power_term_W", "ramp_speed",
     # thermal
@@ -69,6 +71,11 @@ __all__ = [
     "sensitivity_sweep", "compare_metric_sets", "format_delta",
     # airframe diagram geometry
     "regular_polygon_vertices", "rotor_ring_layout", "wing_rotor_positions",
+    # propeller coefficients
+    "estimate_prop_thrust_coefficient", "estimate_prop_power_coefficient",
+    "rpm_from_thrust",
+    # figures
+    "make_figure",
     # GUI
     "Tooltip",
 ]
@@ -451,6 +458,76 @@ def groundspeed_along_track_mps(airspeed_mps: float,
 
 
 # ============================================================
+# ROTOR INFLOW
+# ============================================================
+
+def induced_velocity_forward_flight(v_hover: float,
+                                    airspeed_mps: float,
+                                    disk_incidence_rad: float = 0.0,
+                                    iters: int = 40) -> float:
+    """
+    Rotor induced velocity in forward flight (Glauert's momentum theory).
+
+    A hovering rotor must accelerate still air, so it works hard:
+        v_h = sqrt( T / (2 * rho * A) )
+
+    Once the vehicle is moving, the rotor meets air that is ALREADY moving,
+    so far less velocity has to be added and induced power falls sharply.
+    Glauert's relation for a rotor at incidence alpha to the freestream is:
+
+        vi = v_h^2 / sqrt( (V*cos a)^2 + (V*sin a + vi)^2 )
+
+    Special cases this reduces to:
+      * V = 0            ->  vi = v_h                     (hover)
+      * a = 90 deg       ->  vi = -V/2 + sqrt((V/2)^2 + v_h^2)
+                                                          (axial / propeller)
+      * a = 0 deg        ->  vi = v_h^2 / sqrt(V^2 + vi^2)
+                                                          (edgewise / multirotor)
+
+    A multicopter in forward flight sits near the edgewise case: its rotors
+    stay nearly horizontal and only tilt by the angle needed to balance drag,
+    so the freestream is almost in the disk plane.
+
+    Why this matters
+    ----------------
+    Using the hover value at all speeds overstates induced power by roughly
+    2x at 10 m/s and 4x at 20 m/s for a typical quad.  That removes the
+    "power bucket" — the 10-25% dip below hover power that real multirotors
+    show around 8-14 m/s — and leaves a monotonically rising power curve.
+    With no minimum in the curve, best-endurance and best-range speed
+    searches simply pin to the ends of their search range.
+
+    This returns vi only.  Shaft power is then
+        P = T * (V*sin(a) + vi)
+    where the first term is the propulsive power overcoming airframe drag.
+
+    Solved by damped fixed-point iteration, which converges quickly because
+    the right-hand side is a contraction for all physical inputs.
+    """
+    vh = max(float(v_hover), 0.0)
+    V = max(float(airspeed_mps), 0.0)
+    if vh <= 0.0:
+        return 0.0
+    if V <= 1e-9:
+        return vh                       # hover
+
+    a = float(disk_incidence_rad)
+    v_par = V * math.cos(a)             # in-plane component
+    v_perp = V * math.sin(a)            # through-disk component
+
+    vi = vh                             # start from the hover value
+    for _ in range(max(int(iters), 1)):
+        denom = math.sqrt(v_par ** 2 + (v_perp + vi) ** 2)
+        vi_new = (vh ** 2) / max(denom, 1e-9)
+        # Damping keeps the iteration stable near the vortex-ring region.
+        vi_next = 0.5 * (vi + vi_new)
+        if abs(vi_next - vi) < 1e-9:
+            vi = vi_next
+            break
+        vi = vi_next
+    return max(vi, 0.0)
+
+# ============================================================
 # TRANSIENT FLIGHT (acceleration and deceleration)
 # ============================================================
 
@@ -799,6 +876,119 @@ def format_delta(value: Optional[float], decimals: int = 2) -> str:
     if value is None or not math.isfinite(float(value)):
         return "—"
     return f"{float(value):+.{decimals}f}"
+
+
+# ============================================================
+# PROPELLER COEFFICIENTS
+# ============================================================
+
+def estimate_prop_thrust_coefficient(diameter_in: float,
+                                     pitch_in: float,
+                                     blades: int = 2) -> float:
+    """
+    Estimate a propeller's static thrust coefficient C_T.
+
+        T = C_T * rho * n^2 * D^4      (n in rev/s, D in metres)
+
+    Why an estimate is needed at all
+    --------------------------------
+    Thrust alone does NOT determine RPM. Two propellers of the same diameter
+    producing identical thrust turn at different speeds depending on their
+    pitch and blade area. Without either a measured table or a thrust
+    coefficient, RPM — and everything derived from it: back-EMF, mechanical
+    power, motor efficiency, throttle — is genuinely underdetermined.
+
+    This fit gives a usable default so those figures read as numbers rather
+    than NaN. It is a rough approximation of typical APC-style UAV
+    propellers: C_T rises with pitch/diameter, and with blade count through
+    solidity. Expect **+/-30%**, which propagates directly into RPM as
+    +/-15% (RPM goes as 1/sqrt(C_T)).
+
+    Supply `TConst` explicitly, or load a measured table, whenever accuracy
+    matters. Both take priority over this estimate.
+    """
+    d_in = max(float(diameter_in), 1e-6)
+    p_over_d = max(float(pitch_in), 0.0) / d_in
+
+    # Base fit against pitch/diameter, over the range real UAV props occupy.
+    c_t = 0.10 + 0.10 * min(max(p_over_d, 0.2), 0.9)
+
+    # Blade count enters through solidity. Thrust per blade falls slightly as
+    # blades are added, so the total scales less than linearly.
+    n_blades = max(int(blades or 2), 1)
+    c_t *= (n_blades / 2.0) ** 0.8
+
+    return min(max(c_t, 0.05), 0.30)
+
+
+def estimate_prop_power_coefficient(c_t: float,
+                                    figure_of_merit: float = 0.65) -> float:
+    """
+    Power coefficient consistent with a given thrust coefficient.
+
+        P = C_P * rho * n^3 * D^5
+
+    Derived from momentum theory rather than fitted separately, so the two
+    coefficients cannot drift into disagreement:
+
+        C_P_ideal = C_T^1.5 / sqrt(2)      (per unit disc area)
+
+    divided by a figure of merit for real losses. FM 0.65 is typical of a
+    decent UAV propeller in hover; 0.75+ is a very good one.
+    """
+    ct = max(float(c_t), 1e-6)
+    fm = min(max(float(figure_of_merit), 0.2), 0.95)
+    return (ct ** 1.5) / math.sqrt(2.0) / fm
+
+
+def rpm_from_thrust(thrust_N: float, diameter_m: float, rho: float,
+                    c_t: float) -> Optional[float]:
+    """
+    Propeller speed implied by a thrust, from  T = C_T * rho * n^2 * D^4.
+
+    Returns RPM, or None when the inputs cannot give an answer.
+    """
+    d = float(diameter_m)
+    if thrust_N is None or d <= 0 or rho <= 0 or c_t <= 0:
+        return None
+    t = max(float(thrust_N), 0.0)
+    if t <= 0:
+        return 0.0
+    n_rev_s = math.sqrt(t / (float(c_t) * float(rho) * d ** 4))
+    return n_rev_s * 60.0
+
+
+# ============================================================
+# FIGURES
+# ============================================================
+
+def make_figure(nrows: int = 1, ncols: int = 1, figsize=None, **kwargs):
+    """
+    Create a Figure and its axes WITHOUT entering pyplot's global registry.
+
+    `pyplot.subplots()` keeps every figure it makes alive in a module-level
+    registry until something explicitly closes it. In a long-lived GUI that
+    redraws on each run, nothing ever does — so figures accumulate for the
+    life of the session and matplotlib eventually warns:
+
+        More than 20 figures have been opened...
+
+    Building the Figure directly avoids the registry entirely, so an embedded
+    figure is freed as soon as its canvas is destroyed, which is exactly the
+    lifetime a Tk-embedded plot should have.
+
+    The return signature matches pyplot.subplots(), including its squeeze
+    behaviour, so call sites need only swap the constructor.
+
+    Interactive CLI plotting still uses pyplot: there the registry is doing
+    its job, because plt.show() needs to find the figures.
+    """
+    from matplotlib.figure import Figure
+
+    fig = Figure(figsize=figsize, **kwargs)
+    if nrows == 1 and ncols == 1:
+        return fig, fig.subplots()
+    return fig, fig.subplots(nrows, ncols)
 
 
 # ============================================================

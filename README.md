@@ -1,15 +1,16 @@
 # RotorWorks UAV Power Simulators
 
 **UASforge / dronefoundry**  
-*Simulators v2.12.2*
+*Simulators v2.16.0*
 
 A suite of cross-platform UAV powertrain performance tools:
 
 | Tool | What it does |
 |---|---|
-| `rotorworks_core.py` | Shared code both simulators import — **must sit beside them** |
+| `rotorworks_core.py` | Shared code all simulators import — **must sit beside them** |
 | `multicopter-power-sim-gui.py` | Multicopter performance simulator (GUI + CLI) |
 | `fixedwing-power-sim-gui.py` | Fixed-wing performance simulator (GUI + CLI) |
+| `vtol-power-sim-gui.py` | VTOL simulator, lift+cruise (GUI + CLI) — **new, v0.1.0** |
 | `rotorworks-batch.py` | Batch driver: parameter sweeps, sizing studies, scripted runs |
 | `drag_coefficient_calculator.py` | Measures drag coefficients from photographs |
 
@@ -665,7 +666,46 @@ sudo apt install python3-tk
 ### I do not see the Simple/Advanced selector or the `?` help markers
 
 You are running an older copy of the script. Check with **Help → About /
-Version** — this release is **v2.12.2**, and the version also appears in the
+Version** — this release is **VTOL simulator v0.1.0** (new file, versioned separately)
+- `vtol-power-sim-gui.py` — **lift+cruise only**. Reuses the rotor model from
+  the multicopter and the wing model from the fixed-wing, both through
+  `rotorworks_core`, and adds the part neither has: the transition, where the
+  wing and the rotors share the lift.
+  - The lift split is set by what the wing can carry:
+    `L_wing = min(q*S*CL_cap, W)` and `T_rotor = W - L_wing`. Both propulsion
+    systems draw at once through the transition, which is why it is the most
+    power-hungry part of the flight.
+  - `CL_cap` during transition defaults below `CL_max`, because transitioning
+    at the stall boundary leaves no gust margin.
+  - Stopped lift rotors are carried as drag in cruise, phased in with the
+    wing's lift share so the transition and cruise models agree at the
+    boundary rather than jumping.
+  - Mission output reports the **energy split across hover, transition and
+    cruise**, which is where a VTOL's endurance is won or lost.
+- **A configuration dropdown offers tiltrotor, tiltwing and tailsitter**, so
+  the input set is defined and configurations saved today stay readable. They
+  are **refused with a clear message**, not approximated as lift+cruise: their
+  transition physics differs enough that a fallback would be confidently wrong.
+- The Glauert forward-flight inflow solver moved from the multicopter into
+  `rotorworks_core`, since the VTOL lift rotors need the same physics.
+
+**v2.16.0**
+- **The Compare tab ignored mission runs.** Only the single-point path
+  refreshed it, so after Run Mission the deltas were whatever the last
+  single-point run produced — a changed parameter looked like it had no
+  effect. Mission runs now feed the comparison from their worst-case point.
+- **The comparison refuses to mix run types.** A mission's worst-case point
+  and a single-point run measure different things, so comparing them would
+  show differences that are just a change of run type. Pinning records which
+  kind it was, and a mismatch says so instead of reporting a bogus delta.
+- **PDF reports now contain the whole analysis**: inputs, metrics, status
+  checks, terminal output, every plot, the weight budget, the **airframe
+  diagram**, the **sensitivity sweep**, and the **comparison against a pinned
+  baseline**. Previously the diagram was missed (it has its own canvas) and
+  the two analysis tabs were absent entirely. Sections with no data are
+  omitted rather than printed empty.
+
+**v2.15.1**, and the version also appears in the
 window title bar and at the top of the Output pane on startup.
 
 From a terminal:
@@ -746,6 +786,102 @@ comparable — this is expected, not a regression.
   because propeller efficiency now varies with advance ratio.
 - Fixed-wing glide distance now uses Cruise Altitude rather than the field
   elevation.
+
+**v2.15.1**
+- **The Status tab kept its own copy of thrust-to-weight** and was missed when
+  the Metrics tab was corrected in 2.15.0, so it went on reporting `1.00:1`
+  against a `>= 1.5:1` limit — a check that could never fail, on a number that
+  was never a margin. It now reads the same available-thrust figure as the
+  Metrics tab (6.61:1 on the heavy-lift example), with payload shown at both
+  TWR 1.0 and TWR 2.0. The old ratio is retained as "Thrust required /
+  weight", labelled a trim check rather than a margin.
+  The fixed-wing was already correct — it used available thrust throughout.
+
+**v2.15.0**
+- **Hover-attitude thrust added drag linearly instead of in quadrature.**
+  Drag is horizontal and weight is vertical, so they combine as a vector
+  magnitude. On a 16.5 kg X8 at 18 m/s the old `weight + drag` gave 187 N
+  where the true magnitude is 164 N. At 0 m/s both forms agree, which is why
+  hover-only checks never caught it.
+- **The "Hover" plot series is relabelled "Hover attitude (no yaw into
+  wind)".** It was never thrust at 0 m/s — it is the aircraft holding station
+  against wind, or translating without turning to face the direction of
+  travel, evaluated across airspeed. The old label invited exactly the
+  question "why does hover vary with speed".
+- **Thrust-to-weight is now a design metric.** It compared REQUIRED thrust
+  with weight, which is ~1 by definition in steady flight — the motors are
+  carrying the aircraft, so of course it balances — and told a designer
+  nothing. It now compares MAXIMUM AVAILABLE thrust with all-up weight: the
+  heavy-lift example goes from a meaningless 1.001 to 6.61 : 1.
+  Also added: Thrust Available (total), and payload capacity both at TWR 1.0
+  and at TWR 2.0, the usual minimum for control authority. The old ratio is
+  still shown, labelled "Thrust Required / Weight" with a note that it sits
+  at 1 by construction.
+
+**v2.14.0**
+- **RPM is now estimated when no propeller table or TConst is supplied**, so
+  Back-EMF, Mechanical Power, Motor efficiency, Throttle and Tip Mach read as
+  numbers instead of NaN.
+  Thrust alone does not determine RPM — two props of the same diameter making
+  the same thrust turn at different speeds depending on pitch and blade area —
+  so this is a genuine estimate from `T = C_T * rho * n^2 * D^4`, with C_T
+  fitted to pitch/diameter and blade count. Expect **+/-30% on C_T**, which is
+  **+/-15% on RPM**. A measured table or an explicit `TConst` both take
+  priority and are far more accurate. The metrics carry
+  `prop_rpm_is_estimated` so the two cases are distinguishable.
+  Sanity check: across 5in to 22in props the estimate puts hover tip speed at
+  60-63 m/s, which is where real multirotors sit.
+- **Motor efficiency was badly wrong and is now correct.** The display mixed
+  the two sides of the ESC: electrical power used pack-side current x pack
+  voltage, while mechanical power used that same pack-side current with the
+  winding back-EMF. The ESC chops the pack voltage, so the winding sees much
+  less voltage and much more current. On a 12S heavy-lift this read **13.4%**
+  motor efficiency; it now reads **89.0%**, which is what a large low-Kv motor
+  at 22% throttle should do.
+  Winding current is solved from conservation of electrical power across the
+  ESC, and both currents are now shown separately.
+
+**v2.13.2**
+- **Wind no longer aborts flyable multicopter mission legs.** A distance leg
+  starting from a hover spends the first second or two of its acceleration
+  ramp below the headwind, so its *instantaneous* groundspeed is zero. The
+  guard judged the phase on that instant and reported
+  `Invalid: zero groundspeed with distance phase`, killing a 10 m/s leg into a
+  3 m/s headwind — a 7 m/s steady groundspeed, entirely flyable.
+  The check now asks whether the leg can make progress at its **commanded**
+  airspeed, with a 120 s stall timeout so a genuine deadlock still terminates.
+  A headwind above the commanded airspeed is still rejected, now with a
+  message naming the real cause.
+  Single-point runs were never affected (no ramp), and neither was the
+  fixed-wing.
+
+**v2.13.1**
+- **Fixed the matplotlib figure leak.** Embedded plots were built with
+  `pyplot.subplots()`, which keeps every figure alive in a module-level
+  registry until something closes it. Nothing ever did, so a GUI session
+  accumulated a figure per run for its whole life and matplotlib warned
+  "More than 20 figures have been opened".
+  All 10 embedded-figure sites now build from `matplotlib.figure.Figure`
+  directly via `core.make_figure()`, so a figure is freed with its canvas.
+  Verified at zero retained figures after 80 builds; the full test matrix went
+  from 12 matplotlib warnings to none.
+  Interactive CLI plotting still uses pyplot, where the registry is doing its
+  job — `plt.show()` needs to find the figures.
+
+**v2.13.0**
+- **New `tests/test_matrix.py` closes the coverage gap that let two bugs
+  ship.** It runs the product of the dimensions that actually vary: both
+  simulators x every example config x every example mission x GUI and CLI x
+  with and without a measured propeller table. 67 cases.
+  Both escaped bugs were of the form "works in one interface, or one table
+  state, and not the other" — the `name 'm' is not defined` crash, and a
+  fixed-wing table loader that carried a known fault for six releases because
+  nothing exercised it.
+  The matrix also asserts the table *changes the answer*, so a table that is
+  accepted but silently ignored cannot pass.
+- **Unknown hover wind resistance prints `n/a`** instead of a bare `nan`. The
+  NaN was correct — it means no reference area was given — but it read like a
+  failure. Found by the new matrix.
 
 **v2.12.2**
 - **Fixed a crash on every multicopter run with a propeller table loaded.**
@@ -940,6 +1076,14 @@ Fixed in v2.4.0. Before that, the multicopter power curve rose monotonically
 with speed, so there was no minimum to find and the optimiser returned
 whichever bound it started from.
 
+### A mission leg reports "Invalid" but the same speed flies fine single-point
+
+Fixed in v2.13.2 for the wind case. A leg was judged on its groundspeed at
+the instant it started accelerating, rather than at its commanded speed.
+
+If you still see it, check that the commanded airspeed for that leg genuinely
+exceeds the headwind component — the status message now says which case it is.
+
 ### The window says "not responding" while running
 
 Fixed in v2.11.1 for the propeller-table case. If you still see it, the likely
@@ -974,6 +1118,8 @@ xvfb-run -a pytest            # headless machines (GUI tests need a display)
 | `test_cli.py` | 64 | Subprocess runs of every argument path and example mission, plus edge cases and malformed input |
 | `test_gui.py` | 44 | Real Tk window: hover events, mode toggle, config load, missions, exports |
 | `test_batch.py` | 20 | Sweeps, sizing, mode enforcement, and GUI↔CLI consistency |
+| `test_matrix.py` | 67 | Every config and mission, GUI **and** CLI, with **and** without a propeller table |
+| `test_vtol.py` | 27 | VTOL physics, transition hand-over, config gating, mission energy split |
 
 Almost every test corresponds to a bug that was shipped at some point; the
 docstrings name the symptom. Two are worth knowing about: the tooltip test

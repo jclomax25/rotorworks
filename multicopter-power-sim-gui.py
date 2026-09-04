@@ -83,11 +83,12 @@ battery_voltage_under_load = core.pack_voltage_under_load
 battery_soc_after_energy_draw = core.soc_after_energy_draw
 _fit_propeller_curve = core.fit_propeller_curve
 kinetic_power_term_W = core.kinetic_power_term_W
+induced_velocity_forward_flight = core.induced_velocity_forward_flight
 ramp_speed = core.ramp_speed
 
 # Build identifier. Shown in the title bar, the Output pane and Help > About
 # so you can always tell which copy of the script you are running.
-SIM_VERSION = "2.12.2"
+SIM_VERSION = "2.16.0"
 SIM_BUILD_NOTE = "Table-path inflow double-count fixed; table range warnings"
 import matplotlib.pyplot as plt
 
@@ -1238,7 +1239,16 @@ def thrust_required(config: DroneConfig, speed_mps: float, orientation: str) -> 
     drag_force = drag_force_required(config, speed_mps, orientation)
 
     if orientation == "hover":
-        return weight_force + drag_force
+        # Drag here is HORIZONTAL (translation or wind), weight is vertical,
+        # so they combine as a vector magnitude — not a scalar sum. Adding
+        # them linearly overstated thrust badly: on a 16.5 kg X8 at 18 m/s it
+        # gave 187 N where the true magnitude is 164 N.
+        #
+        # Note this curve is "hover ATTITUDE at an airspeed" — the aircraft
+        # holding station against wind, or translating without yawing into
+        # the direction of travel. It is not thrust at 0 m/s; at 0 m/s the
+        # drag term vanishes and it reduces to the weight, as it must.
+        return math.hypot(weight_force, drag_force)
 
     # forward flight (vector sum)
     return math.sqrt(weight_force**2 + drag_force**2)
@@ -1385,71 +1395,6 @@ def interpolate_motor_power(config: DroneConfig, thrust_per_motor_N: float) -> f
         raise ValueError("prop_table interpolation failed to produce Power_W")
     return float(pt["Power_W"])
 
-def induced_velocity_forward_flight(v_hover: float,
-                                    airspeed_mps: float,
-                                    disk_incidence_rad: float = 0.0,
-                                    iters: int = 40) -> float:
-    """
-    Rotor induced velocity in forward flight (Glauert's momentum theory).
-
-    A hovering rotor must accelerate still air, so it works hard:
-        v_h = sqrt( T / (2 * rho * A) )
-
-    Once the vehicle is moving, the rotor meets air that is ALREADY moving,
-    so far less velocity has to be added and induced power falls sharply.
-    Glauert's relation for a rotor at incidence alpha to the freestream is:
-
-        vi = v_h^2 / sqrt( (V*cos a)^2 + (V*sin a + vi)^2 )
-
-    Special cases this reduces to:
-      * V = 0            ->  vi = v_h                     (hover)
-      * a = 90 deg       ->  vi = -V/2 + sqrt((V/2)^2 + v_h^2)
-                                                          (axial / propeller)
-      * a = 0 deg        ->  vi = v_h^2 / sqrt(V^2 + vi^2)
-                                                          (edgewise / multirotor)
-
-    A multicopter in forward flight sits near the edgewise case: its rotors
-    stay nearly horizontal and only tilt by the angle needed to balance drag,
-    so the freestream is almost in the disk plane.
-
-    Why this matters
-    ----------------
-    Using the hover value at all speeds overstates induced power by roughly
-    2x at 10 m/s and 4x at 20 m/s for a typical quad.  That removes the
-    "power bucket" — the 10-25% dip below hover power that real multirotors
-    show around 8-14 m/s — and leaves a monotonically rising power curve.
-    With no minimum in the curve, best-endurance and best-range speed
-    searches simply pin to the ends of their search range.
-
-    This returns vi only.  Shaft power is then
-        P = T * (V*sin(a) + vi)
-    where the first term is the propulsive power overcoming airframe drag.
-
-    Solved by damped fixed-point iteration, which converges quickly because
-    the right-hand side is a contraction for all physical inputs.
-    """
-    vh = max(float(v_hover), 0.0)
-    V = max(float(airspeed_mps), 0.0)
-    if vh <= 0.0:
-        return 0.0
-    if V <= 1e-9:
-        return vh                       # hover
-
-    a = float(disk_incidence_rad)
-    v_par = V * math.cos(a)             # in-plane component
-    v_perp = V * math.sin(a)            # through-disk component
-
-    vi = vh                             # start from the hover value
-    for _ in range(max(int(iters), 1)):
-        denom = math.sqrt(v_par ** 2 + (v_perp + vi) ** 2)
-        vi_new = (vh ** 2) / max(denom, 1e-9)
-        # Damping keeps the iteration stable near the vortex-ring region.
-        vi_next = 0.5 * (vi + vi_new)
-        if abs(vi_next - vi) < 1e-9:
-            vi = vi_next
-            break
-        vi = vi_next
-    return max(vi, 0.0)
 
 
 def motor_power_from_params(config: DroneConfig, thrust_per_motor_N: float,
@@ -1708,6 +1653,26 @@ def _compute_operating_metrics_core(drone: DroneConfig,
                 rpm_est = float(motor_table['RPM'])
         except Exception:
             motor_table = None
+
+    # Last resort: estimate the propeller's thrust coefficient from its
+    # geometry so RPM — and everything derived from it — is a number rather
+    # than NaN.
+    #
+    # Thrust alone genuinely does not determine RPM: two props of the same
+    # diameter making the same thrust turn at different speeds depending on
+    # pitch and blade area. So this IS an estimate, roughly +/-30% on C_T
+    # and +/-15% on the resulting RPM, and it is flagged as such in the
+    # metrics. A measured table or an explicit TConst both take priority.
+    rpm_is_estimated = False
+    if rpm_est is None and drone.propeller.diameter_in:
+        c_t = core.estimate_prop_thrust_coefficient(
+            drone.propeller.diameter_in, drone.propeller.pitch_in,
+            getattr(drone.propeller, "blades", 2))
+        rpm_est = core.rpm_from_thrust(
+            thrust_per_motor_N, drone.propeller.diameter_in * 0.0254,
+            drone.air_density, c_t)
+        rpm_is_estimated = rpm_est is not None
+
     inflow_mult, mu_adv, eta_inflow = rotor_inflow_power_multiplier(
         drone, airspeed_mps=airspeed, rpm=rpm_est, orientation=orientation
     )
@@ -1794,6 +1759,7 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         "thrust_total_N":      float(total_thrust_N),
         "thrust_per_motor_N":  float(thrust_per_motor_N),
         "prop_rpm":            (float(rpm_est) if rpm_est is not None else None),
+        "prop_rpm_is_estimated": bool(rpm_is_estimated),
         "motor_table_throttle_pct": (float(motor_table["Throttle_pct"]) if motor_table and "Throttle_pct" in motor_table else None),
         "motor_table_eff_gW":  (float(motor_table["Efficiency_gW"])    if motor_table and "Efficiency_gW" in motor_table else None),
         "motor_table_temp_C":  (float(motor_table["Temp_C"])           if motor_table and "Temp_C" in motor_table else None),
@@ -2156,6 +2122,7 @@ def simulate_mission(config: DroneConfig,
         target_speed_mps = max(float(phase.speed), 0.0)
         phase_elapsed_s = 0.0
         phase_distance_m = 0.0
+        stalled_s = 0.0   # time spent unable to make ground progress
         phase_status = "OK"
         step_guard = 0
 
@@ -2267,8 +2234,30 @@ def simulate_mission(config: DroneConfig,
                 remain_m = float(phase.distance) - phase_distance_m
                 step_dist_m = gs_mps * dt_s
                 if step_dist_m <= 1e-9 and remain_m > 1e-3:
-                    phase_status = "Invalid: zero groundspeed with distance phase"
-                    break
+                    # Zero groundspeed right now. During the acceleration ramp
+                    # this is EXPECTED and temporary: a leg that starts from a
+                    # hover has an airspeed below the headwind for the first
+                    # second or two, so it makes no progress until it speeds up.
+                    #
+                    # The phase is only genuinely impossible if it cannot make
+                    # progress at its COMMANDED airspeed. Judging it on the
+                    # instantaneous value aborted perfectly flyable legs — a
+                    # 10 m/s leg into a 3 m/s headwind (7 m/s steady
+                    # groundspeed) was reported invalid purely because it
+                    # began from a standstill.
+                    steady_gs = groundspeed_along_track_mps(
+                        target_speed_mps, headwind_mps, crosswind_mps)
+                    if steady_gs <= 1e-9:
+                        phase_status = ("Invalid: wind exceeds commanded "
+                                        "airspeed, no ground progress possible")
+                        break
+                    # Otherwise keep accelerating; progress starts once the
+                    # airspeed passes the headwind.
+                    stalled_s += dt_s
+                    if stalled_s > 120.0:
+                        phase_status = ("Invalid: could not reach a positive "
+                                        "groundspeed within 120 s")
+                        break
                 if step_dist_m > remain_m:
                     frac = max(min(remain_m / max(step_dist_m, 1e-9), 1.0), 0.0)
                     dt_s *= frac
@@ -2451,7 +2440,7 @@ def make_performance_figure(config: DroneConfig,
 
     be_v, be_t, br_v, br_d = find_optimal_speeds(config, min_speed=v_lo, max_speed=max_speed)
 
-    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    fig, axes = core.make_figure(2, 2, figsize=figsize)
     fig.suptitle("Multicopter Performance", fontsize=13, fontweight="bold")
 
     # 1. Time & Range
@@ -2470,7 +2459,7 @@ def make_performance_figure(config: DroneConfig,
     # 2. Power
     ax = axes[0, 1]
     ax.plot(speeds, [p/1000 for p in pwr_fwd], color="crimson",   label="Forward Flight")
-    ax.plot(speeds, [p/1000 for p in pwr_hov], color="steelblue", label="Hover", linestyle="--")
+    ax.plot(speeds, [p/1000 for p in pwr_hov], color="steelblue", label="Hover attitude (no yaw into wind)", linestyle="--")
     ax.axvline(cruise, color="gray", linestyle="-.", linewidth=1.0, alpha=0.7)
     ax.set_xlabel("Speed (m/s)"); ax.set_ylabel("Power (kW)")
     ax.set_title("Power Required vs Speed")
@@ -2479,7 +2468,7 @@ def make_performance_figure(config: DroneConfig,
     # 3. Thrust
     ax = axes[1, 0]
     ax.plot(speeds, thr_fwd, color="teal",      label="Forward Flight")
-    ax.plot(speeds, thr_hov, color="slategray", label="Hover", linestyle="--")
+    ax.plot(speeds, thr_hov, color="slategray", label="Hover attitude (no yaw into wind)", linestyle="--")
     ax.axvline(cruise, color="gray", linestyle="-.", linewidth=1.0, alpha=0.7)
     ax.set_xlabel("Speed (m/s)"); ax.set_ylabel("Thrust (N)")
     ax.set_title("Thrust Required vs Speed")
@@ -2568,7 +2557,7 @@ def make_airframe_diagram_figure(config: DroneConfig, figsize: tuple = (9, 8)):
         arm_length_m=arm_len, prop_diameter_m=prop_d,
         rotation_rad=math.pi / n_arms if n_arms % 2 == 0 else math.pi / 2.0)
 
-    fig, ax = _plt.subplots(figsize=figsize)
+    fig, ax = core.make_figure(figsize=figsize)
     overlap = layout["overlaps"]
     disc_colour = "#C62828" if overlap else "#2E7D32"
 
@@ -2654,7 +2643,7 @@ def make_motor_operating_point_figure(config: DroneConfig, metrics: dict, figsiz
     """
     if config.propeller.table is None:
         # Return empty figure if no propeller table
-        fig, ax = plt.subplots(1, 1, figsize=figsize)
+        fig, ax = core.make_figure(1, 1, figsize=figsize)
         ax.text(0.5, 0.5, "Propeller table not available\nCannot plot operating curves",
                 ha="center", va="center", transform=ax.transAxes, fontsize=12)
         ax.axis("off")
@@ -2663,7 +2652,7 @@ def make_motor_operating_point_figure(config: DroneConfig, metrics: dict, figsiz
     df = config.propeller.table
     thrust_pm_N = float(metrics.get("thrust_per_motor_N", 0.0))
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=figsize)
+    fig, (ax1, ax2) = core.make_figure(1, 2, figsize=figsize)
     
     # Get data from propeller table
     thrust_g = df["Thrust_g"].values if "Thrust_g" in df.columns else []
@@ -2995,7 +2984,16 @@ def _export_excel_file(path: str, sweep: dict, metrics: list, weight_budget: lis
 def _generate_pdf_report(path: str, report_title: str,
                           inputs_rows: list, metrics_rows: list,
                           status_sections: list, log_text: str,
-                          figures: list, weight_budget: list) -> None:
+                          figures: list, weight_budget: list,
+                          extra_sections: Optional[list] = None) -> None:
+    """
+    Build the PDF report.
+
+    `extra_sections` is a list of (title, headers, rows) tuples appended after
+    the weight budget — used for the sensitivity sweep and the comparison
+    against a pinned baseline, so a report captures the whole analysis rather
+    than only the single operating point.
+    """
     from reportlab.lib.pagesizes import A4
     from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
                                     Table, TableStyle, PageBreak, Image,
@@ -3120,6 +3118,25 @@ def _generate_pdf_report(path: str, report_title: str,
         for line in log_text.splitlines():
             safe = line.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
             story.append(Paragraph(safe or " ", mono))
+    # Extra analysis sections: sensitivity and baseline comparison.
+    for _title, _headers, _rows in (extra_sections or []):
+        if not _rows:
+            continue
+        story.append(PageBreak())
+        story.append(Paragraph(_title, sH1))
+        _data = [list(_headers)] + [list(r) for r in _rows]
+        _tbl = Table(_data, hAlign="LEFT")
+        _tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), NAVY),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("GRID", (0, 0), (-1, -1), 0.25, DGREY),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LGREY]),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(_tbl)
+
     doc.build(story)
 
 
@@ -4691,6 +4708,10 @@ def launch_gui():
         speed = float(_last_run.get("speed", cfg.cruise_speed or 0.0))
         orient = _last_run.get("orientation", "forward")
         m = dict(_last_run.get("metrics") or {})
+        if _last_run.get("from_mission"):
+            # Mission metrics are worst-case across phases. Adding a
+            # single-point endurance here would compare two different things.
+            return m
         try:
             minutes = estimate_flight_time_minutes(cfg, speed, orientation=orient)
             m["flight_time_min"] = minutes
@@ -4706,6 +4727,7 @@ def launch_gui():
             messagebox.showinfo("Compare", "Run a single point first.")
             return
         _cmp_state["baseline"] = metrics
+        _cmp_state["from_mission"] = bool(_last_run.get("from_mission"))
         label = str(v_loaded_cfg.get())
         _cmp_state["label"] = label
         v_cmp_baseline.set(f"{label}  (pinned)")
@@ -4727,6 +4749,17 @@ def launch_gui():
             return
         current = _current_comparison_metrics()
         if not current:
+            return
+        # A mission's worst-case point and a single-point run are different
+        # quantities; comparing them would produce differences that look like
+        # design changes but are just a change of run type.
+        if bool(_cmp_state.get("from_mission")) != bool(_last_run.get("from_mission")):
+            cmp_tv.insert("", "end", tags=("flat",), values=(
+                "Baseline is a "
+                + ("mission" if _cmp_state.get("from_mission") else "single-point")
+                + " run; current is a "
+                + ("mission" if _last_run.get("from_mission") else "single-point")
+                + " run.", "—", "—", "—", "re-pin to compare like with like"))
             return
         rows = core.compare_metric_sets(
             base, current, [(k, lbl, d) for k, lbl, d, _ in _CMP_KEYS])
@@ -4853,7 +4886,7 @@ def launch_gui():
         totals = [r[3] for r in data_rows]
         grand  = sum(totals)
         COLORS = ["#2E75B6","#ED7D31","#A9D18E","#FFC000","#5B9BD5","#FF7F7F"]
-        fig, axes = plt.subplots(1, 2, figsize=(7, max(3, len(labels)*0.6+1)))
+        fig, axes = core.make_figure(1, 2, figsize=(7, max(3, len(labels)*0.6+1)))
         fig.patch.set_facecolor("white")
         ax = axes[0]
         left_ = 0.0
@@ -5051,26 +5084,44 @@ def launch_gui():
                 f"{Iesc:.2f} A", f"<= {imax_m:.2f} A",
                 _status_color_tag(Iesc, imax_m, "max"))
 
+        # Thrust margin must compare what the propulsion system CAN produce
+        # against the weight. Comparing REQUIRED thrust against weight sits at
+        # 1:1 in steady flight by construction — the motors are carrying the
+        # aircraft — so it can never fail its own check and told a pilot
+        # nothing about margin.
         weight_N = config.drone_weight_g * g0 / 1000.0
-        hover_T  = float(metrics.get("hover_thrust_total_N", weight_N))
-        twr_hover = hover_T / max(weight_N, 1e-9)
-        _insert_status_row(motor_table, "Hover TWR (total thrust / weight)",
-            f"{twr_hover:.2f}:1", ">= 1.5:1",
-            "ok" if twr_hover >= 2.0 else ("warn" if twr_hover >= 1.5 else "bad"),
-            "< 1.5 is dangerously marginal; > 2.0 is recommended")
+        avail_T = available_total_thrust_N(config)
 
+        if avail_T and avail_T > 0:
+            twr_avail = avail_T / max(weight_N, 1e-9)
+            _insert_status_row(motor_table, "Thrust-to-weight (max available)",
+                f"{twr_avail:.2f}:1", ">= 2.0:1",
+                "ok" if twr_avail >= 2.0 else ("warn" if twr_avail >= 1.5 else "bad"),
+                "< 1.5 is dangerously marginal; >= 2.0 gives control authority")
+
+            max_pay_g = (avail_T / g0 - config.drone_weight_g / 1000.0) * 1000.0
+            _insert_status_row(motor_table, "Max additional payload",
+                f"{max_pay_g:.0f} g", ">= 0 g",
+                "ok" if max_pay_g >= 0 else "bad",
+                "Extra mass liftable at TWR 1.0, i.e. with no hover margin")
+
+            pay_twr2_g = max(avail_T / 2.0 / g0 - config.drone_weight_g / 1000.0, 0.0) * 1000.0
+            _insert_status_row(motor_table, "Payload at TWR 2.0",
+                f"{pay_twr2_g:.0f} g", ">= 0 g",
+                "ok" if pay_twr2_g > 0 else "warn",
+                "Extra mass while keeping a 2:1 margin — the usable figure")
+        else:
+            _insert_status_row(motor_table, "Thrust-to-weight (max available)",
+                "n/a", ">= 2.0:1", "warn",
+                "Set Max Thrust on the Propeller tab, or load a prop table")
+
+        # Kept as a trim check, not a margin check, and labelled as such.
         from_physics = float(metrics.get("thrust_total_N", weight_N))
         twr_fwd = from_physics / max(weight_N, 1e-9)
-        _insert_status_row(motor_table, "Thrust-to-weight (this speed)",
-            f"{twr_fwd:.2f}:1", ">= 1.0:1",
-            "ok" if twr_fwd >= 1.0 else "bad",
-            "Drops in forward flight due to drag")
-
-        max_pay_g = (hover_T / g0 - config.drone_weight_g / 1000.0) * 1000.0
-        _insert_status_row(motor_table, "Max additional payload",
-            f"{max_pay_g:.0f} g", ">= 0 g",
-            "ok" if max_pay_g >= 0 else "bad",
-            "Remaining thrust capacity above current AUW")
+        _insert_status_row(motor_table, "Thrust required / weight",
+            f"{twr_fwd:.2f}:1", "~1.0:1", "ok",
+            "Sits at 1 in steady flight by definition; rises with tilt in "
+            "forward flight. A trim check, not a margin.")
 
         T_motor = float(metrics.get("motor_temp_est_C", float("nan")))
         T_head  = float(metrics.get("motor_thermal_headroom_C", float("nan")))
@@ -5325,8 +5376,27 @@ def launch_gui():
         V_emf = float("nan")
         if kv and kv > 0 and rpm == rpm:
             V_emf = rpm / float(kv)
+        # The ESC chops the pack voltage, so the WINDING sees far less than
+        # the pack and carries correspondingly more current than the pack
+        # does. `I_motor` above is the PACK-side current per motor; using it
+        # together with the winding back-EMF mixes the two sides of the ESC
+        # and understated mechanical power badly — a large low-Kv motor at
+        # light load came out at 13% efficient.
+        #
+        # Electrical power is conserved across the ESC, so with
+        #     P_elec = V_winding * I_winding
+        #     V_winding = V_emf + I_winding * Rm
+        # eliminating I_winding gives a quadratic in V_winding:
+        #     V^2 - V_emf*V - P_elec*Rm = 0
+        P_elec_motor = (I_motor * v_load) if (I_motor == I_motor and v_load == v_load) else float("nan")
+
         V_motor = v_load
-        if V_emf == V_emf and I_motor == I_motor:
+        I_winding = I_motor
+        if V_emf == V_emf and P_elec_motor == P_elec_motor and P_elec_motor > 0:
+            V_motor = 0.5 * (V_emf + math.sqrt(V_emf * V_emf + 4.0 * P_elec_motor * Rm))
+            if V_motor > 1e-9:
+                I_winding = P_elec_motor / V_motor
+        elif V_emf == V_emf and I_motor == I_motor:
             V_motor = V_emf + I_motor * Rm
 
         throttle_linear = (V_motor / v_load) if (v_load == v_load and v_load > 1e-6 and V_motor == V_motor) else float("nan")
@@ -5336,10 +5406,10 @@ def launch_gui():
         if throttle_linear == throttle_linear:
             throttle_log = math.log10(1 + 9 * max(0.0, min(1.0, throttle_linear)))
 
-        P_elec_motor = (I_motor * v_load) if (I_motor == I_motor and v_load == v_load) else float("nan")
+        # Shaft power is back-EMF times the torque-producing winding current.
         P_mech_motor = float("nan")
-        if V_emf == V_emf and I_motor == I_motor:
-            P_mech_motor = V_emf * max(0.0, I_motor - I0)
+        if V_emf == V_emf and I_winding == I_winding:
+            P_mech_motor = V_emf * max(0.0, I_winding - I0)
         motor_eff = (P_mech_motor / P_elec_motor) if (P_mech_motor==P_mech_motor and P_elec_motor==P_elec_motor and P_elec_motor > 0) else float("nan")
 
         T_est = float(metrics.get("motor_temp_est_C", float("nan")))
@@ -5402,7 +5472,8 @@ def launch_gui():
         _metrics_add("Max power (rated)",      f"{fmf(getattr(drone.motor,'max_power',float('nan')),0)} W")
         _metrics_add("Back-EMF (est)",         f"{fmf(V_emf,2)} V  ({fmt(rpm,0)} rpm / {fmt(kv,0) if kv else '—'} KV)")
         _metrics_add("Terminal Voltage",       f"{fmt(V_motor,2)} V")
-        _metrics_add("Current / motor",        f"{fmt(I_motor,2)} A")
+        _metrics_add("Current / motor (pack side)", f"{fmt(I_motor,2)} A")
+        _metrics_add("Current / motor (winding)",   f"{fmt(I_winding,2)} A  (pack current / throttle)")
         _metrics_add("Electric Power / motor", f"{fmt(P_elec_motor,1)} W")
         _metrics_add("Mechanical Power / motor",f"{fmt(P_mech_motor,1)} W")
         _metrics_add("Motor efficiency",       f"{fmt(motor_eff*100,1)} %  (P_mech / P_elec)")
@@ -5424,11 +5495,36 @@ def launch_gui():
         # ── Total Drive & Power ───────────────────────────────────────────
         _metrics_add_section("Total Drive & Power")
         _metrics_add("Drive Weight",           f"{fmt(drive_g,0)} g  ({nm} motors + ESC + props)")
-        _metrics_add("Thrust-Weight Ratio",    f"{fmt(twr,3)} : 1")
-        hover_TWR = float(metrics.get("hover_thrust_total_N", thrust_total_N)) / max(weight_kg * g0, 1e-9)
-        _metrics_add("Hover TWR",              f"{fmt(hover_TWR,3)} : 1  (static, no drag)")
-        max_pay_g = (thrust_total_N/g0 - weight_kg)*1000 if thrust_total_N==thrust_total_N else float("nan")
-        _metrics_add("Max Extra Payload",      f"{fmt(max_pay_g,0)} g")
+        # Thrust-to-weight must compare AVAILABLE thrust against weight.
+        # Comparing REQUIRED thrust against weight is close to 1 by
+        # definition — in steady flight the motors exactly carry the aircraft
+        # — so it told you nothing. What a designer wants is the margin: how
+        # much more the propulsion system can produce than it needs.
+        T_avail_N = available_total_thrust_N(drone)
+        weight_N = weight_kg * g0
+        if T_avail_N and T_avail_N > 0:
+            twr_avail = T_avail_N / max(weight_N, 1e-9)
+            _metrics_add("Thrust-Weight Ratio",
+                         f"{fmt(twr_avail,2)} : 1  (max available / all-up weight)")
+            _metrics_add("Thrust Available (total)",
+                         f"{fmt(T_avail_N,1)} N  ({fmt(T_avail_N/g0*1000,0)} g)")
+            max_pay_g = (T_avail_N / g0 - weight_kg) * 1000.0
+            _metrics_add("Max Extra Payload",
+                         f"{fmt(max_pay_g,0)} g  (at TWR 1.0, no hover margin)")
+            _metrics_add("Payload at TWR 2.0",
+                         f"{fmt(max(T_avail_N/2.0/g0 - weight_kg, 0.0)*1000.0,0)} g"
+                         "  (a usual minimum for control authority)")
+        else:
+            _metrics_add("Thrust-Weight Ratio",
+                         "n/a  (set Max Thrust or load a prop table)")
+            _metrics_add("Max Extra Payload",
+                         "n/a  (needs a thrust limit to compute a margin)")
+
+        # Thrust actually being produced at this operating point, which is a
+        # different and also useful number.
+        _metrics_add("Thrust Required / Weight",
+                     f"{fmt(thrust_total_N / max(weight_N, 1e-9),3)} : 1"
+                     "  (~1 in steady flight, by definition)")
         _metrics_add("Total Current",          f"{fmt(I_pack,2)} A")
         _metrics_add("Motor Power (total)",    f"{fmt(P_motor_total,1)} W  ({nm} motors)")
         _metrics_add("ESC Losses (total)",     f"{fmt(P_esc_loss,1)} W")
@@ -5494,7 +5590,11 @@ def launch_gui():
         _metrics_add("Reserve Target",         f"{fmf(metrics.get('reserve_target_Wh',float('nan')),1)} Wh")
         _metrics_add("Reserve Margin",         f"{fmf(metrics.get('reserve_margin_Wh',float('nan')),1)} Wh  ({'VIOLATION' if metrics.get('reserve_breached',False) else 'OK'})")
         _metrics_add("Transient Segment",      f"{metrics.get('segment_type','steady')}")
-        _metrics_add("Hover Wind Resistance",  f"{fmt(metrics.get('hover_wind_resistance_mps',float('nan')),2)} m/s  ({fmt(metrics.get('hover_wind_resistance_mps',0)*1.944,1)} kt)")
+        _hwr = metrics.get("hover_wind_resistance_mps", float("nan"))
+        _metrics_add("Hover Wind Resistance",
+                     "n/a (needs a frontal area or body dimensions)"
+                     if _hwr is None or not math.isfinite(float(_hwr))
+                     else f"{float(_hwr):.2f} m/s  ({float(_hwr)*1.944:.1f} kt)")
 
         # ── Thermal ───────────────────────────────────────────────────────
         _metrics_add_section("Thermal Estimates")
@@ -5886,6 +5986,7 @@ def launch_gui():
             # tabs, which re-evaluate the same operating point.
             _last_run["speed"] = speed
             _last_run["orientation"] = orientation
+            _last_run["from_mission"] = False
             # Capture sweep data for CSV/Excel export
             _mc_v = [0.5 + (max_spd-0.5)*i/200 for i in range(201)]
             _last_run_sweep.clear()
@@ -6018,10 +6119,16 @@ def launch_gui():
 
             if worst_metrics is not None:
                 update_status_tables_from_metrics(drone, worst_metrics)
+                # Feed the Compare tab from this mission's worst-case point,
+                # and mark where it came from so the comparison does not mix
+                # a mission against a single-point baseline.
+                _last_run["metrics"] = dict(worst_metrics)
+                _last_run["from_mission"] = True
 
             max_spd = parse_float("Max speed plot", v_max_speed_plot.get())
             _last_run["drone"]   = drone
             _last_run["max_spd"] = max_spd
+            refresh_comparison()
             _last_run_cfg[0] = drone
             update_weight_budget(drone)
             fig = make_performance_figure(
@@ -6260,7 +6367,31 @@ def launch_gui():
                 fig = plt.figure(num)
                 if fig not in figs:
                     figs.append(fig)
+            # The airframe diagram lives on its own canvas, so add it
+            # explicitly rather than hoping it is in the plot list.
+            _ad = _ad_canvas.get("widget")
+            if _ad is not None and _ad.figure not in figs:
+                figs.append(_ad.figure)
+
             wb    = _extract_weight_budget(cfg) if cfg else []
+
+            # Tabular analysis: whatever is currently on the Sensitivity and
+            # Compare tabs. Empty tabs contribute nothing.
+            def _tree_rows(tree):
+                return [list(tree.item(i, "values")) for i in tree.get_children("")]
+
+            _extra = []
+            _sens_rows = _tree_rows(sens_tv)
+            if _sens_rows:
+                _extra.append((
+                    "Sensitivity", ["Input", "-20%", "-10%", "baseline",
+                                    "+10%", "+20%", "swing"], _sens_rows))
+            _cmp_rows = _tree_rows(cmp_tv)
+            if _cmp_rows:
+                _extra.append((
+                    "Comparison against pinned baseline",
+                    ["Metric", "Baseline", "Current", "Change", "Change %"],
+                    _cmp_rows))
             _generate_pdf_report(
                 path         = path,
                 report_title = _report_title,
@@ -6270,6 +6401,7 @@ def launch_gui():
                 log_text     = _get_log_text(),
                 figures      = figs,
                 weight_budget = wb,
+                extra_sections = _extra,
             )
             messagebox.showinfo("Report generated", f"PDF report saved to:\n{path}")
         except Exception as e:
@@ -6663,7 +6795,13 @@ def main():
         print(f"Reserve Status        : {'VIOLATION' if metrics.get('reserve_breached', False) else 'OK'}")
         print(f"Motor Thermal Status  : {metrics.get('thermal_status', 'n/a')} @ {metrics.get('motor_temp_est_C', 0.0):.1f} °C")
         print(f"Thermal M/ESC/Batt    : {metrics.get('motor_temp_est_C', 0.0):.1f} / {metrics.get('esc_temp_est_C', 0.0):.1f} / {metrics.get('battery_temp_est_C', 0.0):.1f} °C")
-        print(f"Hover Wind Resistance : {metrics.get('hover_wind_resistance_mps', 0.0):.2f} m/s")
+        _hwr = metrics.get("hover_wind_resistance_mps", float("nan"))
+        # NaN here means "reference area unknown", which is a real answer.
+        # Print it as n/a rather than a bare "nan", which reads as a crash.
+        _hwr_txt = ("n/a (set a frontal area or body dimensions)"
+                    if _hwr is None or not math.isfinite(float(_hwr))
+                    else f"{float(_hwr):.2f} m/s")
+        print(f"Hover Wind Resistance : {_hwr_txt}")
         print(f"Prop Solidity σ       : {metrics.get('prop_solidity_sigma', 0.0):.3f}")
 
     if args.plot:

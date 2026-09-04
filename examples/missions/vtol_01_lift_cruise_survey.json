@@ -1,0 +1,15 @@
+{
+  "reserve_percent": 20,
+  "transition_time_s": 12,
+  "phases": [
+    {"name": "Vertical climb",     "kind": "climb",      "duration": 30, "climb_rate_mps": 2.5, "altitude": 75},
+    {"name": "Hover check",        "kind": "hover",      "duration": 15, "altitude": 75},
+    {"name": "Transition out",     "kind": "transition", "duration": 12, "speed": 15.0, "altitude": 75},
+    {"name": "Transit to site",    "kind": "cruise",     "distance": 6000, "speed": 22.0, "altitude": 120},
+    {"name": "Survey lines",       "kind": "cruise",     "distance": 12000, "speed": 18.0, "altitude": 100},
+    {"name": "Return transit",     "kind": "cruise",     "distance": 6000, "speed": 22.0, "altitude": 120},
+    {"name": "Transition back",    "kind": "transition", "duration": 15, "speed": 15.0, "altitude": 75},
+    {"name": "Hover to position",  "kind": "hover",      "duration": 20, "altitude": 40},
+    {"name": "Vertical descent",   "kind": "descend",    "duration": 35, "altitude": 0}
+  ]
+}

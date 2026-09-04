@@ -1,7 +1,7 @@
 # Test suite
 
-219 tests covering the shared core, physics, the CLI, the GUI, and the
-batch driver.
+377 tests covering the shared core, physics, the CLI, the GUI, the batch
+driver, and a full config/mission coverage matrix.
 
 Almost every test here corresponds to a bug that was actually shipped. The
 docstrings say which one, so a future failure reads as "the pack capacity
