@@ -96,7 +96,7 @@ ramp_speed = core.ramp_speed
 
 # Build identifier. Shown in the title bar, the Output pane and Help > About
 # so you can always tell which copy of the script you are running.
-SIM_VERSION = "2.40.0"
+SIM_VERSION = "2.41.0"
 SIM_BUILD_NOTE = "Table-path inflow double-count fixed; table range warnings"
 import matplotlib
 import matplotlib.pyplot as plt
@@ -4878,37 +4878,10 @@ def launch_gui():
                 row["name"], f"{row['watts']:.1f}", f"{row['pct']:.1f}%",
                 row["voltage"], current))
 
-        # Share diagram: delivered against each loss, so the eye goes to the
-        # biggest waste rather than to the biggest number.
-        try:
-            slices = [(r["name"], r["watts"]) for r in rows
-                      if r["kind"] in ("delivered", "lost") and r["watts"] > 0.01]
-            if slices:
-                fig, ax = core.make_figure(figsize=(4.6, 4.2))
-                labels = [s[0] for s in slices]
-                values = [s[1] for s in slices]
-                colours = ["#2E7D32" if r["kind"] == "delivered" else "#C62828"
-                           for r in rows
-                           if r["kind"] in ("delivered", "lost") and r["watts"] > 0.01]
-                ax.pie(values, labels=None, colors=colours, autopct="%1.0f%%",
-                       textprops={"fontsize": 7}, startangle=90)
-                ax.legend(labels, fontsize=6, loc="center left",
-                          bbox_to_anchor=(-0.35, 0.5))
-                ax.set_title("Green = delivered, red = lost", fontsize=9)
-                fig.tight_layout()
-                old = _pb_canvas.get("widget")
-                if old is not None:
-                    try:
-                        old.get_tk_widget().destroy()
-                    except Exception:
-                        pass
-                pb_placeholder.grid_remove()
-                canvas = FigureCanvasTkAgg(fig, master=pb_right)
-                canvas.draw()
-                canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
-                _pb_canvas["widget"] = canvas
-        except Exception:
-            pass
+        # The share pie chart was removed: a dozen slivers with a legend
+        # longer than the chart itself conveyed less than the table beside
+        # it, and the smallest rails were unreadable at any size. The
+        # percentage column already carries the same information.
 
 
     # ---- Airframe Diagram tab ----------------------------------------
@@ -4919,6 +4892,75 @@ def launch_gui():
     tab_airframe_diagram.columnconfigure(0, weight=1)
     tab_airframe_diagram.rowconfigure(0, weight=1)
     display_nb.add(tab_airframe_diagram, text="Airframe Diagram")
+
+    # ---- Mission Diagram tab -----------------------------------------
+    # Missions are written as legs — a heading, a distance — never as
+    # coordinates, so the SHAPE of the route is not stated anywhere. This
+    # integrates the legs back into a map, which is the only way to see
+    # whether a pattern closes, overlaps, or drifts.
+    tab_mission_diagram = ttk.Frame(display_nb, padding=0)
+    tab_mission_diagram.columnconfigure(0, weight=1)
+    tab_mission_diagram.rowconfigure(0, weight=1)
+    display_nb.add(tab_mission_diagram, text="Mission Diagram")
+
+    md_holder = ttk.Frame(tab_mission_diagram)
+    md_holder.grid(row=0, column=0, sticky="nsew")
+    md_holder.columnconfigure(0, weight=1)
+    md_holder.rowconfigure(0, weight=1)
+    md_placeholder = ttk.Label(
+        md_holder, foreground="#888888", justify="center", wraplength=460,
+        text="Run a mission to map its ground track and altitude profile.")
+    md_placeholder.grid(row=0, column=0, padx=20, pady=40)
+    _md_canvas = {"widget": None}
+
+    def refresh_mission_diagram(mission_obj):
+        """Draw the route the mission actually flies."""
+        phases = []
+        for ph in getattr(mission_obj, "phases", []) or []:
+            phases.append({
+                "name": getattr(ph, "name", ""),
+                "course_deg": getattr(ph, "course_deg", 0.0),
+                "distance": getattr(ph, "distance", None),
+                "altitude": getattr(ph, "altitude", 0.0),
+                "translation_direction_deg": getattr(
+                    ph, "translation_direction_deg", None),
+                "bank_deg": getattr(ph, "bank_deg", None),
+            })
+        old = _md_canvas.get("widget")
+        if old is not None:
+            try:
+                old.get_tk_widget().destroy()
+            except Exception:
+                pass
+            _md_canvas["widget"] = None
+        if not phases:
+            md_placeholder.grid()
+            return
+        try:
+            fig = core.make_mission_diagram_figure(
+                phases, figsize=(_view["plot_w"], _view["plot_h"] * 0.55))
+        except Exception:
+            md_placeholder.grid()
+            return
+        md_placeholder.grid_remove()
+        canvas = FigureCanvasTkAgg(fig, master=md_holder)
+        canvas.draw()
+        canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        _md_canvas["widget"] = canvas
+
+    def clear_mission_diagram():
+        old = _md_canvas.get("widget")
+        if old is not None:
+            try:
+                old.get_tk_widget().destroy()
+            except Exception:
+                pass
+            _md_canvas["widget"] = None
+        md_placeholder.configure(
+            text="A fixed speed sweep has no route.\n\n"
+                 "Run a mission to map its ground track and altitude profile.")
+        md_placeholder.grid()
+
 
     ad_frame = ttk.LabelFrame(tab_airframe_diagram,
                               text="Plan View (to scale)", padding=4)
@@ -6918,6 +6960,7 @@ def launch_gui():
             _last_run["from_mission"] = False
             _set_result_scope(False)
             _set_sensitivity_outputs(False)
+            clear_mission_diagram()
             _clear_sensitivity("Fixed speed sweep re-run — sensitivity is out of date")
             _last_run["metrics"] = m
             _last_run["wind"]    = wind_speed
@@ -7078,6 +7121,7 @@ def launch_gui():
                 _last_run["from_mission"] = True
                 refresh_comparison()
                 _set_sensitivity_outputs(True)
+                refresh_mission_diagram(mission)
                 _clear_sensitivity("Mission re-run — sensitivity is out of date")
                 # Everything the sensitivity sweep needs to re-fly this exact
                 # mission with a perturbed configuration.

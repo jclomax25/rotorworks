@@ -120,6 +120,79 @@ def polygon_area_px2(points: List[Tuple[float, float]]) -> float:
     return abs(area) / 2.0
 
 
+def _segments_cross(p1, p2, p3, p4) -> bool:
+    """
+    Do closed segments p1-p2 and p3-p4 share any point?
+
+    Uses the orientation test rather than solving for an intersection, so it
+    has no division and no tolerance to tune. Collinear overlap counts as
+    crossing: a trace that doubles back along itself is just as broken as one
+    that cuts across.
+    """
+    def orient(a, b, c) -> int:
+        val = (b[1] - a[1]) * (c[0] - b[0]) - (b[0] - a[0]) * (c[1] - b[1])
+        if abs(val) < 1e-12:
+            return 0                       # collinear
+        return 1 if val > 0 else 2         # clockwise / counter-clockwise
+
+    def on_span(a, b, c) -> bool:
+        """Is c inside the bounding box of a-b, given all three are collinear?"""
+        return (min(a[0], b[0]) - 1e-12 <= c[0] <= max(a[0], b[0]) + 1e-12 and
+                min(a[1], b[1]) - 1e-12 <= c[1] <= max(a[1], b[1]) + 1e-12)
+
+    o1, o2 = orient(p1, p2, p3), orient(p1, p2, p4)
+    o3, o4 = orient(p3, p4, p1), orient(p3, p4, p2)
+
+    if o1 != o2 and o3 != o4:
+        return True
+    if o1 == 0 and on_span(p1, p2, p3):
+        return True
+    if o2 == 0 and on_span(p1, p2, p4):
+        return True
+    if o3 == 0 and on_span(p3, p4, p1):
+        return True
+    if o4 == 0 and on_span(p3, p4, p2):
+        return True
+    return False
+
+
+def polygon_self_intersects(points: List[Tuple[float, float]]) -> bool:
+    """
+    Does this closed polygon cross itself?
+
+    The shoelace formula assumes a SIMPLE polygon. Given a self-intersecting
+    one it silently returns the signed sum of the lobes — which for a
+    figure-eight is the DIFFERENCE of the two halves, and can be anywhere from
+    the right answer to zero. It never raises and never looks wrong.
+
+    That matters here because tracing a silhouette by clicking on a photo is
+    exactly the situation where someone crosses their own outline: a stray
+    click, a boom traced in the wrong order, a vertex dropped in the wrong
+    place. Without this check the area comes back plausible and wrong.
+
+    Adjacent edges share a vertex by construction, and the first and last edge
+    close the loop, so neither pair counts as an intersection.
+
+    O(n^2) in the number of vertices, which is nothing for the tens of points
+    a hand-traced outline has.
+    """
+    n = len(points)
+    if n < 4:
+        return False                       # a triangle cannot cross itself
+
+    for i in range(n):
+        a1, a2 = points[i], points[(i + 1) % n]
+        for j in range(i + 1, n):
+            # Skip edges that share a vertex: consecutive edges, and the
+            # wrap-around pair joining the last vertex back to the first.
+            if j == i or (j + 1) % n == i or (i + 1) % n == j:
+                continue
+            b1, b2 = points[j], points[(j + 1) % n]
+            if _segments_cross(a1, a2, b1, b2):
+                return True
+    return False
+
+
 # ============================================================
 # VIEW CANVAS  — one photo + polygon editor per vehicle view
 # ============================================================
@@ -1191,6 +1264,20 @@ class PropDragTab(ttk.Frame):
             f"Induced velocity  v_h = √({T_per_motor:.3f} / (2×{rho:.4f}×{A_disk*1e4:.2f} cm²)) "
             f"= {v_h:.3f} m/s"
             + rpm_str
+            # This figure is an IDEAL upper bound, and testing showed it runs
+            # 4-6x above the value ArduPilot actually recommends. Saying so
+            # here is the difference between a useful number and one that
+            # silently over-damps a user's EKF.
+            + (f"\n\nNOTE  MCOEF = g/(2·v_h) = {mcoef:.3f} is the IDEAL "
+               f"momentum drag,\n"
+               f"assuming the rotor entrains the freestream completely and "
+               f"turns all\nof its lateral momentum. A real rotor captures "
+               f"only a fraction.\n"
+               f"ArduPilot's documented typical EK3_DRAG_MCOEF is ~0.15, so "
+               f"this\nvalue is about {mcoef / 0.15:.0f}x higher. Treat it as "
+               f"an upper bound and start\nfrom ArduPilot's guidance, or tune "
+               f"against flight logs — do not type\nthis number straight into "
+               f"the parameter.")
         )
 
         self._detail.configure(state="normal")

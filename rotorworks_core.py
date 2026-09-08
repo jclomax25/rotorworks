@@ -74,6 +74,8 @@ __all__ = [
     # propeller coefficients
     "estimate_prop_thrust_coefficient", "estimate_prop_power_coefficient",
     "rpm_from_thrust", "derive_prop_coefficients_from_table",
+    # mission ground track
+    "mission_ground_track", "make_mission_diagram_figure",
     # turning flight
     "turn_bank_deg", "turn_load_factor", "turn_thrust_N",
     # translation geometry
@@ -1262,6 +1264,128 @@ def rotor_load_spread(thrusts: List[float]) -> dict:
         "spread": hi / lo if lo > 1e-9 else float("inf"),
         "imbalance_pct": (hi / mean - 1.0) * 100.0 if mean > 1e-9 else 0.0,
     }
+
+
+# ============================================================
+# MISSION GROUND TRACK
+# ============================================================
+
+def mission_ground_track(phases: List[dict]) -> List[dict]:
+    """
+    Dead-reckon a mission into waypoints on the ground.
+
+    Missions are written as legs — a heading, a distance, an altitude — not as
+    coordinates, so the shape of the route is never actually stated anywhere.
+    Integrating the legs recovers it, which is the only way to see whether a
+    pattern closes, overlaps itself, or drifts.
+
+    Compass convention: `course_deg` is 0 for north and 90 for east, so a leg
+    advances north by `cos(course)` and east by `sin(course)`. Plotting east
+    on x and north on y then puts north up the page, as a map should be.
+
+    Each phase dict may carry `course_deg`, `distance` (m), `altitude` (m),
+    `name`, and either `translation_direction_deg` (multirotor, direction of
+    travel measured from the nose) or `bank_deg` (fixed-wing). Yaw is the
+    heading the AIRFRAME points, which for a multirotor translating sideways
+    is not the direction it is moving:
+
+        yaw = course - translation_direction
+
+    Returns one dict per waypoint: x_m (east), y_m (north), altitude_m,
+    yaw_deg, name, index. The first entry is the start point.
+    """
+    track: List[dict] = []
+    x = y = 0.0
+    alt = float(phases[0].get("altitude", 0.0)) if phases else 0.0
+
+    track.append({"x_m": 0.0, "y_m": 0.0, "altitude_m": 0.0,
+                  "yaw_deg": float(phases[0].get("course_deg", 0.0)) if phases else 0.0,
+                  "name": "Takeoff", "index": 0})
+
+    for i, phase in enumerate(phases, start=1):
+        course = float(phase.get("course_deg", 0.0) or 0.0)
+        dist = float(phase.get("distance", 0.0) or 0.0)
+        alt = float(phase.get("altitude", alt) or 0.0)
+
+        # A phase with no distance (a hover, a yaw pause, a climb) holds
+        # position, so it still earns a waypoint — the altitude changes even
+        # though the ground position does not.
+        if dist > 0:
+            x += dist * math.sin(math.radians(course))
+            y += dist * math.cos(math.radians(course))
+
+        psi = phase.get("translation_direction_deg")
+        yaw = course - float(psi) if psi is not None else course
+
+        track.append({"x_m": x, "y_m": y, "altitude_m": alt,
+                      "yaw_deg": yaw % 360.0,
+                      "name": str(phase.get("name", f"Phase {i}")),
+                      "index": i})
+    return track
+
+
+def make_mission_diagram_figure(phases: List[dict], figsize=(12, 5.5)):
+    """
+    Two views of a mission: the ground track from above, and the altitude
+    profile. Both number the waypoints in flight order.
+
+    The plan view carries an arrow at each waypoint showing where the AIRFRAME
+    is pointing, which for a multirotor is not always where it is going. A
+    square flown with the nose fixed and one flown by yawing at each corner
+    trace the same path; only the arrows tell them apart.
+    """
+    track = mission_ground_track(phases)
+    fig, (ax_plan, ax_alt) = make_figure(1, 2, figsize=figsize)
+
+    xs = [w["x_m"] for w in track]
+    ys = [w["y_m"] for w in track]
+
+    # ---- plan view ----------------------------------------------------
+    ax_plan.plot(xs, ys, color="#1565C0", linewidth=1.6, zorder=2)
+    ax_plan.scatter(xs, ys, s=26, color="#1565C0", zorder=3)
+
+    span = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
+    arrow = span * 0.06
+    for w in track:
+        # Compass yaw: 0 is north (up), 90 is east (right).
+        th = math.radians(w["yaw_deg"])
+        ax_plan.annotate(
+            "", xytext=(w["x_m"], w["y_m"]),
+            xy=(w["x_m"] + arrow * math.sin(th), w["y_m"] + arrow * math.cos(th)),
+            arrowprops=dict(arrowstyle="-|>", color="#EF6C00", lw=1.4), zorder=4)
+        ax_plan.annotate(str(w["index"]), (w["x_m"], w["y_m"]),
+                         textcoords="offset points", xytext=(6, 6),
+                         fontsize=8, fontweight="bold", color="#37474F", zorder=5)
+
+    ax_plan.scatter([xs[0]], [ys[0]], s=150, marker="^", color="#2E7D32",
+                    zorder=6, label="Takeoff")
+    ax_plan.scatter([xs[-1]], [ys[-1]], s=150, marker="v", color="#C62828",
+                    zorder=6, label="Landing")
+    ax_plan.set_xlabel("East (m)")
+    ax_plan.set_ylabel("North (m)")
+    ax_plan.set_title("Ground track — arrows show airframe yaw")
+    ax_plan.set_aspect("equal", adjustable="datalim")
+    ax_plan.grid(True, alpha=0.4)
+    ax_plan.legend(fontsize=8, loc="best")
+
+    # ---- altitude profile ---------------------------------------------
+    idx = [w["index"] for w in track]
+    alts = [w["altitude_m"] for w in track]
+    ax_alt.plot(idx, alts, color="#2E7D32", linewidth=1.8, marker="o",
+                markersize=5)
+    for w in track:
+        ax_alt.annotate(str(w["index"]), (w["index"], w["altitude_m"]),
+                        textcoords="offset points", xytext=(0, 8),
+                        ha="center", fontsize=8, fontweight="bold",
+                        color="#37474F")
+    ax_alt.set_xlabel("Waypoint")
+    ax_alt.set_ylabel("Altitude (m)")
+    ax_alt.set_title("Altitude profile")
+    ax_alt.grid(True, alpha=0.4)
+    ax_alt.set_xticks(idx)
+
+    fig.tight_layout()
+    return fig
 
 
 # ============================================================

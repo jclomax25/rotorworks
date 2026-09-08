@@ -1,6 +1,6 @@
 # Test suite
 
-444 tests covering the shared core, physics, the CLI, the GUI, the batch
+483 tests covering the shared core, physics, the CLI, the GUI, the batch
 driver, the VTOL simulator, and a full config/mission coverage matrix.
 
 Almost every test here corresponds to a bug that was actually shipped. The
@@ -45,11 +45,12 @@ safe to run.
 | `conftest.py` | — | — | Loads the simulators by path, provides reference aircraft |
 | `test_golden.py` | 1 | ~2 s | 348 stored numeric outputs across both simulators |
 | `test_core.py` | 84 | ~1 s | `rotorworks_core`: SoC, wind, inflow, sensitivity, comparison, propeller coefficients, power budget, airframe geometry |
-| `test_physics.py` | 128 | ~5 s | Battery topology, atmosphere, rotor inflow, prop efficiency, drag, turns, translation direction, thresholds, figure leaks |
+| `test_physics.py` | 130 | ~5 s | Battery topology, atmosphere, rotor inflow, prop efficiency, drag, turns, translation direction, thresholds, figure leaks |
 | `test_vtol.py` | 27 | ~3 s | VTOL transition hand-over, config gating, mission energy split |
 | `test_cli.py` | 67 | ~3 min | Real subprocess runs: every argument path, every example mission, edge cases, malformed input |
 | `test_gui.py` | 46 | ~4 min | Real Tk window: hover events, mode toggle, config load, missions, exports, diagram, sensitivity, comparison |
-| `test_matrix.py` | 71 | ~4 min | Every config and mission x GUI and CLI x with and without a propeller table |
+| `test_matrix.py` | 83 | ~4 min | Every config and mission x GUI and CLI x with and without a propeller table |
+| `test_drag_calculator.py` | 25 | ~1 s | Shoelace geometry, pixel scaling, ISA density, ArduPilot BCOEF and MCOEF |
 | `test_batch.py` | 20 | ~2.5 min | Sweeps, sizing, mode enforcement, GUI-config translation, GUI↔CLI consistency |
 
 ### Marks

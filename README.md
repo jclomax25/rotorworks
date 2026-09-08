@@ -1,7 +1,7 @@
 # RotorWorks UAV Power Simulators
 
 **UASforge / dronefoundry**  
-*Simulators v2.40.0*
+*Simulators v2.41.0*
 
 A suite of cross-platform UAV powertrain performance tools:
 
@@ -688,6 +688,26 @@ Version** — this release is **VTOL simulator v0.1.0** (new file, versioned sep
   transition physics differs enough that a fallback would be confidently wrong.
 - The Glauert forward-flight inflow solver moved from the multicopter into
   `rotorworks_core`, since the VTOL lift rotors need the same physics.
+
+**v2.41.0** — Mission Diagram tab
+- **New Mission Diagram tab** in both simulators, drawn after a mission run.
+  Missions are written as legs — a heading, a distance, an altitude — never as
+  coordinates, so the SHAPE of the route was not stated anywhere. Integrating
+  the legs recovers it, which is the only way to see whether a pattern closes,
+  overlaps itself, or drifts.
+- **Ground track** with waypoints numbered in flight order, takeoff marked
+  with a green triangle and landing with a red one, and an **arrow at each
+  waypoint showing where the airframe is pointing**. That last part matters
+  for a multirotor: a square flown with the nose fixed and one flown by yawing
+  at each corner trace the identical path, and only the arrows tell them
+  apart.
+  North is up and east is right, so the map reads as a map.
+- **Altitude profile** beside it, waypoints numbered to match.
+- The tab clears with a note after a fixed speed sweep, which has no route.
+- **Power Budget pie chart removed** from both. A dozen slivers with a legend
+  longer than the chart conveyed less than the table beside it, and the
+  smallest rails were unreadable at any size — the percentage column already
+  carries the same information.
 
 **v2.40.0**
 - **Sensitivity results clear when a new run makes them stale**, in both
