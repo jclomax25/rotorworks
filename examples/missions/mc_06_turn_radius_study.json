@@ -1,0 +1,52 @@
+{
+  "_comment": "Orbit study: the same 600 m of ground track flown straight, then in a wide orbit, then in a tight one. Tighter turns need more thrust (n = 1/cos(bank)) and cost markedly more energy for identical distance \u2014 which is the point.",
+  "reserve_percent": 20,
+  "wind_direction_deg": 0,
+  "phases": [
+    {
+      "name": "Takeoff climb",
+      "speed": 0.0,
+      "duration": 30,
+      "altitude": 60,
+      "climb_rate_mps": 2.0
+    },
+    {
+      "name": "Straight 600 m",
+      "speed": 12.0,
+      "distance": 600,
+      "altitude": 60,
+      "course_deg": 0
+    },
+    {
+      "name": "Orbit R=40 m",
+      "speed": 12.0,
+      "distance": 600,
+      "altitude": 60,
+      "course_deg": 0,
+      "turn_radius_m": 40
+    },
+    {
+      "name": "Orbit R=20 m",
+      "speed": 12.0,
+      "distance": 600,
+      "altitude": 60,
+      "course_deg": 0,
+      "turn_radius_m": 20
+    },
+    {
+      "name": "Orbit R=12 m",
+      "speed": 12.0,
+      "distance": 600,
+      "altitude": 60,
+      "course_deg": 0,
+      "turn_radius_m": 12
+    },
+    {
+      "name": "Descend and land",
+      "speed": 0.0,
+      "duration": 30,
+      "altitude": 0,
+      "descent_rate_mps": 2.0
+    }
+  ]
+}

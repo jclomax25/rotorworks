@@ -1,0 +1,80 @@
+{
+  "_comment": "Square with 25 m rounded corners, flown nose-first throughout with no yaw stops. The aircraft never stops translating, but each corner is a coordinated turn, so it must tilt sideways for centripetal force on top of beating drag.",
+  "reserve_percent": 20,
+  "wind_direction_deg": 0,
+  "phases": [
+    {
+      "name": "Takeoff climb",
+      "speed": 0.0,
+      "duration": 30,
+      "altitude": 60,
+      "climb_rate_mps": 2.0
+    },
+    {
+      "name": "Leg 1 north",
+      "speed": 10.0,
+      "distance": 350.0,
+      "altitude": 60,
+      "course_deg": 0,
+      "translation_direction_deg": 0
+    },
+    {
+      "name": "Rounded corner 1",
+      "speed": 10.0,
+      "distance": 39.3,
+      "altitude": 60,
+      "course_deg": 45,
+      "translation_direction_deg": 0,
+      "turn_radius_m": 25.0
+    },
+    {
+      "name": "Leg 2 east",
+      "speed": 10.0,
+      "distance": 350.0,
+      "altitude": 60,
+      "course_deg": 90,
+      "translation_direction_deg": 0
+    },
+    {
+      "name": "Rounded corner 2",
+      "speed": 10.0,
+      "distance": 39.3,
+      "altitude": 60,
+      "course_deg": 135,
+      "translation_direction_deg": 0,
+      "turn_radius_m": 25.0
+    },
+    {
+      "name": "Leg 3 south",
+      "speed": 10.0,
+      "distance": 350.0,
+      "altitude": 60,
+      "course_deg": 180,
+      "translation_direction_deg": 0
+    },
+    {
+      "name": "Rounded corner 3",
+      "speed": 10.0,
+      "distance": 39.3,
+      "altitude": 60,
+      "course_deg": 225,
+      "translation_direction_deg": 0,
+      "turn_radius_m": 25.0
+    },
+    {
+      "name": "Leg 4 west",
+      "speed": 10.0,
+      "distance": 350.0,
+      "altitude": 60,
+      "course_deg": 270,
+      "translation_direction_deg": 0
+    },
+    {
+      "name": "Descend and land",
+      "speed": 0.0,
+      "duration": 30,
+      "altitude": 0,
+      "descent_rate_mps": 2.0
+    }
+  ]
+}

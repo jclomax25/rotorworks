@@ -556,3 +556,232 @@ def test_format_delta_is_signed_and_handles_none(core):
     assert core.format_delta(None) == "—"
     assert core.format_delta(float("nan")) == "—"
 
+
+
+# ======================================================================
+# PROPELLER COEFFICIENTS
+# ======================================================================
+
+def _table_path(name):
+    import os
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", name)
+
+
+def test_coefficients_derived_from_a_table_are_self_consistent(core, mc):
+    """
+    C_T should be nearly constant across a static table — the coefficient
+    exists precisely to remove the RPM dependence. A large spread would mean
+    the fit is not describing a single regime and should not be trusted.
+    """
+    prop = mc.PropellerConfig(diameter_in=22, pitch_in=7.2, max_rpm=0,
+                              max_thrust_g=9500, blades=2, weight_g=110,
+                              table_csv=_table_path("motor_prop_table.csv"))
+    derived = core.derive_prop_coefficients_from_table(prop.table, 22.0)
+    assert derived is not None
+    assert derived["points"] > 10
+    assert derived["c_t_spread"] < 1.20, \
+        f"C_T varies by {derived['c_t_spread']:.2f}x across the table"
+    assert 0.02 < derived["c_t"] < 0.20, "C_T outside any plausible range"
+    assert 0.005 < derived["c_p"] < 0.15, "C_P outside any plausible range"
+
+
+def test_geometry_estimate_matches_measured_propellers(core, mc, fw):
+    """
+    Regression: the original C_T fit was invented rather than measured and
+    came out roughly TWICE too high against both sample propellers. Since
+    RPM goes as 1/sqrt(C_T) that understated propeller speed by about 40%,
+    and it passed an earlier eyeball check only because the resulting tip
+    speeds landed inside a plausible band.
+
+    The fit is now calibrated against those measurements, so it must stay
+    close to them.
+    """
+    mc_prop = mc.PropellerConfig(diameter_in=22, pitch_in=7.2, max_rpm=0,
+                                 max_thrust_g=9500, blades=2, weight_g=110,
+                                 table_csv=_table_path("motor_prop_table.csv"))
+    fw_prop = fw.PropellerConfig(diameter_in=18, pitch_in=8, blades=2,
+                                 weight_g=60,
+                                 table_csv=_table_path("fw_motor_prop_table.csv"))
+
+    for prop, diameter, pitch in ((mc_prop, 22.0, 7.2), (fw_prop, 18.0, 8.0)):
+        measured = core.derive_prop_coefficients_from_table(prop.table, diameter)
+        estimated = core.estimate_prop_thrust_coefficient(diameter, pitch, 2)
+        error = abs(estimated / measured["c_t"] - 1.0)
+        assert error < 0.25, (
+            f"{diameter}x{pitch}: estimate {estimated:.4f} vs measured "
+            f"{measured['c_t']:.4f} — {error * 100:.0f}% off")
+
+
+def test_derivation_needs_an_rpm_column(core):
+    """Without a rotational speed there is no way to non-dimensionalise."""
+    import pandas as pd
+    df = pd.DataFrame({"Thrust_g": [1000, 2000], "Power_W": [100, 250]})
+    assert core.derive_prop_coefficients_from_table(df, 18.0) is None
+
+
+def test_power_coefficient_follows_from_thrust_coefficient(core):
+    """
+    C_P is derived from C_T through momentum theory rather than fitted
+    separately, so the two cannot drift into disagreement.
+    """
+    for c_t in (0.05, 0.10, 0.20):
+        c_p = core.estimate_prop_power_coefficient(c_t)
+        assert c_p > 0
+        assert core.estimate_prop_power_coefficient(c_t * 2) > c_p, \
+            "a higher thrust coefficient must cost more power"
+
+
+# ======================================================================
+# POWER BUDGET
+# ======================================================================
+
+def test_power_budget_balances(core):
+    """
+    Delivered plus lost must equal the total exactly. If it does not, the
+    table is claiming to account for energy it has not accounted for.
+    """
+    rows = core.build_power_budget(
+        total_in_W=1000.0, motor_shaft_W=780.0, motor_copper_W=60.0,
+        battery_i2r_W=25.0, esc_loss_W=35.0, peripheral_W=20.0,
+        rails=[{"name": "5V", "voltage_V": 5, "current_A": 2.0, "efficiency": 0.9}])
+
+    delivered = sum(r["watts"] for r in rows if r["kind"] == "delivered")
+    lost = sum(r["watts"] for r in rows if r["kind"] == "lost")
+    total = next(r["watts"] for r in rows if r["kind"] == "total")
+
+    assert delivered + lost == pytest.approx(total, rel=1e-9)
+    assert sum(r["pct"] for r in rows
+               if r["kind"] in ("delivered", "lost")) == pytest.approx(100.0, abs=1e-6)
+
+
+def test_battery_loss_is_not_double_counted(core):
+    """
+    Regression: terminal power is measured at the SAGGED voltage, so the
+    pack's own I2R loss is already expressed as reduced voltage rather than
+    extra current. Listing it as a loss inside the terminal power charged it
+    twice and produced a negative "Unaccounted" row exactly equal to the I2R.
+
+    The total is therefore taken at the cells: P_cells = P_terminals + I2R.
+    """
+    # These must add up at the TERMINALS: 925 + 50 + 25 = 1000. The pack's
+    # own I2R then sits on top to give the cell-side total.
+    i2r = 25.0
+    rows = core.build_power_budget(
+        total_in_W=1000.0, motor_shaft_W=925.0, motor_copper_W=50.0,
+        battery_i2r_W=i2r, esc_loss_W=25.0)
+
+    total = next(r["watts"] for r in rows if r["kind"] == "total")
+    assert total == pytest.approx(1000.0 + i2r), \
+        "the total should be cell-side, i.e. terminal power plus pack I2R"
+    assert not any("Unaccounted" in r["name"] for r in rows), \
+        "a residual row means the accounting does not close"
+
+
+def test_power_budget_flags_an_incomplete_breakdown(core):
+    """
+    If the itemised rows genuinely do not add up, that must be visible rather
+    than silently absorbed into the percentages.
+    """
+    rows = core.build_power_budget(
+        total_in_W=1000.0, motor_shaft_W=100.0, motor_copper_W=10.0,
+        battery_i2r_W=0.0, esc_loss_W=10.0)
+    assert any("Unaccounted" in r["name"] for r in rows), \
+        "880 W missing should be reported, not hidden"
+
+
+def test_rail_losses_follow_efficiency(core):
+    """A less efficient regulator must waste more for the same delivered power."""
+    def loss_for(efficiency):
+        rows = core.build_power_budget(
+            total_in_W=500.0, motor_shaft_W=400.0, motor_copper_W=20.0,
+            battery_i2r_W=10.0, esc_loss_W=20.0,
+            rails=[{"name": "5V", "voltage_V": 5, "current_A": 2.0,
+                    "efficiency": efficiency}])
+        return next(r["watts"] for r in rows if "regulator loss" in r["name"])
+
+    assert loss_for(0.80) > loss_for(0.95)
+
+
+# ======================================================================
+# PER-ROTOR LOAD SHARING
+# ======================================================================
+
+def _x_quad(core, arm=0.237):
+    """Four rotors in an X, +x forward and +y right."""
+    import math as _m
+    return [(arm * _m.cos(a), arm * _m.sin(a))
+            for a in (_m.pi / 4, 3 * _m.pi / 4, 5 * _m.pi / 4, 7 * _m.pi / 4)]
+
+
+def test_drag_through_the_cg_loads_every_rotor_equally(core):
+    """With no moment arm there is no moment, so nothing is unbalanced."""
+    thrusts = core.rotor_thrust_distribution(
+        _x_quad(core), 17.66, drag_N=2.2, translation_azimuth_deg=0.0,
+        drag_height_above_cg_m=0.0)
+    assert all(t == pytest.approx(17.66 / 4) for t in thrusts)
+
+
+def test_rotor_thrusts_always_sum_to_the_total(core):
+    """
+    The split redistributes thrust; it must not create or destroy any. If the
+    sum drifted, the aircraft would be silently heavier or lighter than the
+    weight it is holding up.
+    """
+    for azimuth in (0.0, 45.0, 90.0, 180.0, 270.0):
+        thrusts = core.rotor_thrust_distribution(
+            _x_quad(core), 17.66, drag_N=2.2,
+            translation_azimuth_deg=azimuth, drag_height_above_cg_m=0.06)
+        assert sum(thrusts) == pytest.approx(17.66, rel=1e-9)
+
+
+def test_trailing_rotors_work_harder_than_leading_ones(core):
+    """
+    Drag above the CG pitches the nose down, so the rotors BEHIND the CG must
+    push harder to hold attitude. Which rotor saturates first is decided by
+    this, not by the average.
+    """
+    positions = _x_quad(core)          # 0,3 are forward; 1,2 are aft
+    thrusts = core.rotor_thrust_distribution(
+        positions, 17.66, drag_N=2.2, translation_azimuth_deg=0.0,
+        drag_height_above_cg_m=0.06)
+    forward_pair = (thrusts[0] + thrusts[3]) / 2
+    aft_pair = (thrusts[1] + thrusts[2]) / 2
+    assert aft_pair > forward_pair
+
+
+def test_travel_direction_selects_which_rotors_load(core):
+    """
+    Flying forwards loads the aft pair; flying right loads the left-hand pair.
+    The imbalance follows the direction of travel, which is the whole point of
+    having a translation direction.
+    """
+    positions = _x_quad(core)
+    fwd = core.rotor_thrust_distribution(
+        positions, 17.66, drag_N=2.2, translation_azimuth_deg=0.0,
+        drag_height_above_cg_m=0.06)
+    right = core.rotor_thrust_distribution(
+        positions, 17.66, drag_N=2.2, translation_azimuth_deg=90.0,
+        drag_height_above_cg_m=0.06)
+    assert fwd != right, "direction of travel must change which rotors load"
+    # Same magnitude of imbalance, different rotors carrying it.
+    assert core.rotor_load_spread(fwd)["spread"] == pytest.approx(
+        core.rotor_load_spread(right)["spread"], rel=1e-9)
+
+
+def test_load_spread_reports_a_meaningful_imbalance(core):
+    spread = core.rotor_load_spread([4.0, 4.0, 5.0, 5.0])
+    assert spread["max_N"] == 5.0 and spread["min_N"] == 4.0
+    assert spread["spread"] == pytest.approx(1.25)
+    assert spread["imbalance_pct"] == pytest.approx(11.111, abs=0.01)
+
+    even = core.rotor_load_spread([4.4] * 4)
+    assert even["spread"] == pytest.approx(1.0)
+    assert even["imbalance_pct"] == pytest.approx(0.0)
+
+
+def test_no_rotor_is_asked_to_pull_downward(core):
+    """A rotor cannot produce negative thrust, so the split must floor at 0."""
+    thrusts = core.rotor_thrust_distribution(
+        _x_quad(core), 5.0, drag_N=50.0, translation_azimuth_deg=0.0,
+        drag_height_above_cg_m=0.5)
+    assert all(t >= 0.0 for t in thrusts)

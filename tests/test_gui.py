@@ -264,7 +264,7 @@ def test_runs_succeed_in_both_modes(request, which):
     for mode in ("Advanced", "Simple"):
         gui.radio(mode).invoke()
         gui.pump()
-        errs = gui.click("Single-Point")
+        errs = gui.click("Fixed Speed Sweep")
         assert not errs, f"{mode} mode run failed: {errs[0][:200]}"
 
 
@@ -276,7 +276,7 @@ def test_every_multicopter_config_loads_and_runs(mc_gui, paths):
     for cfg in _configs(paths, "multicopter"):
         mc_gui.set_open_dialog(cfg)
         mc_gui.click("Load Config")
-        errs = mc_gui.click("Single-Point")
+        errs = mc_gui.click("Fixed Speed Sweep")
         assert not errs, f"{os.path.basename(cfg)}: {errs[0][:200]}"
 
 
@@ -284,7 +284,7 @@ def test_every_fixedwing_config_loads_and_runs(fw_gui, paths):
     for cfg in _configs(paths, "fixedwing"):
         fw_gui.set_open_dialog(cfg)
         fw_gui.click("Load Config")
-        errs = fw_gui.click("Single-Point")
+        errs = fw_gui.click("Fixed Speed Sweep")
         assert not errs, f"{os.path.basename(cfg)}: {errs[0][:200]}"
 
 
@@ -328,7 +328,7 @@ def test_config_save_and_reload_round_trip(request, which, tmp_path):
 
     gui.set_open_dialog(dest)
     assert not gui.click("Load Config")
-    assert not gui.click("Single-Point")
+    assert not gui.click("Fixed Speed Sweep")
 
 
 @pytest.mark.parametrize("label,ext,dependency", [
@@ -342,7 +342,7 @@ def test_exports_produce_files(request, which, label, ext, dependency, tmp_path)
         pytest.importorskip(dependency, reason=f"{dependency} not installed")
     gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
 
-    gui.click("Single-Point")
+    gui.click("Fixed Speed Sweep")
     dest = str(tmp_path / f"out{ext}")
     gui.set_save_dialog(dest)
     errs = gui.click(label)
@@ -386,7 +386,7 @@ def test_loading_a_config_does_not_block_on_a_modal(request, which, paths):
 
     assert not errs, f"loading raised: {errs[0][:200]}"
     # The button path may confirm; what matters is that it returned at all.
-    assert gui.click("Single-Point") == []
+    assert gui.click("Fixed Speed Sweep") == []
 
 
 @pytest.mark.parametrize("which", ["mc", "fw"])
@@ -420,8 +420,11 @@ def test_airframe_diagram_tab_exists_after_weight_budget(request, which):
             tabs = [widget.tab(i, "text") for i in range(len(widget.tabs()))]
             if "Weight Budget" in tabs:
                 assert "Airframe Diagram" in tabs, "diagram tab missing"
-                assert tabs.index("Airframe Diagram") == tabs.index("Weight Budget") + 1, \
-                    "diagram tab must follow Weight Budget"
+                # Ordering, not adjacency: Power Budget was later inserted
+                # between the two, and the requirement was always that the
+                # diagram comes after the budgets, not immediately after.
+                assert tabs.index("Airframe Diagram") > tabs.index("Weight Budget"), \
+                    "diagram tab should come after Weight Budget"
                 return
     pytest.fail("no display notebook containing a Weight Budget tab")
 
@@ -434,7 +437,7 @@ def test_airframe_diagram_draws_on_a_run(request, which):
     broken diagram would otherwise show up as a stuck placeholder.
     """
     gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
-    assert gui.click("Single-Point") == []
+    assert gui.click("Fixed Speed Sweep") == []
     gui.pump()
 
     placeholders = [w for w in gui.refresh()
@@ -452,7 +455,7 @@ def test_airframe_diagram_survives_missing_dimensions(request, which):
     still draw, using proportionate assumptions rather than failing.
     """
     gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
-    assert gui.click("Single-Point") == []
+    assert gui.click("Fixed Speed Sweep") == []
     gui.pump()
     placeholders = [w for w in gui.refresh()
                     if isinstance(w, ttk.Label)
@@ -497,7 +500,7 @@ def test_sensitivity_ranks_inputs_by_influence(request, which):
     that ordering is what makes the tornado chart readable.
     """
     gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
-    assert gui.click("Single-Point") == []
+    assert gui.click("Fixed Speed Sweep") == []
     assert gui.click("Run Sensitivity") == []
     gui.pump()
 
@@ -531,7 +534,7 @@ def test_sensitivity_needs_a_run_first(request, which):
 @pytest.mark.parametrize("which", ["mc", "fw"])
 def test_comparison_is_empty_until_a_baseline_is_pinned(request, which):
     gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
-    assert gui.click("Single-Point") == []
+    assert gui.click("Fixed Speed Sweep") == []
     tree = _tree_with(gui, "metric", "delta", "pct")
     assert tree is not None, "comparison table not found"
     assert tree.get_children() == (), "comparison populated with no baseline"
@@ -545,9 +548,9 @@ def test_pinned_baseline_shows_zero_delta_against_itself(request, which):
     the same thing.
     """
     gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
-    assert gui.click("Single-Point") == []
+    assert gui.click("Fixed Speed Sweep") == []
     assert gui.click("Pin Current") == []
-    assert gui.click("Single-Point") == []
+    assert gui.click("Fixed Speed Sweep") == []
     gui.pump()
 
     tree = _tree_with(gui, "metric", "delta", "pct")
@@ -567,7 +570,7 @@ def test_pinned_baseline_shows_zero_delta_against_itself(request, which):
 @pytest.mark.parametrize("which", ["mc", "fw"])
 def test_clearing_the_baseline_empties_the_table(request, which):
     gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
-    gui.click("Single-Point")
+    gui.click("Fixed Speed Sweep")
     gui.click("Pin Current")
     gui.pump()
     tree = _tree_with(gui, "metric", "delta", "pct")
@@ -624,5 +627,21 @@ def test_running_with_a_measured_table_loaded(request, which, paths):
     browse.invoke()
     gui.pump()
 
-    errs = gui.click("Single-Point")
+    errs = gui.click("Fixed Speed Sweep")
     assert errs == [], f"running with a table raised: {errs[:1]}"
+
+
+# NOT COVERED: comparison across two MISSION runs.
+#
+# The fixed-wing had two ordering faults here — the mission path never called
+# refresh_comparison() at all, and once it did, it ran BEFORE
+# _last_run["metrics"] was stored, so the tab compared the new baseline
+# against the PREVIOUS run's numbers and every delta read +0.00.
+#
+# Both are fixed and verified by hand (21 of 25 rows move after a 25% weight
+# change). There is no automated test because this harness cannot drive a
+# mission run: it has no way to set the Mission JSON field, and the several
+# "Browse" buttons cannot be told apart by label fragment. Adding that
+# capability to the harness is the prerequisite, and it would also unlock
+# mission coverage for the Status, Metrics and Power Budget tabs, none of
+# which are exercised on the mission path either.

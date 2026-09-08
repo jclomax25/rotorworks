@@ -1,8 +1,6 @@
 {
-  "_comment": "Out-and-back delivery with a hover drop at the far end. Wind is from the west, so the outbound leg is a headwind and the return is a tailwind. Note the sim does not drop payload mass mid-flight \u2014 for a true loaded/unloaded comparison, run this twice with different Payload Mass values.",
-  "reserve_percent": 25,
-  "rth_reserve_Wh": 10,
-  "diversion_reserve_Wh": 5,
+  "_comment": "Out-and-back delivery with a hover drop at the far end. Wind is from the west, so the outbound leg is a headwind and the return is a tailwind. Note the sim does not drop payload mass mid-flight \u2014 for a true loaded/unloaded comparison, run this twice with different Payload Mass values. Reserve is 35% of USABLE energy, which replaces the old '25% plus 10 Wh RTH and 5 Wh diversion' \u2014 the separate reserve fields were removed in v2.19.0 and one percentage now covers landing, return-to-home and diversion.",
+  "reserve_percent": 35,
   "wind_direction_deg": 270,
   "transient_dt_s": 0.5,
   "max_accel_mps2": 2.0,

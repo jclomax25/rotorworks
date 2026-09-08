@@ -260,3 +260,24 @@ def test_multicopter_edge_cases(paths, extra, label):
 ])
 def test_fixedwing_edge_cases(paths, extra, label):
     assert_no_crash(run_sim(paths["fixedwing"], FW_BASE + extra), label)
+
+
+def test_cli_accepts_the_orientation_names_the_gui_writes(paths):
+    """
+    Regression: the model, the GUI dropdown and the example configs moved to
+    "translating" in 2.26.0/2.30.0, but the CLI kept a hover/forward-only
+    argparse choices list AND a second validator inside main(). The batch
+    driver therefore could not run a config the GUI had just written.
+
+    Every entry point must accept the same vocabulary.
+    """
+    for orientation in ("translating", "hover", "forward"):
+        assert_clean(run_sim(paths["multicopter"],
+                             MC_BASE + ["--orientation", orientation]),
+                     f"--orientation {orientation}")
+
+
+def test_cli_rejects_an_unknown_orientation(paths):
+    """The widened list must not have become a free-for-all."""
+    result = run_sim(paths["multicopter"], MC_BASE + ["--orientation", "sideways"])
+    assert result.returncode != 0, "an invalid orientation should still fail"

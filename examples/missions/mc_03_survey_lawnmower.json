@@ -1,8 +1,6 @@
 {
-  "_comment": "Classic lawnmower mapping pattern: transit out, four survey lines at slow photo-capture speed with turns between, then transit home. Includes an 8 Wh return-to-home reserve on top of the 25% margin.",
-  "reserve_percent": 25,
-  "rth_reserve_Wh": 8,
-  "diversion_reserve_Wh": 0,
+  "_comment": "Lawnmower survey pattern. The end-of-line turns now carry a turn_radius_m, so they are charged the extra thrust a real turn needs (1/cos(bank)) rather than being priced as straight flight. Compare the total against the same mission with the radii removed. Reserve is 30% of USABLE energy, which replaces the old '25% plus an 8 Wh return-to-home' \u2014 the separate reserve fields were removed in v2.19.0 and one percentage now covers landing, return-to-home and diversion.",
+  "reserve_percent": 30,
   "wind_direction_deg": 45,
   "transient_dt_s": 0.5,
   "max_accel_mps2": 1.5,
@@ -35,7 +33,8 @@
       "speed": 4.0,
       "distance": 40,
       "altitude": 80,
-      "course_deg": 0
+      "course_deg": 0,
+      "turn_radius_m": 12.7
     },
     {
       "name": "Survey line 2",
@@ -49,7 +48,8 @@
       "speed": 4.0,
       "distance": 40,
       "altitude": 80,
-      "course_deg": 0
+      "course_deg": 0,
+      "turn_radius_m": 12.7
     },
     {
       "name": "Survey line 3",
@@ -63,7 +63,8 @@
       "speed": 4.0,
       "distance": 40,
       "altitude": 80,
-      "course_deg": 0
+      "course_deg": 0,
+      "turn_radius_m": 12.7
     },
     {
       "name": "Survey line 4",

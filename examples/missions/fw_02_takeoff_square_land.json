@@ -1,8 +1,6 @@
 {
-  "_comment": "Fly a 1.5 km square circuit with 30-degree banked turns between legs. The banked turns raise load factor and stall speed \u2014 watch the Status tab.",
+  "_comment": "Fly a 1.5 km square circuit with 30-degree banked turns between legs. The banked turns raise load factor and stall speed \u2014 watch the Status tab. Reserve is a percentage of USABLE energy and should cover landing, return-to-home and any diversion.",
   "reserve_percent": 20,
-  "rth_reserve_Wh": 0,
-  "diversion_reserve_Wh": 0,
   "wind_direction_deg": 0,
   "phases": [
     {

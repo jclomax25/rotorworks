@@ -1,8 +1,6 @@
 {
-  "_comment": "Diagnostic mission: three minutes at each of four cruise speeds. Compare the power drawn in each phase against the best-endurance and best-range speeds reported on the Metrics tab.",
+  "_comment": "Diagnostic mission: three minutes at each of four cruise speeds. Compare the power drawn in each phase against the best-endurance and best-range speeds reported on the Metrics tab. Reserve is a percentage of USABLE energy and should cover landing, return-to-home and any diversion.",
   "reserve_percent": 20,
-  "rth_reserve_Wh": 0,
-  "diversion_reserve_Wh": 0,
   "wind_direction_deg": 0,
   "phases": [
     {

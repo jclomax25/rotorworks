@@ -1,0 +1,53 @@
+{
+  "_comment": "Square flown with the NOSE FIXED. The aircraft never yaws; it translates forward, right, backward and left in turn. Legs 2 and 4 present the SIDE silhouette, which on most airframes is larger than the frontal one, so they cost more even though the distance is identical.",
+  "reserve_percent": 20,
+  "wind_direction_deg": 0,
+  "phases": [
+    {
+      "name": "Takeoff climb",
+      "speed": 0.0,
+      "duration": 30,
+      "altitude": 60,
+      "climb_rate_mps": 2.0
+    },
+    {
+      "name": "Leg 1 north (nose-first)",
+      "speed": 10.0,
+      "distance": 400,
+      "altitude": 60,
+      "course_deg": 0,
+      "translation_direction_deg": 0
+    },
+    {
+      "name": "Leg 2 east (sideways right)",
+      "speed": 10.0,
+      "distance": 400,
+      "altitude": 60,
+      "course_deg": 90,
+      "translation_direction_deg": 90
+    },
+    {
+      "name": "Leg 3 south (backwards)",
+      "speed": 10.0,
+      "distance": 400,
+      "altitude": 60,
+      "course_deg": 180,
+      "translation_direction_deg": 180
+    },
+    {
+      "name": "Leg 4 west (sideways left)",
+      "speed": 10.0,
+      "distance": 400,
+      "altitude": 60,
+      "course_deg": 270,
+      "translation_direction_deg": 270
+    },
+    {
+      "name": "Descend and land",
+      "speed": 0.0,
+      "duration": 30,
+      "altitude": 0,
+      "descent_rate_mps": 2.0
+    }
+  ]
+}

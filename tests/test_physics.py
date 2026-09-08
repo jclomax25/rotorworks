@@ -1276,3 +1276,511 @@ def test_thrust_to_weight_uses_available_thrust(mc, mc_quad):
     assert required_N / weight_N == pytest.approx(1.0, abs=0.02), \
         "required thrust over weight should sit at 1 in hover, which is why it " \
         "is useless as a design metric"
+
+
+def test_status_and_metrics_agree_on_thrust_to_weight(mc, mc_quad):
+    """
+    Regression: the Status tab kept its own copy of the thrust-to-weight
+    calculation and was missed when the Metrics tab was corrected, so it went
+    on reporting 1.00:1 against a ">= 1.5:1" limit — a check that could never
+    fail, on a number that was never a margin.
+
+    Both surfaces must derive from the same available-thrust figure.
+    """
+    weight_N = mc_quad.drone_weight_g * 9.81 / 1000.0
+    available_N = mc.available_total_thrust_N(mc_quad)
+    assert available_N > 0
+
+    expected = available_N / weight_N
+    assert expected > 1.5, "reference quad should have real thrust margin"
+
+    # The required-thrust ratio must NOT be what either surface reports as TWR.
+    required_N = mc.compute_operating_metrics(mc_quad, 0.0, "hover")["thrust_total_N"]
+    assert abs(required_N / weight_N - expected) > 0.5, (
+        "available and required ratios are indistinguishable here, so this "
+        "test cannot detect the regression it exists for")
+
+
+def test_fixedwing_thrust_to_weight_threshold_scales_with_efficiency(fw):
+    """
+    Regression: the fixed-wing thrust-to-weight check used a fixed ">= 1.2:1"
+    limit, which is a ROTORCRAFT criterion. A wing carries the weight, so
+    thrust only has to beat drag: level flight needs T/W > 1/(L/D), which is
+    around 0.11 for a survey aircraft and 0.05 for a glider.
+
+    The 2 m survey example was flagged red at 0.54:1 while climbing at
+    494 m/min with an 80% thrust margin and a 19 m take-off — a healthy
+    aircraft failing a check that almost no real fixed-wing could pass.
+
+    The threshold must therefore scale with the aircraft's own L/D.
+    """
+    config = _fw_table_config(fw, None)
+    metrics = fw.compute_metrics(config, 22.0)
+
+    ld = metrics["LD_ratio"]
+    twr = metrics["thrust_available_N"] / config.weight_N
+    needed_for_level = 1.0 / ld
+
+    assert twr > needed_for_level, (
+        "the reference aircraft cannot hold level flight, so this test cannot "
+        "distinguish a bad threshold from a bad aircraft")
+    assert needed_for_level < 1.2, (
+        "a fixed-wing needing T/W above 1.2 for level flight would be "
+        "extraordinary; the old fixed threshold was not physical")
+
+    # The aircraft must be demonstrably healthy on independent measures.
+    assert metrics["max_rc_mps"] > 0, "cannot climb"
+    assert metrics["thrust_required_N"] < metrics["thrust_available_N"]
+
+
+def test_more_efficient_aircraft_needs_less_thrust_to_weight(fw):
+    """A higher L/D must lower the thrust-to-weight a wing actually needs."""
+    draggy = _fw_table_config(fw, None)
+    draggy.airframe.CD0 = 0.060
+
+    clean = _fw_table_config(fw, None)
+    clean.airframe.CD0 = 0.015
+
+    ld_draggy = fw.compute_metrics(draggy, 22.0)["LD_ratio"]
+    ld_clean = fw.compute_metrics(clean, 22.0)["LD_ratio"]
+
+    assert ld_clean > ld_draggy
+    assert 1.0 / ld_clean < 1.0 / ld_draggy, \
+        "the cleaner aircraft should need less thrust-to-weight, not more"
+
+
+# ======================================================================
+# MULTICOPTER STATUS THRESHOLDS
+# ======================================================================
+
+def test_hover_efficiency_ceiling_follows_disk_loading(mc, mc_quad):
+    """
+    The best achievable hover efficiency is set by disk loading alone:
+
+        vi = sqrt(DL / 2*rho)        ideal g/W = 1000 / (g0 * vi)
+
+    A flat "5 g/W" threshold therefore measured disc SIZE more than design
+    quality — trivially easy on a heavy-lift with big discs, near impossible
+    on a cinewhoop. The check now scales with this ceiling.
+    """
+    rho = mc_quad.air_density
+    metrics = mc.compute_operating_metrics(mc_quad, 0.0, "hover")
+    dl = float(metrics["disk_loading_N_m2"])
+
+    ideal_gW = 1000.0 / (9.80665 * math.sqrt(dl / (2.0 * rho)))
+    actual_gW = float(metrics["hover_efficiency_gW"])
+
+    assert actual_gW < ideal_gW, \
+        "a real rotor cannot beat the momentum-theory ideal for its disk loading"
+    assert 0.2 < actual_gW / ideal_gW < 1.0, \
+        f"achieving {actual_gW / ideal_gW * 100:.0f}% of ideal is not credible"
+
+
+def test_higher_disk_loading_lowers_the_efficiency_ceiling(mc, mc_quad):
+    """Smaller discs for the same weight must reduce the achievable g/W."""
+    import copy
+    small = copy.deepcopy(mc_quad)
+    small.propeller.diameter_in = mc_quad.propeller.diameter_in * 0.6
+
+    big_dl = mc.compute_operating_metrics(mc_quad, 0.0, "hover")["disk_loading_N_m2"]
+    small_dl = mc.compute_operating_metrics(small, 0.0, "hover")["disk_loading_N_m2"]
+    assert small_dl > big_dl, "smaller discs should raise disk loading"
+
+    def ceiling(dl):
+        return 1000.0 / (9.80665 * math.sqrt(dl / (2.0 * mc_quad.air_density)))
+
+    assert ceiling(small_dl) < ceiling(big_dl), \
+        "a higher disk loading must lower the efficiency ceiling"
+
+
+def test_solidity_expectation_scales_with_blade_count(mc):
+    """
+    Solidity rises with blade count almost by definition, so a single
+    0.05-0.15 window judged a 3-blade propeller against a 2-blade
+    expectation and flagged ordinary designs as suspect.
+    """
+    two = mc.propeller_solidity(5.0, 2)
+    three = mc.propeller_solidity(5.0, 3)
+    assert three > two
+    # The scaled window must accept its own blade count.
+    for blades, sigma in ((2, two), (3, three)):
+        lo, hi = 0.05 * blades / 2.0, 0.15 * blades / 2.0
+        assert lo <= sigma <= hi, \
+            f"{blades}-blade solidity {sigma:.3f} outside its scaled window"
+
+
+def test_figure_of_merit_expectation_scales_with_rotor_size(mc):
+    """
+    Small propellers run at low Reynolds number and cannot reach the figure
+    of merit of a large rotor. A flat 0.65 flagged three of the five example
+    aircraft as bad, including ordinary ones.
+    """
+    def target(diameter_in):
+        if diameter_in >= 15:
+            return 0.70
+        if diameter_in >= 9:
+            return 0.60
+        return 0.45
+
+    assert target(22) > target(10) > target(3), \
+        "expectation should fall with rotor size, not stay constant"
+
+
+# ======================================================================
+# TRANSLATION DIRECTION
+# ======================================================================
+
+def test_sideways_translation_costs_more_than_forward(mc, mc_quad):
+    """
+    A multirotor presents its side silhouette when translating sideways,
+    which on most airframes is larger than the frontal one. Treating every
+    translation as nose-first understated the cost of flying crabbed.
+    """
+    import copy
+    forward = copy.deepcopy(mc_quad)
+    forward.translation_direction_deg = 0.0
+    sideways = copy.deepcopy(mc_quad)
+    sideways.translation_direction_deg = 90.0
+
+    d_fwd = mc.drag_force_required(forward, 12.0, "translating")
+    d_side = mc.drag_force_required(sideways, 12.0, "translating")
+    assert d_side > d_fwd, "sideways should present the larger silhouette"
+
+    p_fwd = mc.compute_operating_metrics(forward, 12.0, "translating")["total_power_W"]
+    p_side = mc.compute_operating_metrics(sideways, 12.0, "translating")["total_power_W"]
+    assert p_side > p_fwd
+
+
+def test_tilt_splits_into_pitch_and_roll_by_direction(mc, mc_quad):
+    """
+    Forward translation is pure pitch, sideways is pure roll, and a diagonal
+    splits between them. A single "tilt" number could not express this, and
+    airframes rarely have equal authority in both axes.
+    """
+    import copy
+
+    def attitude(azimuth):
+        cfg = copy.deepcopy(mc_quad)
+        cfg.translation_direction_deg = azimuth
+        m = mc.compute_operating_metrics(cfg, 12.0, "translating")
+        return m["pitch_required_deg"], m["roll_required_deg"], m["tilt_required_deg"]
+
+    pitch, roll, tilt = attitude(0.0)
+    assert abs(roll) < 1e-6 and pitch == pytest.approx(tilt, rel=1e-6)
+
+    pitch, roll, tilt = attitude(90.0)
+    assert abs(pitch) < 1e-6 and roll == pytest.approx(tilt, rel=1e-6)
+
+    pitch, roll, tilt = attitude(45.0)
+    assert pitch == pytest.approx(roll, rel=1e-6), "45 deg should split evenly"
+    assert 0 < pitch < tilt, "each component must be smaller than the total"
+
+
+def test_pitch_and_roll_recombine_to_the_total_tilt(mc, mc_quad):
+    """The split must be lossless — it is a rotation of the same vector."""
+    import copy
+    import rotorworks_core as core
+    for azimuth in (0.0, 30.0, 45.0, 60.0, 90.0, 200.0):
+        cfg = copy.deepcopy(mc_quad)
+        cfg.translation_direction_deg = azimuth
+        m = mc.compute_operating_metrics(cfg, 12.0, "translating")
+        recombined = core.tilt_from_pitch_roll(m["pitch_required_deg"],
+                                               m["roll_required_deg"])
+        assert recombined == pytest.approx(m["tilt_required_deg"], abs=1e-6)
+
+
+def test_forward_orientation_still_works(mc, mc_quad):
+    """
+    "forward" is the old name for translating at 0 degrees. Existing configs,
+    missions and CLI invocations must behave exactly as before.
+    """
+    import copy
+    cfg = copy.deepcopy(mc_quad)
+    cfg.translation_direction_deg = 0.0
+    old = mc.compute_operating_metrics(cfg, 12.0, "forward")
+    new = mc.compute_operating_metrics(cfg, 12.0, "translating")
+    for key, value in old.items():
+        if isinstance(value, float) and math.isfinite(value):
+            assert new.get(key) == pytest.approx(value, rel=1e-12), \
+                f"{key} differs between 'forward' and 'translating'"
+
+
+# ======================================================================
+# MULTICOPTER TURNS
+# ======================================================================
+
+def test_turn_bank_matches_the_standard_relation():
+    import rotorworks_core as core
+    """tan(bank) = V^2 / (R*g) — the same for a multirotor and an aeroplane."""
+    for speed, radius in ((10.0, 10.0), (12.0, 25.0), (20.0, 40.0)):
+        expected = math.degrees(math.atan(speed ** 2 / (radius * 9.80665)))
+        assert core.turn_bank_deg(speed, radius) == pytest.approx(expected, rel=1e-9)
+
+
+def test_straight_flight_has_unit_load_factor():
+    import rotorworks_core as core
+    """No turn, no penalty — a zero or absent radius must change nothing."""
+    assert core.turn_load_factor(15.0, 0.0) == pytest.approx(1.0)
+    assert core.turn_bank_deg(15.0, 0.0) == pytest.approx(0.0)
+
+
+def test_turning_costs_power(mc, mc_quad):
+    """
+    A turning multirotor holds its weight AND supplies centripetal force, so
+    thrust rises by 1/cos(bank) and power with it. Missions of tight turns
+    cost more than their straight-line distance suggests — which the model
+    previously could not express at all.
+    """
+    import rotorworks_core as core
+    straight = mc.compute_operating_metrics(mc_quad, 12.0, "translating",
+                                            load_factor=1.0)["total_power_W"]
+    powers = []
+    for radius in (100.0, 50.0, 25.0, 15.0):
+        n = core.turn_load_factor(12.0, radius)
+        powers.append(mc.compute_operating_metrics(
+            mc_quad, 12.0, "translating", load_factor=n)["total_power_W"])
+
+    assert all(p > straight for p in powers), "every turn should cost power"
+    # Radii run wide to tight, so the cost should rise through the list.
+    assert powers == sorted(powers), "tighter turns must cost more, not less"
+
+
+def test_turn_thrust_is_a_three_way_vector_sum():
+    import rotorworks_core as core
+    """
+    Weight, drag and centripetal force are mutually perpendicular, so
+    T = sqrt(W^2 + D^2 + Fc^2). Adding any pair linearly would overstate it.
+    """
+    weight_N, drag_N, speed, radius = 17.66, 2.2, 12.0, 20.0
+    thrust, along, lateral = core.turn_thrust_N(weight_N, drag_N, speed, radius)
+
+    centripetal = (weight_N / 9.80665) * speed ** 2 / radius
+    assert thrust == pytest.approx(
+        math.sqrt(weight_N ** 2 + drag_N ** 2 + centripetal ** 2), rel=1e-9)
+    assert thrust < weight_N + drag_N + centripetal, "linear sum is back"
+    assert lateral == pytest.approx(core.turn_bank_deg(speed, radius), rel=1e-9), \
+        "the lateral tilt IS the bank angle"
+
+
+def test_a_mission_without_turns_is_unchanged(mc, mc_quad, tmp_path):
+    """Existing missions have no turn radius and must behave exactly as before."""
+    import json
+    payload = {"reserve_percent": 20, "phases": [
+        {"name": "Leg", "speed": 12.0, "distance": 500, "altitude": 50}]}
+    path = tmp_path / "straight.json"
+    path.write_text(json.dumps(payload))
+
+    mission = mc.MissionProfile.from_json(str(path))
+    assert getattr(mission.phases[0], "turn_radius_m", None) in (None, 0, 0.0)
+
+    results, _worst, _series = mc.simulate_mission(mc_quad, mission, wind_mps=0.0)
+    assert results and "Invalid" not in results[0][3]
+
+
+# ======================================================================
+# ZERO-SPEED CONSISTENCY AND CONTINUITY
+# ======================================================================
+
+def test_hover_and_translating_agree_at_zero_speed(mc, mc_quad):
+    """
+    Regression: "hover" and "translating at 0 m/s" describe the identical
+    condition and must give identical power.
+
+    They differed by about 4% on a coaxial airframe because the coaxial
+    interference penalty was discounted 30% whenever the orientation was not
+    the literal word "hover" — so a stationary aircraft got a forward-flight
+    benefit that requires a freestream it does not have.
+    """
+    import copy
+    for layout, spacing in (("flat", None), ("coaxial", 0.05)):
+        cfg = copy.deepcopy(mc_quad)
+        cfg.motor_configuration = layout
+        cfg.coaxial_spacing_m = spacing
+        if layout == "coaxial":
+            cfg.num_motors = max(cfg.num_motors, 2) * 2
+
+        hover = mc.power_required(cfg, 0.0, "hover")
+        translating = mc.power_required(cfg, 0.0, "translating")
+        assert hover == pytest.approx(translating, rel=1e-12), (
+            f"{layout}: hover {hover:.4f} W vs translating {translating:.4f} W "
+            "— two names for the same condition must agree")
+
+
+def test_coaxial_relief_grows_with_airspeed_not_with_a_label(mc, mc_quad):
+    """
+    Forward flight eases coaxial interference because the freestream sweeps
+    the upper rotor's wake clear. That relief must scale with SPEED — keying
+    it to the orientation string made it a step change at zero.
+    """
+    import copy
+    cfg = copy.deepcopy(mc_quad)
+    cfg.motor_configuration = "coaxial"
+    cfg.coaxial_spacing_m = 0.05
+    cfg.num_motors = max(cfg.num_motors, 2) * 2
+
+    thrust = mc.thrust_required(cfg, 0.0, "hover") / cfg.num_motors
+    penalties = [
+        mc.motor_configuration_power_multiplier(
+            cfg, "translating", airspeed_mps=v, thrust_per_motor_N=thrust)
+        for v in (0.0, 2.0, 5.0, 10.0, 20.0)]
+
+    assert penalties[0] == pytest.approx(
+        mc.motor_configuration_power_multiplier(cfg, "hover"), rel=1e-12), \
+        "at rest there is no freestream, so no relief"
+    assert penalties == sorted(penalties, reverse=True), \
+        "relief should grow with speed, so the penalty falls"
+    assert penalties[-1] > 1.0, "coaxial interference never disappears entirely"
+
+
+def test_multicopter_power_curve_has_no_jumps(mc, mc_quad):
+    """
+    Power must vary smoothly with speed. A step means a branch is being taken
+    on a label or a threshold rather than on the physics, which is exactly
+    how the coaxial discount went unnoticed.
+    """
+    import copy
+    for layout, spacing in (("flat", None), ("coaxial", 0.05)):
+        cfg = copy.deepcopy(mc_quad)
+        cfg.motor_configuration = layout
+        cfg.coaxial_spacing_m = spacing
+        if layout == "coaxial":
+            cfg.num_motors = max(cfg.num_motors, 2) * 2
+
+        speeds = [i * 0.1 for i in range(0, 251)]
+        powers = [mc.power_required(cfg, v, "translating") for v in speeds]
+        for i in range(len(speeds) - 1):
+            step = abs(powers[i + 1] - powers[i]) / max(powers[i], 1e-9)
+            assert step < 0.05, (
+                f"{layout}: {step * 100:.1f}% jump between "
+                f"{speeds[i]:.1f} and {speeds[i + 1]:.1f} m/s")
+
+
+def test_thrust_equals_weight_when_stationary(mc, mc_quad):
+    """With no drag and no turn, the rotors hold exactly the weight."""
+    weight_N = mc_quad.drone_weight_g * 9.81 / 1000.0
+    assert mc.thrust_required(mc_quad, 0.0, "translating") == pytest.approx(
+        weight_N, abs=1e-6)
+    assert mc.thrust_required(mc_quad, 0.0, "hover") == pytest.approx(
+        weight_N, abs=1e-6)
+
+
+def test_hover_endurance_ignores_the_cruise_speed_box(mc, mc_quad):
+    """
+    Regression: compute_operating_metrics forces hover to 0 m/s but
+    estimate_flight_time_minutes did not, so one run reported hover POWER
+    and cruise-speed ENDURANCE — 47.99 min against the correct 23.80 on the
+    heavy-lift example.
+    """
+    at_zero = mc.estimate_flight_time_minutes(mc_quad, 0.0, orientation="hover")
+    at_speed = mc.estimate_flight_time_minutes(mc_quad, 17.0, orientation="hover")
+    assert at_zero == pytest.approx(at_speed, rel=1e-12), \
+        "hover endurance must not depend on the speed box"
+
+
+def test_mission_altitude_trace_ramps_instead_of_jumping(mc, mc_quad, tmp_path):
+    """
+    Regression: the altitude series recorded `phase.altitude` — the phase's
+    TARGET — as a constant, so a 30 s climb from 0 to 60 m plotted as an
+    instant jump to 60 and stayed there through the landing.
+
+    The ENERGY was always right (the potential-power term is integrated per
+    step, and matched m*g*h to 0.7%), which is what made this easy to miss:
+    only the trace disagreed with the physics behind it.
+    """
+    import json
+    payload = {"reserve_percent": 20, "phases": [
+        {"name": "Climb", "speed": 0.0, "duration": 30,
+         "altitude": 60, "climb_rate_mps": 2.0},
+        {"name": "Cruise", "speed": 10.0, "distance": 200, "altitude": 60},
+        {"name": "Land", "speed": 0.0, "duration": 30,
+         "altitude": 0, "descent_rate_mps": 2.0}]}
+    path = tmp_path / "climb.json"
+    path.write_text(json.dumps(payload))
+
+    _results, _worst, series = mc.simulate_mission(
+        mc_quad, mc.MissionProfile.from_json(str(path)), wind_mps=0.0)
+    alt = series["altitude_m"]
+
+    assert alt[0] == pytest.approx(0.0, abs=1e-6), "must start on the ground"
+    assert max(alt) == pytest.approx(60.0, abs=0.5), "must reach the target"
+    assert alt[-1] == pytest.approx(0.0, abs=0.5), "must come back down"
+
+    # A ramp, not a step: intermediate heights have to actually appear.
+    climbing = [a for a in alt if 5.0 < a < 55.0]
+    assert len(climbing) > 10, \
+        "no intermediate altitudes — the trace jumped instead of ramping"
+
+
+def test_mission_climb_energy_matches_potential_energy(mc, mc_quad, tmp_path):
+    """
+    The extra energy a climb costs over hovering for the same time must equal
+    m*g*h, give or take the extra thrust needed while climbing.
+    """
+    import json
+    height, rate = 60.0, 2.0
+    duration = height / rate
+    payload = {"reserve_percent": 20, "phases": [
+        {"name": "Climb", "speed": 0.0, "duration": duration,
+         "altitude": height, "climb_rate_mps": rate}]}
+    path = tmp_path / "climb_only.json"
+    path.write_text(json.dumps(payload))
+
+    _r, _w, series = mc.simulate_mission(
+        mc_quad, mc.MissionProfile.from_json(str(path)), wind_mps=0.0)
+    used_Wh = series["battery_energy_Wh"][0] - series["battery_energy_Wh"][-1]
+
+    hover_W = mc.compute_operating_metrics(mc_quad, 0.0, "hover")["total_power_W"]
+    hover_Wh = hover_W * duration / 3600.0
+    climb_work_Wh = used_Wh - hover_Wh
+
+    ideal_Wh = (mc_quad.drone_weight_g * 9.81 / 1000.0) * height / 3600.0
+    assert climb_work_Wh == pytest.approx(ideal_Wh, rel=0.15), (
+        f"climb cost {climb_work_Wh:.2f} Wh over hover, ideal m*g*h is "
+        f"{ideal_Wh:.2f} Wh")
+
+
+def test_rails_and_peripheral_current_add(mc, mc_quad):
+    """
+    Regression: regulated rails and direct-from-pack peripherals are
+    INDEPENDENT loads. The help has always said so — "use this for devices
+    wired straight to pack voltage; use the Avionics tab for anything on a
+    regulated rail... never enter the same device in both" — but the model
+    used peripheral current only as a FALLBACK for "no rails defined".
+
+    So a payload wired straight to the pack drew nothing at all as soon as a
+    single BEC rail existed, and the number the user typed did nothing.
+    """
+    import copy
+
+    def power(periph_A, with_rails):
+        cfg = copy.deepcopy(mc_quad)
+        cfg.periph_current = periph_A
+        cfg.avionics = (mc.AvionicsConfig(voltage_tree={5.0: (2.0, 0.9)})
+                        if with_rails else None)
+        return mc.compute_operating_metrics(cfg, 10.0, "translating")["total_power_W"]
+
+    base = power(0.0, False)
+    rails_only = power(0.0, True)
+    periph_only = power(2.0, False)
+    both = power(2.0, True)
+
+    assert rails_only > base, "a rail draws power"
+    assert periph_only > base, "a direct-from-pack device draws power"
+    assert both - base == pytest.approx(
+        (rails_only - base) + (periph_only - base), rel=1e-9), \
+        "the two loads must add, not replace one another"
+
+
+def test_peripheral_current_is_not_ignored_when_rails_exist(mc, mc_quad):
+    """The specific symptom: typing a peripheral current changed nothing."""
+    import copy
+    cfg = copy.deepcopy(mc_quad)
+    cfg.avionics = mc.AvionicsConfig(voltage_tree={5.0: (2.0, 0.9)})
+
+    cfg.periph_current = 0.0
+    without = mc.compute_operating_metrics(cfg, 10.0, "translating")["total_power_W"]
+    cfg.periph_current = 2.0
+    with_periph = mc.compute_operating_metrics(cfg, 10.0, "translating")["total_power_W"]
+
+    assert with_periph > without, \
+        "peripheral current was ignored because rails were defined"

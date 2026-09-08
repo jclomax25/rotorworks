@@ -1,7 +1,7 @@
 # Test suite
 
-377 tests covering the shared core, physics, the CLI, the GUI, the batch
-driver, and a full config/mission coverage matrix.
+444 tests covering the shared core, physics, the CLI, the GUI, the batch
+driver, the VTOL simulator, and a full config/mission coverage matrix.
 
 Almost every test here corresponds to a bug that was actually shipped. The
 docstrings say which one, so a future failure reads as "the pack capacity
@@ -13,13 +13,13 @@ regression is back" rather than "test_foo failed".
 
 ```bash
 pip install pytest
-pytest                                  # everything (~7 minutes)
+pytest                                  # everything (~15 minutes)
 ```
 
 Faster subsets:
 
 ```bash
-pytest -m "not slow"                    # physics only, ~4 seconds
+pytest -m "not slow"                    # physics only, ~10 seconds
 pytest tests/test_physics.py            # same thing, explicitly
 pytest tests/test_cli.py                # subprocess runs, ~2.5 min
 pytest -m gui                           # GUI only
@@ -43,12 +43,14 @@ safe to run.
 | File | Tests | Speed | What it covers |
 |---|---|---|---|
 | `conftest.py` | — | — | Loads the simulators by path, provides reference aircraft |
-| `test_golden.py` | 1 | ~1 s | 348 stored numeric outputs across both simulators |
-| `test_core.py` | 56 | ~1 s | `rotorworks_core`, plus checks that both simulators delegate to it |
-| `test_physics.py` | 57 | ~4 s | Battery topology, atmosphere, rotor inflow, prop efficiency, SoC, drag, landing, metrics sanity, drag calculator |
-| `test_cli.py` | 64 | ~2.5 min | Real subprocess runs: every argument path, every example mission, edge cases, malformed input |
-| `test_gui.py` | 22 | ~2 min | Real Tk window: hover events, mode toggle, config load, missions, exports |
-| `test_batch.py` | 20 | ~2 min | Sweeps, sizing, mode enforcement, GUI-config translation, GUI↔CLI consistency |
+| `test_golden.py` | 1 | ~2 s | 348 stored numeric outputs across both simulators |
+| `test_core.py` | 84 | ~1 s | `rotorworks_core`: SoC, wind, inflow, sensitivity, comparison, propeller coefficients, power budget, airframe geometry |
+| `test_physics.py` | 128 | ~5 s | Battery topology, atmosphere, rotor inflow, prop efficiency, drag, turns, translation direction, thresholds, figure leaks |
+| `test_vtol.py` | 27 | ~3 s | VTOL transition hand-over, config gating, mission energy split |
+| `test_cli.py` | 67 | ~3 min | Real subprocess runs: every argument path, every example mission, edge cases, malformed input |
+| `test_gui.py` | 46 | ~4 min | Real Tk window: hover events, mode toggle, config load, missions, exports, diagram, sensitivity, comparison |
+| `test_matrix.py` | 71 | ~4 min | Every config and mission x GUI and CLI x with and without a propeller table |
+| `test_batch.py` | 20 | ~2.5 min | Sweeps, sizing, mode enforcement, GUI-config translation, GUI↔CLI consistency |
 
 ### Marks
 
@@ -78,7 +80,7 @@ python tests/test_golden.py --update
 Then read the diff before committing. A snapshot regenerated without reading
 the diff is worse than no snapshot.
 
-## The three tests worth understanding
+## The four tests worth understanding
 
 **`test_hovering_every_help_marker_shows_a_tooltip`** fires real `<Enter>`
 events at every `?` marker. An earlier version of this test counted the
@@ -98,6 +100,17 @@ through the GUI and through `rotorworks-batch.py`, then compares flight time.
 The fixed-wing CLI had no ESC arguments for the project's whole history, so
 the batch path silently dropped losses the GUI applied — about 1% on a typical
 airframe, invisible unless you compared the two directly.
+
+**`test_matrix.py` as a whole** exists because two bugs shipped through the
+same hole: `name 'm' is not defined`, which fired only when a propeller table
+was loaded, and a fixed-wing table loader that carried a known fault for six
+releases because nothing exercised it. Both were of the form "works in one
+interface, or one table state, and not the other". Individual tests could not
+close that; only the product of the dimensions could.
+
+Note its display skip is deliberately **not** module-level. The CLI half needs
+no display, and skipping the whole file on a headless box would silently drop
+half the coverage while still reporting green.
 
 ---
 
@@ -130,6 +143,13 @@ changing those fixtures will break tests that look unrelated.
 Worth knowing before you rely on a green run:
 
 - **The View menu** (window scale, plot size, UI font size) is untested.
+- **The VTOL simulator has no GUI or matrix coverage.** `test_vtol.py` covers
+  its physics, config gating and missions; its window is built and run only in
+  a manual check.
+- **Plot *contents*** — the new mission-plot axes, the drag and thrust
+  component panels, and the Power Budget share diagram are confirmed to render
+  without error, not to be correct. The one exception is the multicopter power
+  bucket.
 - **The Avionics tab's add / remove / clear rail buttons** are exercised only
   indirectly, through configs that already contain rails.
 - **Plot contents** are not inspected. The tests confirm that plotting runs

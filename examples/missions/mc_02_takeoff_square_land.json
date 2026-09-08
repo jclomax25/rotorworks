@@ -1,8 +1,6 @@
 {
-  "_comment": "Takeoff, fly a 400 m square (one leg per compass heading), return to hover, land. With wind set, each leg sees a different head/cross component \u2014 a good way to see how wind direction changes leg-by-leg power.",
+  "_comment": "Takeoff, fly a 400 m square, return to hover, land. Each leg sees a different head/cross wind component, so leg-by-leg power differs once wind is set. The three corners now carry a turn_radius_m, so they cost the extra thrust a real turn needs instead of being free. Reserve is a percentage of USABLE energy and should cover landing, return-to-home and any diversion.",
   "reserve_percent": 20,
-  "rth_reserve_Wh": 0,
-  "diversion_reserve_Wh": 0,
   "wind_direction_deg": 0,
   "transient_dt_s": 0.5,
   "max_accel_mps2": 2.0,
@@ -24,6 +22,14 @@
       "course_deg": 0
     },
     {
+      "name": "Corner 1",
+      "speed": 6.0,
+      "distance": 24,
+      "altitude": 40,
+      "course_deg": 0,
+      "turn_radius_m": 8.0
+    },
+    {
       "name": "Leg 2 east",
       "speed": 10.0,
       "distance": 400,
@@ -31,11 +37,27 @@
       "course_deg": 90
     },
     {
+      "name": "Corner 2",
+      "speed": 6.0,
+      "distance": 24,
+      "altitude": 40,
+      "course_deg": 90,
+      "turn_radius_m": 8.0
+    },
+    {
       "name": "Leg 3 south",
       "speed": 10.0,
       "distance": 400,
       "altitude": 40,
       "course_deg": 180
+    },
+    {
+      "name": "Corner 3",
+      "speed": 6.0,
+      "distance": 24,
+      "altitude": 40,
+      "course_deg": 180,
+      "turn_radius_m": 8.0
     },
     {
       "name": "Leg 4 west",

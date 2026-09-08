@@ -1,7 +1,7 @@
 # RotorWorks UAV Power Simulators
 
 **UASforge / dronefoundry**  
-*Simulators v2.16.0*
+*Simulators v2.40.0*
 
 A suite of cross-platform UAV powertrain performance tools:
 
@@ -688,6 +688,683 @@ Version** — this release is **VTOL simulator v0.1.0** (new file, versioned sep
   transition physics differs enough that a fallback would be confidently wrong.
 - The Glauert forward-flight inflow solver moved from the multicopter into
   `rotorworks_core`, since the VTOL lift rotors need the same physics.
+
+**v2.40.0**
+- **Sensitivity results clear when a new run makes them stale**, in both
+  simulators and on both run paths. A sensitivity sweep is tied to the run it
+  was computed from; leaving the previous rankings on screen after the design
+  or the mission changes is worse than showing nothing, because the numbers
+  look current and there is no way to tell they are not. The table now says
+  which kind of run invalidated it and to press Run Sensitivity again.
+- **Removed a leftover sentence from the About window** in both simulators.
+  An earlier edit deleted the opening lines of that paragraph and left its
+  tail behind, so the box ended mid-sentence with "field, you are running an
+  older copy of this script."
+
+**v2.39.1** — fixed-wing mission comparison actually compares
+You were right that it did not work. **Two** ordering faults, one symptom.
+- **The mission path never called `refresh_comparison()`.** Both calls lived
+  in `run_single_point`, so a pinned baseline sat unchanged while the run
+  behind it moved. The multicopter had this exact fault and it was fixed in
+  v2.16.0; the fix was never carried across.
+- **Adding the call was not enough**: it ran BEFORE `_last_run["metrics"]` was
+  stored, so the tab compared the new baseline against the PREVIOUS run's
+  numbers — still +0.00 everywhere. Storing first fixes it.
+- Verified: with a 25% weight increase between two mission runs, **21 of 25
+  rows move**, in the right directions (flight time -15.7 min, total power
+  +24.4 W).
+- **No automated test for this.** The GUI harness cannot drive a mission run —
+  it has no way to set the Mission JSON field and cannot tell the several
+  "Browse" buttons apart. That gap is now documented in `tests/test_gui.py`,
+  along with what it would unlock: mission coverage for Status, Metrics and
+  Power Budget, none of which are exercised on the mission path either.
+
+**v2.39.0** — the multicopter mission corrections applied to the fixed-wing
+- **Status and Metrics now say what they show.** After a mission, Status is
+  the WORST value each check reached and Metrics is the LAST evaluated
+  instant. Metrics was previously fed the worst-case dict, which presents an
+  operating point the aircraft never flew — each field's worst moment happens
+  at a different time.
+- **Fixed Speed Plots and Power Budget clear on a mission run.** The mission
+  cleared the plots and then rebuilt the sweep a few lines later, so the
+  placeholder never survived — the same fault the multicopter had. The run
+  now lands on Mission Plots.
+- **The altitude trace ramps.** It recorded the phase TARGET, so a climb
+  plotted as an instant jump. The fixed-wing evaluates each phase once rather
+  than stepping through time, so the fix differs from the multicopter's: it
+  records where the aircraft STARTS a phase and where it ENDS it, and the plot
+  draws the ramp between. A 0-120 m climb now reads 0 at t=0 and 120 at t=90.
+- **Stall speed now rises with bank.** In a turn the wing carries n times the
+  weight, so stall goes as `sqrt(n)` — at 45 deg that is 10.87 m/s against the
+  9.14 being reported. The mission loop already used the corrected value
+  internally; only the displayed metric was wrong, so the margin the user read
+  was not the margin they had.
+- **Bank already fed the power calculation** and needed no change: 84.0 W
+  level against 93.8 W at 45 deg on the 2 m survey aircraft.
+- Compare already gated mixed runs ("Baseline is a mission run; current is a
+  single-point run") and needed no change.
+
+**v2.38.0** — peripheral current was being ignored, not just mis-displayed
+Chasing why the fixed-wing Power Budget omitted peripheral current turned up
+a deeper fault in BOTH simulators.
+- **Regulated rails and direct-from-pack peripherals are independent loads
+  and now ADD.** The help has always said so — "use this for devices wired
+  straight to pack voltage; use the Avionics tab for anything on a regulated
+  rail... never enter the same device in both" — but the model used
+  peripheral current only as a FALLBACK for "no rails defined". So a payload
+  wired straight to the pack drew **nothing at all** as soon as a single BEC
+  rail existed, and the number typed into the box did nothing.
+  Fixed at all six sites across the two simulators: the metrics core, the
+  mission path, the plotting path and the CSV export.
+- **This also corrects v2.35.0.** That release hid the peripheral row from the
+  Power Budget to suppress a negative "Unaccounted" equal to the peripheral
+  draw. The residual was real, but it was the MODEL ignoring the load, not the
+  table over-reporting it — so the fix was in the wrong direction. The row is
+  back and the budget closes.
+- **Peripheral power is valued at NOMINAL pack voltage in the budget**,
+  matching how the model charges it. Using the loaded voltage disagreed by the
+  sag and left a -3.6 W residual.
+- Two new tests: that the two loads add exactly, and that typing a peripheral
+  current changes the answer when rails are present.
+
+**v2.37.1**
+- **Cruise speed marked on the fixed-wing performance plots**, matching the
+  multicopter. Five panels already drew a red stall line but nothing showed
+  where the aircraft is actually being asked to fly, so a design sitting on
+  the wrong side of a knee looked fine. A grey dash-dot line now marks cruise
+  on Flight Time & Range, Thrust, Power, Rate of Climb and Drag. The Drag
+  Polar is left alone — its x-axis is CD, not airspeed.
+
+**v2.37.0** — per-leg translation direction, and the altitude trace
+- **Mission phases can set their own `translation_direction_deg`.** It was a
+  config-level value, one for the whole flight, so a square flown with the
+  nose FIXED — north, then sideways east, then backwards south — could not be
+  expressed as a mission at all.
+- **The mission altitude trace was recording the phase TARGET, not the actual
+  height.** A 30 s climb from 0 to 60 m plotted as an instant jump to 60 and
+  stayed there through the landing. The climb ENERGY was always correct: the
+  potential-power term is integrated per step and matches `m*g*h` to 0.7%
+  (2.72 Wh measured against 2.70 ideal for 16.5 kg lifted 60 m). Only the
+  trace disagreed with the physics behind it, which is why it went unnoticed.
+  Altitude is now integrated step by step for every phase type. The first fix
+  only covered distance-based phases, which left a duration-based takeoff
+  climb flat at zero — the trace now ramps correctly both up and down.
+- **Three new example missions** flying the same 400 m square three ways:
+  `mc_07a` fixed yaw (translating in four directions), `mc_07b` yawing at each
+  corner, `mc_07c` rounded corners flown nose-first throughout.
+
+**v2.36.0** — the hover/translating inconsistency, and the vocabulary gap
+- **Root cause found for the 4% hover discrepancy.** The coaxial interference
+  penalty was discounted a flat 30% whenever `orientation != "hover"`, at ANY
+  airspeed. So a stationary aircraft described as "translating at 0 m/s" got a
+  forward-flight benefit that requires a freestream it does not have.
+  The relief is real — the freestream sweeps the upper rotor's wake clear of
+  the lower one — but it depends on HOW FAST you are going, not on which word
+  describes the flight mode. It now blends on `V / (V + v_hover)`: no relief
+  at rest, half at `V = v_hover`, approaching the full 30% at speed. Hover and
+  translating-at-zero now agree to 1 part in 10^12.
+- **Swept for the same class of bug.** Power is continuous across 0-25 m/s
+  (worst step 0.94%), thrust equals weight exactly at rest, and hover matches
+  translating-at-zero for both flat and coaxial layouts. Five new physics
+  tests lock these in.
+- **Golden snapshot regenerated.** 17 values moved across 4 keys, all coaxial
+  X8; flat, fixed-wing, battery and atmosphere untouched. Largest shift
+  +2.34% at 5 m/s, smallest at high speed — the expected shape, since the old
+  flat discount was most wrong where there was least freestream. `hover@0.0`
+  did not move, because hover always paid the full penalty.
+- **The CLI never learned the word "translating"** — in two places, the
+  argparse `choices` list and a second validator inside `main()`. The batch
+  driver therefore could not run a config the GUI had just written. Two new
+  CLI tests assert every entry point accepts the same vocabulary, and that an
+  invalid one still fails.
+- **A batch test routed configs by filename prefix**, so `Jaguar-quad.json`
+  was fed to the fixed-wing simulator. It now routes by the config's declared
+  `schema`, which is the thing that actually says what a config is.
+
+**v2.35.0** — power-budget, hover and diagram corrections
+- **Peripheral current was double-counted in the Power Budget.** The model
+  draws avionics power from the RAILS when any are defined and falls back to
+  peripheral current only when none are — either, never both. The budget
+  listed both, which showed up as a negative "Unaccounted" row exactly equal
+  to the peripheral draw. The budget now closes with no residual.
+- **A hover run reported hover power but cruise-speed endurance.**
+  `compute_operating_metrics` forces hover to 0 m/s; `estimate_flight_time_minutes`
+  did not, so the same run mixed two conditions — hovering at 17 m/s in the
+  speed box gave 47.99 min against the correct 23.80 min.
+- **The plan view is drawn nose-up.** It plotted +x (forward) to the RIGHT, so
+  0 deg pointed right and 90 deg pointed LEFT — the opposite of both the help
+  text and normal plan-view convention. Now 0 deg is up, 90 deg is starboard,
+  180 aft, 270 port, all verified.
+- **Rated Voltage removed** from the Motor and ESC tabs in both simulators,
+  superseded by the min/max rating range added in 2.20.0.
+- **Payload row shows its mass fraction**; battery mass fraction, drive mass
+  fraction, motor configuration and energy density removed from Environment &
+  Design, where they duplicated the Airframe section.
+- **Power Budget clears after a mission**, like the plot tabs, since a mission
+  has no single operating point to break down.
+
+**v2.34.0** — sensitivity works on missions
+Sensitivity only ever perturbed a single operating point, so the question it
+could answer was "what does this change do at cruise" — never "what does it do
+to the flight I actually intend to make".
+- **After a mission, each perturbation re-flies the WHOLE mission.** That
+  matters because the two answers differ: a change that improves cruise can
+  still fail a mission on its hover legs, and only re-flying it shows that.
+- **The output list switches with the run type**, since the questions are not
+  interchangeable. Mission mode offers energy, time, distance, reserve margin,
+  minimum state of charge, peak pack current and peak motor temperature;
+  "hover efficiency" has no meaning for a mission and "reserve margin" none
+  for a sweep. A note on the tab says which mode is active.
+- Conditions are preserved: the perturbed runs use the same wind, temperature,
+  pressure and orientation as the mission you ran, so only the lever changes.
+- Cost is real — 16 levers x 4 factors is 64 full mission simulations, about
+  15-20 s. Worth it for the answer, but not instant.
+- Both simulators. On the 2 m survey lawnmower, reserve margin is dominated by
+  battery capacity at 53% swing, then propeller efficiency at 10%.
+
+**v2.33.2**
+- **Documented why a steady tilt alone does not unbalance the rotors.**
+  Holding a constant tilt at constant speed needs no net moment: weight acts
+  at the CG, and equal thrust on a symmetric airframe also acts through the
+  CG. Differential thrust is what CHANGES attitude; once the aircraft is at
+  the angle it wants, that difference disappears. Drag acting at a different
+  height from the CG is what unbalances them continuously.
+- **Named what is NOT modelled**, in the help text and on the Per-Rotor
+  Loading panel: rear rotors flying in the front rotors' wake need more POWER
+  for the same thrust, and blade flapping adds a nose-up moment in forward
+  flight. Both are real, both make the rear rotors work harder than this
+  model shows, and neither is captured.
+
+**v2.33.1**
+- **Fixed-wing Cruise Speed moved from Airframe to Mission/Environment**,
+  matching where the multicopter's went in v2.19.0. That release moved the
+  multicopter's and missed the fixed-wing's, so the two simulators disagreed
+  about where the same setting lives. Cruise speed describes how an aircraft
+  is FLOWN, not what it is.
+
+**v2.33.0** — what Status and Metrics mean after a mission
+Both tabs already behaved differently after a mission than after a sweep, and
+neither said so. "Pack current 33 A" reads like a steady value when it is
+actually the worst instant of an entire flight.
+- **Status now states its scope.** After a mission every row is the WORST
+  value reached at any point — highest current, power, thrust and temperature,
+  LOWEST pack voltage, state of charge and reserve margin — so a row passes
+  only if it passed throughout. After a fixed speed run it says that instead.
+  (The worst-case tracking already existed; it was simply unlabelled.)
+- **Metrics now shows the mission's LAST evaluated instant**, and says so.
+  Previously it was not repopulated after a mission at all, so it kept
+  displaying whatever fixed-speed run came before — stale numbers presented as
+  current ones. Populating it from the worst-case dict would have been worse
+  still: each field's worst moment happens at a different time, so that
+  combination describes a point the aircraft never flew.
+- **Fixed Speed Plots really do clear after a mission now.** The 2.23.0 change
+  called the clearing helper and then redrew the sweep three lines later, so
+  the placeholder never survived. A mission produces no fixed-speed sweep;
+  drawing one from the config implied it did. The run now lands on Mission
+  Plots instead.
+
+**v2.32.0** — per-rotor loading on the Airframe Diagram
+- **New Per-Rotor Loading panel** beside the plan view. One row per rotor:
+  position, thrust in newtons and grams, share against the mean, and margin
+  to the propeller's rated maximum with the percentage used. The
+  hardest-working rotor is highlighted amber, and any rotor over its rating
+  red — because the rotor that saturates first is what limits the aircraft,
+  and an average cannot show which one that is.
+- A summary row gives the load **spread** (max/min) and the worst rotor's
+  excess over the mean.
+- **The diagram now numbers each rotor** and draws an arrow for the direction
+  of travel, so the table can be read against the picture without guessing
+  which rotor is which.
+- Coaxial layouts are handled: a pair shares a position, so the pair's thrust
+  is halved per rotor and the row is marked `(x2)`.
+- Worked example — 450 survey quad travelling 45° off the nose at 14 m/s with
+  a 6 cm drag offset: rotor 3 (aft-left) carries **+6.8%** above the mean
+  while rotor 1 unloads by the same amount, a spread of 1.147:1. With the drag
+  offset left blank the load is even and the panel says so.
+- Also added the **Drag Height above CG** input row, which 2.31.0 defined but
+  never placed on a tab.
+
+**v2.31.0** — translation direction as an input, and per-rotor loading
+- **Translation Direction is now a GUI field** on Mission/Environment. It
+  existed in the config from 2.26.0 but was never given a widget, so the only
+  way to set it was hand-editing JSON.
+  It is deliberately separate from Course Heading: course is where you are
+  going relative to the **wind**; translation direction is which way the
+  airframe is being pushed relative to **itself** — 0° straight ahead,
+  90° straight right, 45° toward the front-right motor. It sets the drag
+  silhouette and the pitch/roll split.
+- **Max Pitch and Max Roll** also got fields, each falling back to Max Tilt.
+- **Per-rotor load sharing.** Drag acting above the centre of gravity makes a
+  pitching moment `M = D x h`, and attitude is only held if the rotors counter
+  it with differential thrust — so the trailing rotors work harder than the
+  leading ones. Which rotor saturates first is decided by that imbalance, not
+  by the average, and the model previously assumed every rotor carried
+  exactly `T/n`.
+  New **Drag Height above CG** input; leave it blank and the load stays even,
+  exactly as before. The split uses the same rotor geometry the Airframe
+  Diagram draws, so the loading corresponds to the layout on screen.
+  New metrics: `rotor_thrusts_N`, `rotor_thrust_max_N`, `rotor_thrust_min_N`,
+  `rotor_load_spread`, `rotor_imbalance_pct`.
+- Removed the stale "if you do not see the Simple / Advanced selector..."
+  paragraph from the About window in both simulators.
+
+**v2.30.1** — battery mass counted correctly; entered airframe mass honoured
+Both faults shared one cause: the mass arithmetic read the RAW pack-weight
+field, which is the weight of a SINGLE pack. The aircraft carries
+series x parallel of them, so a 2S1P arrangement of 2100 g packs weighs
+4200 g — exactly what the Weight Budget was already showing.
+- **The mass validation understated the battery** and let impossible designs
+  through. On the heavy-lift X8 it compared 7370 g of components against a
+  9000 g all-up weight and passed, while the true total is 9470 g.
+- **The heavy-lift example was therefore still wrong.** Corrected again, from
+  9000 g to **11500 g**, which leaves 2030 g of structure. The first
+  correction in 2.29.0 used the same faulty arithmetic, so it moved the number
+  without fixing the problem.
+- **An entered airframe mass never reached the Weight Budget.** In "enter
+  airframe" mode the structure mass is an INPUT, but the budget still derived
+  it as a residual — showing 0.0 g while the field said 1000 g. It now shows
+  what was entered, so the table cannot disagree with the input driving it.
+- Both simulators fixed; all 10 configs re-verified against the corrected
+  arithmetic.
+
+**v2.30.0** — example configs refreshed, VTOL config save/load
+- **All 10 example configs updated** to carry the full current input set:
+  avionics mass, mass entry mode, per-axis pitch and roll limits, motor/ESC/
+  battery temperature limits, time-at-maximum allowances and voltage rating
+  ranges. Fixed-wing configs gained field lengths and a minimum climb rate,
+  which is what their take-off, landing and thrust-margin checks now judge
+  against. Dead inputs (frontal area, RTH and diversion reserves) removed.
+- **New `vtol_2m4_lift_cruise_survey`**, and the VTOL simulator gained
+  **config save/load** — it had none, so a VTOL design could not be kept or
+  shared.
+- **The multicopter orientation dropdown still said "forward".** The 2.26.0
+  translation work changed the physics and the metrics but never reached the
+  widget or its validator, so a config saved with `orientation: translating`
+  was rejected by the very GUI that would have produced it. Found by loading
+  the refreshed configs. The dropdown now offers **translating / hover**, and
+  "forward" still loads from older files.
+- **The Jaguar example pointed at an absolute path** on one machine's Desktop
+  for its propeller table. Cleared, with a note to load your own.
+- Every config leaves a positive airframe mass after components are
+  subtracted, so none is refused by the 2.29.0 validation.
+
+**v2.29.0** — mass entry, validation, and text wrapping
+- **Mass Entry Mode is a dropdown**, and whichever mass is being CALCULATED is
+  greyed out. Leaving both editable allowed entering two numbers that
+  contradict, with nothing to say which the simulation used.
+- **Impossible mass combinations are refused.** In "derive airframe" mode the
+  airframe mass is the residual after components are subtracted; if the
+  components already exceed the all-up weight the residual is negative, which
+  is not a slightly-wrong answer but an impossible aircraft. The run stops
+  with a message naming both figures and the three ways to fix it.
+- **This immediately caught a bad example config.** The heavy-lift X8 declared
+  6500 g all-up without payload while carrying 7020 g of motors, ESCs, props
+  and battery — an implied airframe of **-520 g**. Corrected to 9000 g, which
+  leaves a realistic ~1980 g of structure for a 22 in X8.
+- **Report status notes now wrap.** The status table was the one table still
+  unwrapped, so its notes — the longest text in the report — ran off the page.
+  The report also gained the `edge` colour so it matches the GUI.
+- **Status notes are readable in full in the GUI.** `ttk.Treeview` has no
+  option to wrap text inside a cell, so rather than truncating invisibly the
+  full note for the selected row is shown in a wrapping strip beneath the
+  table.
+
+**v2.28.0** — Sensitivity and Compare broadened
+Both tabs were written before much of the model existed and had fallen behind
+what the simulators compute.
+- **Multicopter sensitivity: 8 to 16 levers.** Added payload mass (the one
+  most users vary first, previously reachable only through all-up weight),
+  prop pitch, air density (standing in for altitude and temperature — a
+  multirotor is far more sensitive to it than a wing, since hover power goes
+  as 1/sqrt(rho)), figure of merit, battery and ESC resistance, profile area,
+  and translation direction, which became a real design variable in 2.26.0.
+- **Multicopter sensitivity outputs: 3 to 7.** Hover endurance (distinct from
+  cruise), pack current, motor temperature and hover efficiency.
+- **Fixed-wing sensitivity: 8 to 15 levers**, including wing span, which at
+  fixed area changes aspect ratio and is the single biggest lever on induced
+  drag. Outputs gained stall speed, L/D, rate of climb and take-off distance.
+- **Compare: 11 to 24 rows (multicopter) and 12 to 25 (fixed-wing).** Now
+  covers attitude (pitch, roll, total tilt), the itemised losses — two designs
+  can draw identical total power while wasting very different amounts as heat
+  — thermal margins, and the performance margins a change is usually bought
+  for: thrust available, best climb, take-off distance, glide ratio, and the
+  optimal speeds.
+
+**v2.27.0** — multicopter turn model
+Mission phases accept an optional **`turn_radius_m`**. The fixed-wing already
+modelled bank through its load factor; the multicopter did not model turns at
+all, so a mission of tight circuits cost the same as flying the distance
+straight.
+- A turning multirotor holds its weight AND supplies centripetal force, so
+  thrust rises by `1/cos(bank)` where `tan(bank) = V^2 / (R*g)` — the same
+  relation as for an aeroplane, since both must tilt their lift vector
+  sideways. `turn_thrust_N` treats weight, drag and centripetal force as the
+  mutually perpendicular vectors they are:
+  `T = sqrt(W^2 + D^2 + Fc^2)`.
+- The cost is substantial. On the reference quad at 12 m/s:
+  a 50 m radius costs **+4.5%** power, 25 m **+18%**, 15 m **+48%**, and a
+  10 m turn **doubles** it.
+- Phases without a turn radius are untouched, so existing missions behave
+  exactly as before — asserted by a test.
+- Endurance and range remain steady-state estimates with no turn applied;
+  turns are a mission-phase property, not a fixed-speed one.
+
+**v2.26.0** — translation direction (multicopter)
+A multirotor does not have a single "forward": it can translate any way
+without yawing, and which way it goes changes both the silhouette it presents
+and how the required tilt splits between pitch and roll. The old model treated
+every translation as nose-first and hid both effects.
+- **Orientation "forward" is now "translating"**, with a new **translation
+  direction** input measured from the nose (0 deg ahead, 90 deg right).
+  "forward" is still accepted and means translating at 0 deg, so existing
+  configs, missions and CLI calls are unchanged — asserted by a test that
+  compares every metric between the two names.
+- **Drag depends on direction.** The presented area interpolates between the
+  frontal and side silhouettes as
+  `A(psi) = A_front*cos^2(psi) + A_side*sin^2(psi)`, exact for a rectangular
+  prism. On the reference quad at 12 m/s that is 2.24 N nose-first against
+  3.72 N sideways — 66% more drag and 16% more power, which the old model
+  could not express at all.
+- **Tilt is reported as pitch and roll**, split by the direction of travel:
+  `tan(pitch) = tan(tilt)*cos(psi)`, `tan(roll) = tan(tilt)*sin(psi)`.
+  Forward translation is pure pitch, sideways is pure roll, a diagonal splits
+  evenly. Same case above: 7.2 deg of pitch flying forward, 11.9 deg of roll
+  flying sideways.
+- **Separate pitch and roll limits**, each falling back to the old single
+  tilt limit. Long-armed airframes rarely have equal authority in both axes,
+  and one number could not say so.
+
+**v2.25.1** — multicopter status thresholds given a basis
+The same treatment the fixed-wing limits got. Measured against all five
+example aircraft first, then changed only where the data said the limit was
+wrong.
+- **Disk loading is no longer pass/fail.** It is a design choice — a cinewhoop
+  runs high disk loading on purpose. What it does fix is the best hover
+  efficiency physically available, `ideal g/W = 1000 / (g0 * sqrt(DL/2rho))`,
+  so the row now reports that ceiling instead of judging the number.
+- **Hover efficiency is judged against that ceiling**, not a flat 5 g/W. The
+  old limit measured disc SIZE more than design quality: trivially easy on a
+  heavy-lift with 22 in discs, near impossible on a 3 in cinewhoop. The
+  cinewhoop now reads "44% of the 11.5 g/W ideal for this disk loading".
+- **Figure of merit scales with rotor size.** Small propellers run at low
+  Reynolds number and cannot reach the FoM of a large rotor. The flat 0.65
+  flagged three of the five example aircraft as bad, including ordinary ones.
+  Targets are now 0.70 for >= 15 in, 0.60 for >= 9 in, 0.45 below that.
+- **Prop solidity scales with blade count.** Solidity rises with blade number
+  almost by definition, so one 0.05-0.15 window judged 3-blade propellers
+  against a 2-blade expectation and flagged normal designs as suspect.
+- **Tip Mach uses the local speed of sound**, matching the fixed-wing fix, and
+  now shows the tip speed in m/s alongside.
+
+**v2.25.0** — Power Budget tab (#57, both simulators)
+- **New Power Budget tab**, beside Weight Budget. The weight budget answers
+  "what is this aircraft made of"; this answers "what is the battery actually
+  paying for". A design can be light and still lose a large share of its
+  energy to heat.
+- Every row is either **delivered** (green) or **lost** (red), with a voltage
+  and current column. Anything drawing straight from the pack reports
+  "Battery" for voltage, because its voltage is whatever the pack happens to
+  be at rather than a designed value. Each avionics rail contributes two rows:
+  the power delivered at rail voltage, and the regulator loss getting there.
+- Subtotals for total delivered and total losses, then the grand total, plus a
+  share diagram colour-keyed the same way.
+- **The total is taken at the CELLS, not the pack terminals.** Terminal power
+  is already measured at the sagged voltage, so counting the pack's own I2R
+  loss inside it charges that loss twice — which showed up immediately as a
+  negative "Unaccounted" row exactly equal to the I2R. The budget uses
+  `P_cells = P_terminals + I2R` so every joule is counted once.
+- An **Unaccounted** row appears whenever the itemised rows genuinely do not
+  close, rather than absorbing the difference into the percentages. That is
+  what caught the double-count above.
+
+**v2.24.0** — propeller coefficients, and a correction to the C_T fit
+- **TConst (C_T) and PConst (C_P) now appear in the Propeller metrics** of
+  both simulators (#46). With a table loaded they are **measured** from it —
+  `T = C_T x rho x n^2 x D^4`, `P = C_P x rho x n^3 x D^5` — and the note
+  reports how many points were used and how tightly C_T holds across them.
+  Without a table they fall back to the geometry estimate and say so.
+- **The geometry C_T fit was about twice too high and has been recalibrated.**
+  Deriving coefficients from the two measured tables gave C_T 0.062 for the
+  22x6.6 and 0.079 for the 18x8, against roughly 0.13 and 0.14 from the old
+  `0.10 + 0.10*p/D`. That fit was invented, not measured. Since RPM goes as
+  `1/sqrt(C_T)` it understated propeller speed by about 40%.
+  It had passed an earlier check only because the resulting hover tip speeds
+  landed in a plausible band — which is not evidence. The fit is now
+  `0.022 + 0.129*p/D`, within 4% of both measurements, and hover tip speeds
+  move from 60-63 m/s to 70-91 m/s, which matches real multirotors better.
+  Two propellers is still a thin basis; supply TConst or a table when it
+  matters.
+- **The voltage-rating unit is a dropdown** (S or V) rather than free text
+  (#12), in both simulators and for both motor and ESC. A two-valued choice
+  typed by hand invites "volts" or a typo that silently reads as the wrong
+  unit.
+
+**v2.23.1** — the same plot and export work applied to the fixed-wing
+- Mission Plots take up to 4 variables with two y-axes a side and colour-keyed
+  axes, and the x-axis switches between mission time and distance.
+- "Plots" renamed **Fixed Speed Plots**, and each plot tab is cleared with an
+  explanatory note when the other kind of run happens.
+- The power panel now draws **mechanical alongside electrical** required
+  power, so the drivetrain loss is the gap between them, with power available
+  as a third trace.
+- Exports follow the run: the sweep CSV gained Power Electrical, Power
+  Mechanical, Thrust Required and Thrust Available so its columns match the
+  curves; a mission run exports its own history instead of a stale sweep.
+- **Not ported, deliberately:** the multicopter's thrust-component and drag
+  panels (#22, #23). A fixed-wing has no "hover attitude" trace to remove, and
+  it already plots induced against parasitic drag and thrust required against
+  available — the equivalent information in the form that suits a wing.
+
+**v2.23.0** — mission plots and exports (multicopter)
+- **Mission Plots take up to 4 variables** (#4), two y-axes on the left and
+  two on the right, each axis and its curve sharing a distinct colour so a
+  trace is identifiable without reading the legend. The panel says the limit
+  is 4; selecting more plots the first four and explains why — beyond that the
+  axes crowd each other and nothing is readable.
+- **Mission plot x-axis can be time or distance** (#19). Distance is the more
+  useful axis on a survey pattern, where what matters is where along the route
+  something happened.
+- **"Plots" is now "Fixed Speed Plots"** (#17), and each plot tab belongs to
+  one kind of run. Running a mission clears the fixed-speed plots with a note
+  saying so, and running a sweep clears the mission plots (#18). A stale chart
+  from the other kind of run is worse than an empty tab, because the axes look
+  perfectly plausible.
+- **Exports follow whatever was plotted** (#21). After a fixed speed sweep the
+  CSV/Excel carries speed, flight time, range, mechanical and electrical
+  power, the three thrust components and the three drag curves — the columns
+  mirror the curves on screen, in the same order. After a mission it carries
+  the mission history instead of a stale sweep.
+
+**v2.22.0** — fixed-speed plots reworked (multicopter)
+- **"Run Single-Point" is now "Run Fixed Speed Sweep"**, and the output header
+  reads "Fixed Speed Run". The button always swept speed to build the curves;
+  the old name understated it.
+- **Power panel shows mechanical AND electrical** instead of the ambiguous
+  "hover attitude" trace. The gap between the two curves is the drivetrain
+  loss, which is far more useful than a line that was neither hover nor the
+  flight being simulated.
+- **Thrust panel resolves into components**: total, the horizontal part that
+  beats drag, and the vertical part that holds the weight (constant, equal to
+  weight). Hover attitude removed.
+- **New drag panel** replaces the single-point power breakdown, which belongs
+  on its own tab rather than inside a speed sweep.
+  Profile and parasitic drag are labelled as **alternative silhouettes, not
+  additive components** — a multirotor pitches nose-down in forward flight and
+  presents its frontal area, so total drag equals the parasitic curve. The
+  profile curve is shown for comparison because it is what the same aircraft
+  would suffer translating level, and it is usually the larger of the two.
+
+**v2.21.1** — fixed-wing status thresholds given a basis
+Every hard-coded fixed-wing limit either became an input or acquired a
+derivation. None of them are constants chosen by nobody any more.
+- **Take-off run and landing distance are Mission/Environment inputs.** How
+  much runway is enough depends on your field: 100 m is generous for a
+  hand-launch and impossible off a short strip. With no field entered the
+  distance is reported without a verdict, rather than judged against a number
+  the user never chose.
+- **Thrust margin is judged by the climb it buys.** A percentage alone does
+  not say whether the aircraft climbs; excess thrust becomes climb rate
+  directly through `RC = (T - D) x V / W`. The row now shows that climb rate
+  and checks it against a **minimum climb rate** input.
+- **Prop tip speed is a Mach limit, not a speed limit.** Compressibility at
+  the tip is what costs efficiency and makes noise, and the speed of sound
+  falls with temperature — so the old fixed 200 m/s was several percent wrong
+  on a cold day. Now `<= Mach 0.60`, evaluated against the local speed of
+  sound. On the 2 m survey example this reclassifies 199.4 m/s from a clean
+  pass to `edge` at Mach 0.58, which is the honest reading.
+- **Reynolds number keeps its bands but states the physics**: below ~70 k the
+  laminar separation bubble does not reattach, above ~200 k ordinary
+  published polars apply, and between the two the airfoil simply has to be
+  chosen for low Re. The mean chord it was computed at is now shown.
+
+**v2.21.0** — mass entry, and the avionics-mass fix
+- **Avionics Mass never reached the model.** The field was collected and the
+  config class accepted it, but nothing connected the two in `build_config`,
+  so a non-zero value vanished before it could appear in the Weight Budget or
+  the metrics. Wired in both simulators.
+- **"Base Weight" renamed "All Up Weight without Payload"**, with help saying
+  what it is used for: the airframe mass is derived from it by subtracting
+  battery, motors, ESCs, propellers and avionics, and that residual is what
+  the Weight Budget shows as "Airframe / Structure".
+- **New Mass Entry Mode.** `derive airframe` behaves as before. `enter
+  airframe` reverses it: give the bare structure mass and the all-up weight is
+  built up from the components — better when designing from a parts list than
+  when weighing a finished aircraft.
+
+**v2.20.2**
+- **The fixed-wing thrust-to-weight check used a rotorcraft criterion.** It
+  demanded `>= 1.2:1` and called anything less "marginal climb performance",
+  which flagged the 2 m survey example red at 0.54:1 — while that aircraft
+  climbs at 494 m/min, holds an 80% thrust margin at cruise and takes off in
+  19 m. Almost no real fixed-wing could have passed it.
+  A wing carries the weight, so thrust only has to beat drag: level flight
+  needs `T/W > 1/(L/D)`, which is 0.11 for that survey aircraft and 0.05 for
+  the 3 m glider. The threshold now scales with the aircraft's own L/D, and
+  the note says what the number means — T/W above 1 is needed only to climb
+  vertically.
+  The thrust figure feeding it was correct throughout; only the limit was
+  wrong.
+
+**v2.20.1** — the same status pass applied to the fixed-wing
+- Tag-colour rendering fix, the `edge` band, `_classify` and
+  `_dual_limit_row` all ported, so both simulators now colour and classify
+  identically.
+- Pack current, discharge C-rate, motor current and motor power carry both
+  ratings on one row.
+- Motor, ESC and battery thermal limits, time-at-maximum allowances, and the
+  motor voltage-rating check are all present here too.
+
+**v2.20.0** — status system (multicopter)
+- **Status colours now actually render in the GUI.** The tags were always
+  configured; Tk 8.6.9 and later silently drop Treeview tag backgrounds
+  unless the style's state map is stripped first. That is why the PDF was
+  coloured and the window was not.
+- **Four states instead of three.** A new `edge` band marks a value within 5%
+  of its limit: passing, but with no margin for a gust, a hot day or a tired
+  battery.
+- **Dual-limit rows.** Pack current, discharge C-rate, motor current, motor
+  power and ESC current each carry BOTH ratings on one row — green under the
+  continuous rating, amber between the two, red above the maximum. Two
+  separate "vs cont" and "vs max" rows made a design sitting between them
+  look like one pass and one fail, when it is really a time-limited condition.
+- **Time-at-maximum inputs** for the motor, the ESC and the battery. When
+  given, exceeding the continuous rating reports how long it may be held.
+  When blank, the note says duration is unchecked rather than implying it is
+  fine.
+- **Thermal limits are inputs**, replacing hard-coded 100/90/55 °C for motor,
+  ESC and battery.
+- **Motor voltage rating check**, alongside the existing ESC one. Ratings can
+  be entered as volts or as an S-count range, since 4-6S motors are specified
+  both ways.
+
+**v2.19.0** — inputs reorganised (both simulators)
+- **Non-motor loads live together.** Peripheral Current moved from Airframe
+  to the top of the Avionics tab, above the rail table. Splitting them across
+  tabs made it easy to enter the same device twice — once as a raw pack draw
+  and once as a regulated rail.
+- **New Avionics Mass input**, beside it, and it now appears in the Weight
+  Budget. It previously vanished into the airframe residual, so a user could
+  not see it.
+- **Cruise Speed and Max Tilt moved to Mission/Environment.** Both describe
+  how the aircraft is flown, not what it is.
+- **New Plot Settings tab** holding the plot speed range. That is a display
+  choice, not a physical input.
+- **Frontal Area removed.** Forward flight uses parasite area and
+  hover-attitude uses profile area; frontal area survived only as a fallback,
+  which now points at parasite area instead.
+- **RTH and Diversion reserve inputs removed.** One reserve percentage now
+  covers all of it, and its help says so.
+- **The reserve help states what the percentage is OF**: usable energy, not
+  pack energy. A 100 Wh pack at 80% usable gives 80 Wh, so 20% reserve holds
+  back 16 Wh of that — not 20 Wh.
+- **SoC curve is a file picker**, not a typed path.
+- **Altitude, temperature and pressure default to ISA sea level** rather than
+  blanks, so a new user starts from a defined atmosphere.
+
+**v2.18.1** — the same metrics pass applied to the fixed-wing
+- **"What it means" column**, matching the multicopter. The PDF report folds
+  the note in beside the value.
+- **Aircraft section gains mass fractions**: all-up weight, payload, battery
+  mass fraction and drive mass fraction. The battery note differs from the
+  multicopter's on purpose — a fixed-wing tolerates a higher battery fraction
+  because cruise power rises only slowly with weight, where a multirotor pays
+  for every gram in hover.
+- **Environment reports its inputs**: altitude, cruise altitude, temperature,
+  wind speed, and the head/cross split — not only the derived air density.
+- **Losses sit with the component that produces them**: pack I2R in Battery,
+  motor copper loss in Thrust & Power, ESC and battery headroom in Thermal
+  & Losses.
+- New metric keys: `altitude_m`, `ambient_temp_C`, `wind_mps`.
+  (`battery_loss_W` and `motor_copper_loss_W` already existed.)
+
+**v2.18.0** — Metrics restructuring (multicopter)
+- **A "What it means" column.** Every metric can now carry a one-line
+  explanation. A table of bare numbers assumes the reader already knows which
+  of two same-unit figures is which; several here (figure of merit, the two
+  g/W rows, propulsion power) genuinely need saying. The PDF report folds the
+  note in beside the value.
+- **New Airframe section**, first in the list: all-up weight, payload,
+  battery mass fraction, drive mass fraction and motor configuration — what
+  the vehicle IS, before how it performs.
+- **Environment & Design now reports its inputs**, not just the derived air
+  density: altitude, temperature, pressure, wind speed and direction, and the
+  head/cross wind split.
+- **Losses sit with the thing that produces them.** Pack I2R moved to
+  Battery, motor copper loss to Motor @ Operating Point. Thermal Estimates
+  gained ESC and battery headroom.
+- **Total Drive & Power** replaces the vague "Total Current" with total motor
+  current, current into avionics, peripheral current, avionics conversion
+  loss, and total power losses.
+- New metric keys behind these: `altitude_m`, `ambient_temp_C`,
+  `pressure_Pa`, `wind_mps`, `headwind_mps`, `crosswind_mps`,
+  `battery_i2r_loss_W`.
+
+**v2.17.0** — clarity pass over the Metrics tab and the PDF report
+- **Hover meant "hover attitude at the cruise speed box"**, so hover power
+  fell as you raised a speed the aircraft was not flying at, and a hover run
+  reported a flight distance. Hover now forces 0 m/s and zero groundspeed.
+- **The report's Metrics page showed only section headings.** Once Metrics
+  became collapsible, `get_children()` on the root returned the headings and
+  nothing under them. It now walks the tree.
+- **Report tables wrap** instead of running past the column edge or over the
+  next column.
+- **Propulsion power excluded motor copper loss.** It was `P_in` less ESC and
+  avionics only, so winding heat counted as useful output and flattered
+  system efficiency. Renamed **Propulsion Power**, and system efficiency is
+  now labelled `P_propulsion / P_in` with a note that avionics power is real
+  output that simply does not make lift.
+- **"Specific thrust" was a misnomer** — in aerodynamics that is thrust per
+  unit mass flow. Renamed **Thrust per Watt (this point)**, and it and Hover
+  Efficiency now carry their equations, since they share units.
+- **Ideal Hover Power and Actual Induced Power** now state their definitions;
+  they differ by exactly the figure of merit.
+- Undefined limits read **"Not Specified"** rather than a bare dash.
+- The reserve-margin note spells out the arithmetic: usable Wh, minus reserve
+  held back, minus what the flight consumes.
+- Rows removed as duplicated or not meaningful in a fixed-speed run:
+  Cont C-rate limit, Energy Density, Thermal Headroom, Power split, Tilt
+  Limit, Acceleration, Reserve Margin, and the duplicate Battery Flight Time.
+  Reserve Target renamed **Reserve Battery Amount**.
 
 **v2.16.0**
 - **The Compare tab ignored mission runs.** Only the single-point path

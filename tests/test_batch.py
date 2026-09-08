@@ -158,7 +158,15 @@ def test_gui_config_translation_drops_blanks(rw, paths, cfg, sim):
 def test_every_example_config_runs_through_batch(paths):
     for cfg in sorted(glob.glob(os.path.join(paths["configs"], "*.json"))):
         rel = os.path.relpath(cfg, paths["root"])
-        sim = "multicopter" if os.path.basename(cfg).startswith("multi") else "fixedwing"
+        # Route by the config's own schema, not by its filename. A filename
+        # prefix said "Jaguar-quad.json" was a fixed-wing, so a multicopter
+        # config was fed to the wrong simulator — the config is not obliged
+        # to announce its type in its name, but it does declare a schema.
+        with open(cfg, encoding="utf-8") as handle:
+            schema = str(json.load(handle).get("schema", ""))
+        if "vtol" in schema:
+            continue          # the VTOL simulator has no batch driver
+        sim = "multicopter" if "multicopter" in schema else "fixedwing"
         var = "speed" if sim == "multicopter" else "cruise_speed"
         val = "8" if sim == "multicopter" else "18"
         assert_all_runs_ok(run_batch(paths, [
@@ -209,7 +217,7 @@ def test_gui_and_batch_agree_on_the_same_config(paths, mc, fw, sim, cfg, var, va
     try:
         gui.set_open_dialog(os.path.join(paths["root"], cfg))
         gui.click("Load Config")
-        assert not gui.click("Single-Point")
+        assert not gui.click("Fixed Speed Sweep")
         text = ""
         for widget in gui.widgets:
             if isinstance(widget, tk.Text):

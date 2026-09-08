@@ -1,0 +1,71 @@
+{
+  "_comment": "Square flown by YAWING at each corner, so every leg is nose-first and presents the frontal silhouette. The yaw itself is modelled as a brief hover: the aircraft still holds its weight while turning, which costs time and energy but no forward progress.",
+  "reserve_percent": 20,
+  "wind_direction_deg": 0,
+  "phases": [
+    {
+      "name": "Takeoff climb",
+      "speed": 0.0,
+      "duration": 30,
+      "altitude": 60,
+      "climb_rate_mps": 2.0
+    },
+    {
+      "name": "Leg 1 north (nose-first)",
+      "speed": 10.0,
+      "distance": 400,
+      "altitude": 60,
+      "course_deg": 0,
+      "translation_direction_deg": 0
+    },
+    {
+      "name": "Yaw 90 at corner 1",
+      "speed": 0.0,
+      "duration": 4,
+      "altitude": 60
+    },
+    {
+      "name": "Leg 2 east (nose-first)",
+      "speed": 10.0,
+      "distance": 400,
+      "altitude": 60,
+      "course_deg": 90,
+      "translation_direction_deg": 0
+    },
+    {
+      "name": "Yaw 90 at corner 2",
+      "speed": 0.0,
+      "duration": 4,
+      "altitude": 60
+    },
+    {
+      "name": "Leg 3 south (nose-first)",
+      "speed": 10.0,
+      "distance": 400,
+      "altitude": 60,
+      "course_deg": 180,
+      "translation_direction_deg": 0
+    },
+    {
+      "name": "Yaw 90 at corner 3",
+      "speed": 0.0,
+      "duration": 4,
+      "altitude": 60
+    },
+    {
+      "name": "Leg 4 west (nose-first)",
+      "speed": 10.0,
+      "distance": 400,
+      "altitude": 60,
+      "course_deg": 270,
+      "translation_direction_deg": 0
+    },
+    {
+      "name": "Descend and land",
+      "speed": 0.0,
+      "duration": 30,
+      "altitude": 0,
+      "descent_rate_mps": 2.0
+    }
+  ]
+}

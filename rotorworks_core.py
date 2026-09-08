@@ -73,7 +73,15 @@ __all__ = [
     "regular_polygon_vertices", "rotor_ring_layout", "wing_rotor_positions",
     # propeller coefficients
     "estimate_prop_thrust_coefficient", "estimate_prop_power_coefficient",
-    "rpm_from_thrust",
+    "rpm_from_thrust", "derive_prop_coefficients_from_table",
+    # turning flight
+    "turn_bank_deg", "turn_load_factor", "turn_thrust_N",
+    # translation geometry
+    "translation_drag_area", "pitch_roll_from_tilt", "tilt_from_pitch_roll",
+    # per-rotor load sharing
+    "rotor_thrust_distribution", "rotor_load_spread",
+    # power budget
+    "build_power_budget",
     # figures
     "make_figure",
     # GUI
@@ -910,8 +918,21 @@ def estimate_prop_thrust_coefficient(diameter_in: float,
     d_in = max(float(diameter_in), 1e-6)
     p_over_d = max(float(pitch_in), 0.0) / d_in
 
-    # Base fit against pitch/diameter, over the range real UAV props occupy.
-    c_t = 0.10 + 0.10 * min(max(p_over_d, 0.2), 0.9)
+    # Calibrated against the two measured tables shipped with the tests:
+    #   APC-style 22x6.6 (p/D 0.33)  ->  C_T 0.062
+    #   APC-style 18x8   (p/D 0.44)  ->  C_T 0.079
+    # which give slope 0.129 and intercept 0.022.
+    #
+    # The earlier fit (0.10 + 0.10*p/D) was invented rather than measured and
+    # came out roughly TWICE too high against both propellers. Because RPM
+    # goes as 1/sqrt(C_T), that error understated propeller speed by about
+    # 40%. It survived an earlier sanity check only because the resulting tip
+    # speeds landed inside a plausible band — a reminder that "looks
+    # reasonable" is not evidence.
+    #
+    # Two propellers is still a thin basis. Treat this as an order-of-
+    # magnitude default and supply TConst or a table whenever it matters.
+    c_t = 0.022 + 0.129 * min(max(p_over_d, 0.2), 0.9)
 
     # Blade count enters through solidity. Thrust per blade falls slightly as
     # blades are added, so the total scales less than linearly.
@@ -941,6 +962,73 @@ def estimate_prop_power_coefficient(c_t: float,
     return (ct ** 1.5) / math.sqrt(2.0) / fm
 
 
+def derive_prop_coefficients_from_table(df, diameter_in: float,
+                                        rho: float = 1.225) -> Optional[dict]:
+    """
+    Fit C_T and C_P from a measured static propeller table.
+
+        T = C_T * rho * n^2 * D^4
+        P = C_P * rho * n^3 * D^5      (n in rev/s, D in metres)
+
+    Bench data is normally taken at or near sea level, so `rho` defaults to
+    1.225 kg/m3. If your table was recorded somewhere high, pass the density
+    it was actually measured at — the coefficients scale directly with it and
+    a 15% density error becomes a 15% coefficient error.
+
+    Measured coefficients beat any estimate: they capture the real blade, not
+    a fit against pitch and diameter. Returns None when the table lacks the
+    RPM column needed, since without a rotational speed there is no way to
+    non-dimensionalise.
+
+    Returned keys:
+        c_t, c_p        mean coefficients across the table
+        c_t_spread      max/min ratio of the per-row C_T values; a well
+                        behaved propeller stays near 1.0, and a large spread
+                        means the fit is not describing a single regime
+        points          rows used
+    """
+    if df is None:
+        return None
+    for column in ("Thrust_g", "RPM"):
+        if column not in df:
+            return None
+
+    d_m = float(diameter_in) * 0.0254
+    if d_m <= 0 or rho <= 0:
+        return None
+
+    have_power = "Power_W" in df
+    ct_values, cp_values = [], []
+    for _, row in df.iterrows():
+        try:
+            rpm = float(row["RPM"])
+            thrust_N = float(row["Thrust_g"]) * G0 / 1000.0
+        except (TypeError, ValueError):
+            continue
+        n = rpm / 60.0
+        if n <= 0 or thrust_N <= 0:
+            continue
+        ct_values.append(thrust_N / (rho * n ** 2 * d_m ** 4))
+        if have_power:
+            try:
+                power_W = float(row["Power_W"])
+            except (TypeError, ValueError):
+                continue
+            if power_W > 0:
+                cp_values.append(power_W / (rho * n ** 3 * d_m ** 5))
+
+    if not ct_values:
+        return None
+
+    c_t = sum(ct_values) / len(ct_values)
+    return {
+        "c_t": c_t,
+        "c_p": (sum(cp_values) / len(cp_values)) if cp_values else None,
+        "c_t_spread": (max(ct_values) / max(min(ct_values), 1e-9)),
+        "points": len(ct_values),
+    }
+
+
 def rpm_from_thrust(thrust_N: float, diameter_m: float, rho: float,
                     c_t: float) -> Optional[float]:
     """
@@ -956,6 +1044,337 @@ def rpm_from_thrust(thrust_N: float, diameter_m: float, rho: float,
         return 0.0
     n_rev_s = math.sqrt(t / (float(c_t) * float(rho) * d ** 4))
     return n_rev_s * 60.0
+
+
+# ============================================================
+# TRANSLATION GEOMETRY
+# ============================================================
+# A multirotor does not have a single "forward". It can translate in any
+# direction without yawing, and which way it goes changes both the silhouette
+# it presents to the airflow and how the required tilt splits between pitch
+# and roll. Treating every translation as nose-first hid both effects.
+
+def translation_drag_area(frontal_area_m2: float,
+                          side_area_m2: float,
+                          azimuth_deg: float) -> float:
+    """
+    Reference area presented when translating at `azimuth_deg` off the nose.
+
+    0 deg is straight ahead (frontal silhouette), 90 deg is straight right
+    (side silhouette). For a broadly box-shaped airframe the projected area
+    between those extremes follows
+
+        A(psi) = A_front * cos^2(psi) + A_side * sin^2(psi)
+
+    which is exact for the projected area of a rectangular prism and a decent
+    approximation for a real airframe. Note it interpolates the AREA, not the
+    drag: drag also depends on how cleanly the shape sheds flow at that angle,
+    which this does not attempt to capture.
+    """
+    psi = math.radians(float(azimuth_deg))
+    a_front = max(float(frontal_area_m2), 0.0)
+    a_side = max(float(side_area_m2), 0.0)
+    return a_front * math.cos(psi) ** 2 + a_side * math.sin(psi) ** 2
+
+
+def pitch_roll_from_tilt(tilt_deg: float, azimuth_deg: float) -> Tuple[float, float]:
+    """
+    Split a total tilt into pitch and roll for a given translation direction.
+
+    The thrust vector tilts by `tilt_deg` toward `azimuth_deg`. Resolving that
+    tilt onto the body axes:
+
+        tan(pitch) = tan(tilt) * cos(azimuth)
+        tan(roll)  = tan(tilt) * sin(azimuth)
+
+    Translating straight ahead is pure pitch; straight sideways is pure roll;
+    a diagonal splits between them. This matters because airframes rarely have
+    the same authority in both axes — a long-armed cinelifter can have far
+    less roll authority than pitch, and a single "tilt limit" cannot express
+    that.
+
+    Returns (pitch_deg, roll_deg), both signed.
+    """
+    tilt = math.radians(float(tilt_deg))
+    psi = math.radians(float(azimuth_deg))
+    tan_tilt = math.tan(tilt)
+    pitch = math.atan(tan_tilt * math.cos(psi))
+    roll = math.atan(tan_tilt * math.sin(psi))
+    return math.degrees(pitch), math.degrees(roll)
+
+
+def tilt_from_pitch_roll(pitch_deg: float, roll_deg: float) -> float:
+    """
+    Total tilt from its pitch and roll components — the inverse of
+    `pitch_roll_from_tilt`.
+
+        tan(tilt)^2 = tan(pitch)^2 + tan(roll)^2
+    """
+    tp = math.tan(math.radians(float(pitch_deg)))
+    tr = math.tan(math.radians(float(roll_deg)))
+    return math.degrees(math.atan(math.sqrt(tp * tp + tr * tr)))
+
+
+# ============================================================
+# TURNING FLIGHT
+# ============================================================
+
+def turn_bank_deg(speed_mps: float, radius_m: float) -> float:
+    """
+    Bank angle for a coordinated turn.
+
+        tan(bank) = V^2 / (R * g)
+
+    Identical for a multirotor and a fixed-wing: both must tilt their lift
+    vector sideways to supply the centripetal force. The multirotor does it
+    by tilting the whole rotor disc, the aeroplane by banking the wing, but
+    the trigonometry does not care.
+    """
+    v = max(float(speed_mps), 0.0)
+    r = float(radius_m)
+    if r <= 0 or v <= 0:
+        return 0.0
+    return math.degrees(math.atan((v * v) / (r * G0)))
+
+
+def turn_load_factor(speed_mps: float, radius_m: float) -> float:
+    """
+    Load factor in a coordinated turn: n = 1 / cos(bank), and never below 1.
+
+    A turning aircraft must generate more than its own weight, because the
+    lift vector is now doing two jobs. For a multirotor that means more
+    thrust, more induced velocity and more power — which is why a mission of
+    tight turns costs more than the straight-line distance suggests.
+    """
+    bank = math.radians(turn_bank_deg(speed_mps, radius_m))
+    return 1.0 / max(math.cos(bank), 1e-6)
+
+
+def turn_thrust_N(weight_N: float, drag_N: float,
+                  speed_mps: float, radius_m: float) -> Tuple[float, float, float]:
+    """
+    Total thrust for a multirotor holding a turn, and how its tilt resolves.
+
+    Three forces act, and they are mutually perpendicular:
+        vertical    W          holding the aircraft up
+        along-track D          beating drag
+        lateral     m V^2 / R  turning the corner
+
+    so the thrust magnitude is the 3D vector sum
+
+        T = sqrt(W^2 + D^2 + F_c^2)
+
+    Returns (thrust_N, along_track_tilt_deg, lateral_tilt_deg). The lateral
+    tilt IS the bank angle; the along-track tilt is the usual drag tilt. Both
+    are needed because they load different body axes once the direction of
+    travel is taken into account.
+    """
+    w = max(float(weight_N), 1e-9)
+    d = max(float(drag_N), 0.0)
+    v = max(float(speed_mps), 0.0)
+    r = float(radius_m)
+
+    centripetal = (w / G0) * v * v / r if r > 0 else 0.0
+    thrust = math.sqrt(w * w + d * d + centripetal * centripetal)
+    return (thrust,
+            math.degrees(math.atan2(d, w)),
+            math.degrees(math.atan2(centripetal, w)))
+
+
+# ============================================================
+# PER-ROTOR LOAD SHARING
+# ============================================================
+
+def rotor_thrust_distribution(rotor_positions: List[Tuple[float, float]],
+                              total_thrust_N: float,
+                              drag_N: float = 0.0,
+                              translation_azimuth_deg: float = 0.0,
+                              drag_height_above_cg_m: float = 0.0) -> List[float]:
+    """
+    Thrust each rotor must produce, once the drag moment is accounted for.
+
+    In steady translating flight the rotors do NOT share the load equally.
+    Drag acts at some height above (or below) the centre of gravity, and that
+    offset produces a pitching moment:
+
+        M = D * h
+
+    Attitude is only held if the rotors counter it with differential thrust,
+    so the trailing rotors work harder than the leading ones. Which rotor
+    saturates first — and therefore what actually limits the aircraft — is
+    decided by this imbalance, not by the average.
+
+    The moment axis is perpendicular to the direction of travel. Each rotor's
+    share is proportional to its distance along that axis, which is the
+    minimum-effort solution a real mixer converges on:
+
+        dT_i = M * r_i / sum(r_j^2)
+
+    With `drag_height_above_cg_m` at 0 the moment vanishes and every rotor
+    carries `total_thrust_N / n`, exactly as before.
+
+    `rotor_positions` are (x, y) in metres with +x forward and +y right.
+    Returns one thrust per rotor, in the same order. Values are floored at
+    zero: a rotor cannot pull down.
+    """
+    n = len(rotor_positions)
+    if n == 0:
+        return []
+    even = max(float(total_thrust_N), 0.0) / n
+    moment = float(drag_N) * float(drag_height_above_cg_m)
+    if abs(moment) < 1e-12:
+        return [even] * n
+
+    # Travel direction, and the axis the drag moment acts about (90 deg to it).
+    psi = math.radians(float(translation_azimuth_deg))
+    axis_x, axis_y = math.cos(psi), math.sin(psi)
+
+    # Distance of each rotor along the travel direction. A rotor ahead of the
+    # CG gets a positive arm, one behind gets a negative one.
+    arms = [x * axis_x + y * axis_y for x, y in rotor_positions]
+    denom = sum(a * a for a in arms)
+    if denom < 1e-12:
+        return [even] * n
+
+    # Drag above the CG pitches the nose down, so the LEADING rotors unload
+    # and the trailing ones take up the difference.
+    return [max(even - moment * a / denom, 0.0) for a in arms]
+
+
+def rotor_load_spread(thrusts: List[float]) -> dict:
+    """
+    Summarise how unevenly the rotors are loaded.
+
+    `spread` is the highest thrust divided by the lowest: 1.0 is perfectly
+    even, and a large value means one rotor is close to its limit while
+    another idles. `imbalance_pct` is how far the hardest-working rotor sits
+    above the average, which is the number to compare against motor headroom.
+    """
+    if not thrusts:
+        return {"max_N": 0.0, "min_N": 0.0, "mean_N": 0.0,
+                "spread": 1.0, "imbalance_pct": 0.0}
+    hi, lo = max(thrusts), min(thrusts)
+    mean = sum(thrusts) / len(thrusts)
+    return {
+        "max_N": hi,
+        "min_N": lo,
+        "mean_N": mean,
+        "spread": hi / lo if lo > 1e-9 else float("inf"),
+        "imbalance_pct": (hi / mean - 1.0) * 100.0 if mean > 1e-9 else 0.0,
+    }
+
+
+# ============================================================
+# POWER BUDGET
+# ============================================================
+
+def build_power_budget(total_in_W: float,
+                       motor_shaft_W: float,
+                       motor_copper_W: float,
+                       battery_i2r_W: float,
+                       esc_loss_W: float,
+                       peripheral_W: float = 0.0,
+                       peripheral_V: Optional[float] = None,
+                       peripheral_A: Optional[float] = None,
+                       rails: Optional[List[dict]] = None) -> List[dict]:
+    """
+    Break the pack's electrical output into where every watt ends up.
+
+    The weight budget answers "what is this aircraft made of"; this answers
+    "what is the battery actually paying for". Both are needed, because a
+    design can be light and still waste a third of its energy as heat.
+
+    Every row is either DELIVERED (it did useful work) or LOST (it became
+    heat), and the two categories must sum to the total — which is what makes
+    the table checkable rather than merely informative.
+
+    The total is taken at the CELLS, not the pack terminals: terminal power is
+    already measured at the sagged voltage, so counting the pack's own I2R
+    loss inside it would charge that loss twice.
+
+    `rails` is a list of avionics rails, each a dict with `name`, `voltage_V`,
+    `current_A` and `efficiency`. A rail's input power splits into the power
+    delivered at rail voltage and the conversion loss in its regulator.
+
+    Rows carry a voltage and a current. Anything drawing straight from the
+    pack reports "Battery" for voltage, because its voltage is whatever the
+    pack happens to be at that moment rather than a designed value.
+
+    Returns a list of dicts: name, watts, pct, kind ("delivered"/"lost"/
+    "subtotal"/"total"), voltage, current.
+    """
+    # The pack's terminal power is measured at the LOADED voltage, so the
+    # cells' internal I2R loss is already expressed as voltage sag rather
+    # than as extra current. Listing it as a loss inside the terminal power
+    # therefore double-counts it — which showed up as a negative
+    # "Unaccounted" row exactly equal to the I2R.
+    #
+    # The budget is therefore taken from the CELLS, not the terminals:
+    #     P_cells = P_terminals + I2R
+    # so every joule the chemistry gives up is accounted for exactly once.
+    total = max(float(total_in_W) + float(battery_i2r_W), 1e-9)
+    rows: List[dict] = []
+
+    def add(name, watts, kind, voltage="Battery", current=None):
+        rows.append({
+            "name": name,
+            "watts": float(watts),
+            "pct": float(watts) / total * 100.0,
+            "kind": kind,
+            "voltage": voltage,
+            "current": current,
+        })
+
+    # ---- delivered ----------------------------------------------------
+    add("Motor shaft power (to the air)", motor_shaft_W, "delivered")
+
+    rail_list = rails or []
+    for rail in rail_list:
+        name = str(rail.get("name", "rail"))
+        volts = float(rail.get("voltage_V", 0.0) or 0.0)
+        amps = float(rail.get("current_A", 0.0) or 0.0)
+        eff = min(max(float(rail.get("efficiency", 0.9) or 0.9), 0.05), 1.0)
+        delivered = volts * amps
+        add(f"Avionics rail {name} delivered", delivered, "delivered",
+            f"{volts:.1f} V", amps)
+        add(f"Avionics rail {name} regulator loss",
+            delivered * (1.0 / eff - 1.0), "lost", f"{volts:.1f} V", amps)
+
+    # Regulated rails and direct-from-pack peripherals are independent loads
+    # and both appear. An earlier version hid this row whenever rails existed,
+    # to suppress a negative "Unaccounted" — but that residual was really the
+    # model ignoring peripheral current, not the table over-reporting it.
+    if peripheral_W > 0:
+        add("Peripheral devices (direct from pack)", peripheral_W, "delivered",
+            "Battery" if peripheral_V is None else f"{peripheral_V:.1f} V",
+            peripheral_A)
+
+    # ---- lost ---------------------------------------------------------
+    add("Motor copper loss (I2Rm)", motor_copper_W, "lost")
+    add("ESC losses", esc_loss_W, "lost")
+    add("Battery internal loss (I2R)", battery_i2r_W, "lost")
+
+    delivered_W = sum(r["watts"] for r in rows if r["kind"] == "delivered")
+    lost_W = sum(r["watts"] for r in rows if r["kind"] == "lost")
+
+    # Anything the itemised rows do not account for. Showing it keeps the
+    # table honest: a large residual means the breakdown is incomplete, and
+    # hiding it would make the percentages quietly wrong.
+    residual = total - delivered_W - lost_W
+    if abs(residual) > max(total * 0.005, 0.5):
+        add("Unaccounted", residual, "lost")
+        lost_W += residual
+
+    rows.append({"name": "Total delivered", "watts": delivered_W,
+                 "pct": delivered_W / total * 100.0, "kind": "subtotal",
+                 "voltage": "", "current": None})
+    rows.append({"name": "Total losses", "watts": lost_W,
+                 "pct": lost_W / total * 100.0, "kind": "subtotal",
+                 "voltage": "", "current": None})
+    rows.append({"name": "TOTAL from cells", "watts": total,
+                 "pct": 100.0, "kind": "total",
+                 "voltage": "Battery", "current": None})
+    return rows
 
 
 # ============================================================

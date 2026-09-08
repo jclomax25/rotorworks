@@ -58,7 +58,7 @@ except ImportError as _exc:      # pragma: no cover - install/deploy problem
         f"folder as this script.\nOriginal error: {_exc}"
     )
 
-SIM_VERSION = "0.1.0"
+SIM_VERSION = "0.2.0"
 SIM_BUILD_NOTE = "VTOL simulator - lift+cruise configuration"
 
 G0 = core.G0
@@ -1265,12 +1265,65 @@ def launch_gui(args=None) -> None:
                      f"(reserve {totals['reserve_Wh']:.1f} Wh)")
         log("\n".join(lines))
 
+    # ---- configuration save / load -----------------------------------
+    # The other two simulators have this; without it a VTOL design could not
+    # be kept, shared, or used as a worked example.
+    def save_config():
+        path = filedialog.asksaveasfilename(
+            title="Save VTOL configuration", defaultextension=".json",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if not path:
+            return
+        payload = {
+            "schema": "vtol_power_sim_v1",
+            "config_type": v_config_type.get(),
+            "vars": {key: var.get() for key, var in fields.items()},
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+        except Exception as exc:
+            messagebox.showerror("Save failed", str(exc))
+            return
+        log(f"Configuration saved to {os.path.basename(path)}\n")
+
+    def load_config():
+        path = filedialog.askopenfilename(
+            title="Load VTOL configuration",
+            filetypes=[("JSON", "*.json"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception as exc:
+            messagebox.showerror("Load failed", str(exc))
+            return
+        if payload.get("schema") not in (None, "vtol_power_sim_v1"):
+            messagebox.showerror(
+                "Wrong file",
+                f"That looks like a '{payload.get('schema')}' file, not a VTOL "
+                "configuration. Loading it would silently mis-assign fields.")
+            return
+        for key, value in (payload.get("vars") or {}).items():
+            if key in fields:
+                fields[key].set(str(value))
+        chosen = payload.get("config_type")
+        if chosen in CONFIG_TYPES:
+            v_config_type.set(chosen)
+        log(f"Loaded {os.path.basename(path)}\n"
+            f"Press Run Single-Point to evaluate it.\n")
+
     buttons = ttk.Frame(root, padding=6)
     buttons.grid(row=1, column=0, columnspan=2, sticky="ew")
     ttk.Button(buttons, text="▶  Run Single-Point",
                command=run_single_point).pack(side="left")
     ttk.Button(buttons, text="📋  Run Mission (JSON)",
                command=run_mission).pack(side="left", padx=(6, 0))
+    ttk.Button(buttons, text="💾  Save Config",
+               command=save_config).pack(side="right")
+    ttk.Button(buttons, text="📂  Load Config",
+               command=load_config).pack(side="right", padx=(0, 6))
 
     log(f"VTOL Power Simulator  v{SIM_VERSION}\n"
         f"{'=' * 52}\n"

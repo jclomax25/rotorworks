@@ -96,7 +96,7 @@ ramp_speed = core.ramp_speed
 
 # Build identifier. Shown in the title bar, the Output pane and Help > About
 # so you can always tell which copy of the script you are running.
-SIM_VERSION = "2.16.0"
+SIM_VERSION = "2.40.0"
 SIM_BUILD_NOTE = "Table-path inflow double-count fixed; table range warnings"
 import matplotlib
 import matplotlib.pyplot as plt
@@ -784,6 +784,8 @@ class FixedWingConfig:
                  cruise_speed_mps:  float,
                  payload_mass_g:   float = 0.0,
                  periph_current_A:  float   = 0.0,
+                 avionics_mass_g: float = 0.0,
+                 airframe_mass_g: float = 0.0,
                  esc:             Optional[ESCConfig]      = None,
                  avionics:        Optional[AvionicsConfig] = None,
                  air_density:     float     = RHO0,
@@ -798,6 +800,10 @@ class FixedWingConfig:
         self.aircraft_weight_g = self.base_aircraft_weight_g + self.payload_mass_g
         self.cruise_speed_mps  = float(cruise_speed_mps)
         self.periph_current_A  = float(periph_current_A)
+        # Mass of the avionics the rails power. Optional; 0 means it is
+        # already accounted for inside the airframe weight.
+        self.avionics_mass_g = float(avionics_mass_g or 0.0)
+        self.airframe_mass_g = float(airframe_mass_g or 0.0)
         self.esc               = esc
         self.avionics          = avionics
         self.air_density       = float(air_density)
@@ -1921,9 +1927,13 @@ def compute_metrics(config: FixedWingConfig,
     P_elec  = motor_shaft_power_from_thrust(config, T_req, V)  # motor electrical [W]
 
     # Avionics / peripheral power
-    P_avionics = avionics_input_power_W(config.avionics)
-    if P_avionics <= 0.0:
-        P_avionics = batt.vnom_pack * max(config.periph_current_A, 0.0)
+    # Regulated rails and direct-from-pack peripherals are independent loads
+    # and ADD. Treating peripheral current as a fallback for "no rails
+    # defined" meant a device wired straight to the pack drew nothing at all
+    # as soon as a single BEC rail existed.
+    P_rails = avionics_input_power_W(config.avionics)
+    P_periph = batt.vnom_pack * max(config.periph_current_A, 0.0)
+    P_avionics = P_rails + P_periph
 
     # ESC losses
     esc_loss, esc_note = esc_losses_W(config, batt.vmax_pack, P_elec)
@@ -1998,7 +2008,20 @@ def compute_metrics(config: FixedWingConfig,
         groundspeed_mps    = gs_track,
         wind_head_mps      = float(wind_head_mps),
         wind_cross_mps     = float(wind_cross_mps),
-        stall_speed_mps    = V_stall,
+        # In a banked turn the wing carries n times the weight, so the
+        # stall speed rises as sqrt(n). Reporting the 1-g figure while
+        # banked understates it — at 45 deg that is 9.14 against a real
+        # 10.87 m/s, and the margin the user reads is not the one they
+        # have. The mission loop already used the corrected value
+        # internally; only the reported metric was wrong.
+        stall_speed_mps    = V_stall * math.sqrt(max(bank_load_factor(bank_deg), 1.0)),
+
+        # Environment actually used for this evaluation, so the Metrics tab
+        # can report its inputs and not only the derived air density.
+        ambient_temp_C     = float(ambient_temp_C),
+        wind_mps           = float(math.hypot(wind_head_mps, wind_cross_mps)),
+        altitude_m         = float(getattr(config, "reference_altitude_m", 0.0) or 0.0),
+
         stall_speed_turn_mps = V_stall_turn,
         # Aerodynamics
         CL                 = CL,
@@ -2136,6 +2159,15 @@ def make_performance_figure(config: FixedWingConfig,
       6. Induced vs Parasitic Drag vs Speed
     """
     V_stall = stall_speed(config)
+    # Cruise speed marker, matching the multicopter figure. Without it the
+    # curves show where the aircraft COULD fly but not where it is being
+    # asked to, so a design sitting on the wrong side of a knee looks fine.
+    V_cruise = float(getattr(config, "cruise_speed_mps", 0.0) or 0.0)
+
+    def _mark_cruise(axis):
+        if V_cruise > 0:
+            axis.axvline(V_cruise, color="gray", linestyle="-.",
+                         linewidth=1.0, alpha=0.7)
     v_lo    = max(V_stall, 1.0)
     v_hi    = max_speed
     speeds  = [v_lo + (v_hi - v_lo) * i / 300 for i in range(301)]
@@ -2180,6 +2212,7 @@ def make_performance_figure(config: FixedWingConfig,
     ax.set_xlabel("Airspeed (m/s)"); ax.set_ylabel("Time (min)"); ax2.set_ylabel("Range (km)")
     ax.set_title("Flight Time & Range vs Airspeed")
     ax.axvline(V_stall, color="red", linestyle=":", linewidth=1, label="V_stall")
+    _mark_cruise(ax)
     ax.legend(handles=[l1, l2], loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.4)
 
@@ -2191,15 +2224,27 @@ def make_performance_figure(config: FixedWingConfig,
     ax.set_title("Thrust Required vs Available")
     ax.legend(fontsize=8); ax.grid(True, alpha=0.4)
     ax.axvline(V_stall, color="red", linestyle=":", linewidth=1)
+    _mark_cruise(ax)
+
+    # Combined motor+propeller efficiency, for the shaft-power trace.
+    cfg_eta = max(float(config.airframe.prop_efficiency), 0.05)
 
     # ---- 3. Power ----
     ax = axes[0, 2]
-    ax.plot(speeds, [p/1000 for p in powers_req],   label="Power Required (kW)", color="crimson")
-    ax.plot(speeds, [p/1000 for p in powers_avail], label="Power Available (kW)", color="green", linestyle="--")
+    # Required power here is ELECTRICAL, drawn from the pack. Showing the
+    # mechanical (shaft) power alongside it makes the drivetrain loss visible
+    # as the gap between the two curves.
+    ax.plot(speeds, [p / 1000 for p in powers_req],
+            label="Electrical required (from pack)", color="crimson")
+    ax.plot(speeds, [p / 1000 * cfg_eta for p in powers_req],
+            label="Mechanical (to the air)", color="#1565C0", linestyle="--")
+    ax.plot(speeds, [p / 1000 for p in powers_avail],
+            label="Power available", color="green", linestyle=":")
     ax.set_xlabel("Airspeed (m/s)"); ax.set_ylabel("Power (kW)")
-    ax.set_title("Power Required vs Available")
+    ax.set_title("Power vs Airspeed — mechanical, electrical, available")
     ax.legend(fontsize=8); ax.grid(True, alpha=0.4)
     ax.axvline(V_stall, color="red", linestyle=":", linewidth=1)
+    _mark_cruise(ax)
 
     # ---- 4. Rate of Climb ----
     ax = axes[1, 0]
@@ -2208,6 +2253,7 @@ def make_performance_figure(config: FixedWingConfig,
     ax.set_title("Rate of Climb vs Airspeed")
     ax.axhline(0, color="gray", linewidth=0.8); ax.grid(True, alpha=0.4)
     ax.axvline(V_stall, color="red", linestyle=":", linewidth=1)
+    _mark_cruise(ax)
     ax.legend(fontsize=8)
 
     # ---- 5. Drag Polar ----
@@ -2227,6 +2273,7 @@ def make_performance_figure(config: FixedWingConfig,
     ax.set_xlabel("Airspeed (m/s)"); ax.set_ylabel("Drag (N)")
     ax.set_title("Induced vs Parasitic Drag")
     ax.axvline(V_stall, color="red", linestyle=":", linewidth=1)
+    _mark_cruise(ax)
     ax.legend(fontsize=8)
     ax.grid(True, alpha=0.4)
 
@@ -2574,7 +2621,16 @@ def simulate_fw_mission(
     motor_temp_C = ambient_c
     esc_temp_C = ambient_c
     battery_temp_C = ambient_c
+    _last_instant = None
     prev_alt_m = float(mission.phases[0].altitude) if mission.phases else 0.0
+    # Height actually flown, integrated step by step. Recording the phase's
+    # TARGET made a climb plot as an instant jump — the same fault the
+    # multicopter had, and with the same consequence: the trace disagreed
+    # with the climb energy, which was always integrated correctly.
+    alt_now_m = float(mission.phases[0].altitude) if mission.phases else 0.0
+    # A takeoff starts on the ground, not at the first phase's target.
+    if mission.phases and (mission.phases[0].climb_rate_mps or 0) > 0:
+        alt_now_m = 0.0
 
     series: dict = {
         "t_s":              [],
@@ -2730,6 +2786,7 @@ def simulate_fw_mission(
         m["battery_loss_W"] = battery_loss_W
         m["reserve_margin_Wh"] = remaining_Wh - reserve_target_Wh
         worst = _merge_worst(worst, m)
+        _last_instant = m
 
         total_P   = float(m.get("total_power_W", 0.0))
         pack_I    = float(m.get("pack_current_A", 0.0))
@@ -2746,7 +2803,8 @@ def simulate_fw_mission(
             results.append((phase.name, 0.0, 0.0, f"Below stall speed ({stall_speed(cfg):.1f} m/s)"))
             break
 
-        _append(phase.name, phase.altitude, m, t_s, dist_km, remaining_Wh, reserve_breached)
+        # Phase START: the aircraft is still at the previous phase's height.
+        _append(phase.name, alt_now_m, m, t_s, dist_km, remaining_Wh, reserve_breached)
 
         # ---- Transient lead-in: ramp airspeed to the commanded value -------
         # A fixed-wing cannot change speed instantly. Accelerating costs extra
@@ -2808,7 +2866,7 @@ def simulate_fw_mission(
                 t_s += actual_s
                 dist_km += ramp_km * (actual_s / max(ramp_s, 1e-9))
                 remaining_Wh = 0.0
-                _append(phase.name, phase.altitude, m, t_s, dist_km, remaining_Wh, True)
+                _append(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_Wh, True)
                 results.append((phase.name, actual_s / 60.0,
                                 dist_km, "Battery depleted (during acceleration)"))
                 break
@@ -2836,7 +2894,7 @@ def simulate_fw_mission(
                 motor_temp_C = thermal_step(motor_temp_C, ambient_c, m.get("motor_copper_loss_W", 0.0), 0.35, 240.0, actual_s)
                 esc_temp_C = thermal_step(esc_temp_C, ambient_c, m.get("esc_loss_W", 0.0), 0.70, 180.0, actual_s)
                 battery_temp_C = thermal_step(battery_temp_C, ambient_c, m.get("battery_loss_W", 0.0), 0.25, 500.0, actual_s)
-                _append(phase.name, phase.altitude, m, t_s, dist_km, remaining_Wh, True)
+                _append(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_Wh, True)
                 results.append((phase.name, actual_s/60.0, actual_km, "Battery depleted"))
                 break
             remaining_Wh -= energy_Wh
@@ -2847,7 +2905,7 @@ def simulate_fw_mission(
             motor_temp_C = thermal_step(motor_temp_C, ambient_c, m.get("motor_copper_loss_W", 0.0), 0.35, 240.0, dur_s)
             esc_temp_C = thermal_step(esc_temp_C, ambient_c, m.get("esc_loss_W", 0.0), 0.70, 180.0, dur_s)
             battery_temp_C = thermal_step(battery_temp_C, ambient_c, m.get("battery_loss_W", 0.0), 0.25, 500.0, dur_s)
-            _append(phase.name, phase.altitude, m, t_s, dist_km, remaining_Wh, reserve_breached)
+            _append(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_Wh, reserve_breached)
             results.append((phase.name, (dur_s + ramp_s)/60.0,
                             V_gs*dur_s/1000.0 + ramp_km, phase_status))
 
@@ -2863,7 +2921,7 @@ def simulate_fw_mission(
                 motor_temp_C = thermal_step(motor_temp_C, ambient_c, m.get("motor_copper_loss_W", 0.0), 0.35, 240.0, actual_s)
                 esc_temp_C = thermal_step(esc_temp_C, ambient_c, m.get("esc_loss_W", 0.0), 0.70, 180.0, actual_s)
                 battery_temp_C = thermal_step(battery_temp_C, ambient_c, m.get("battery_loss_W", 0.0), 0.25, 500.0, actual_s)
-                _append(phase.name, phase.altitude, m, t_s, dist_km, remaining_Wh, True)
+                _append(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_Wh, True)
                 results.append((phase.name, actual_s/60.0, actual_km, "Battery depleted"))
                 break
             remaining_Wh -= energy_Wh
@@ -2874,7 +2932,7 @@ def simulate_fw_mission(
             motor_temp_C = thermal_step(motor_temp_C, ambient_c, m.get("motor_copper_loss_W", 0.0), 0.35, 240.0, time_s)
             esc_temp_C = thermal_step(esc_temp_C, ambient_c, m.get("esc_loss_W", 0.0), 0.70, 180.0, time_s)
             battery_temp_C = thermal_step(battery_temp_C, ambient_c, m.get("battery_loss_W", 0.0), 0.25, 500.0, time_s)
-            _append(phase.name, phase.altitude, m, t_s, dist_km, remaining_Wh, reserve_breached)
+            _append(phase.name, float(phase.altitude), m, t_s, dist_km, remaining_Wh, reserve_breached)
             results.append((phase.name, (time_s + ramp_s)/60.0,
                             dist_m/1000.0 + ramp_km, phase_status))
 
@@ -2882,6 +2940,7 @@ def simulate_fw_mission(
             results.append((phase.name, 0.0, 0.0, "Invalid: no duration or distance"))
             break
         prev_alt_m = float(phase.altitude)
+        alt_now_m = float(phase.altitude)
 
     if worst:
         worst["reserve_target_Wh"] = reserve_target_Wh
@@ -2893,6 +2952,13 @@ def simulate_fw_mission(
         worst["battery_temp_est_C"] = battery_temp_C
         mt = max(motor_temp_C, esc_temp_C, battery_temp_C)
         worst["thermal_status"] = "OK" if mt < 65.0 else ("WARN" if mt < 85.0 else "HOT")
+    # The worst-case dict answers "did anything breach"; the last instant
+    # answers "what was it doing at the end". Status shows one, Metrics
+    # the other — filling Metrics from the worst case would present an
+    # operating point the aircraft never actually flew.
+    if worst is not None:
+        worst["_last_instant"] = dict(_last_instant or {})
+
     return results, worst, series
 
 
@@ -2936,6 +3002,11 @@ def _extract_weight_budget(cfg) -> list:
         w = float(getattr(prop, "weight_g", 0.0) or 0.0)
         rows.append(("Propeller", w, num_motors, w * num_motors)); accounted += w * num_motors
     if payload_g > 0:
+        # #8 avionics is a real mass item and was previously invisible: it
+        # fell into the airframe residual, so a user could not see it.
+        _av_g = float(getattr(cfg, "avionics_mass_g", 0.0) or 0.0)
+        if _av_g > 0:
+            rows.append(("Avionics", _av_g, 1, _av_g)); accounted += _av_g
         rows.append(("Payload", payload_g, 1, payload_g)); accounted += payload_g
     airframe_g = max(0.0, total_g - accounted)
     rows.append(("Airframe / Structure", airframe_g, 1, airframe_g))
@@ -3020,6 +3091,27 @@ def _generate_pdf_report(path: str, report_title: str,
                             topMargin=2.0*cm,  bottomMargin=2.0*cm)
     styles = getSampleStyleSheet()
     story  = []
+
+    # Long metric names, notes and file paths were running past the column
+    # edge and over the next column. Wrapping each cell in a Paragraph makes
+    # reportlab flow the text onto more lines instead of overflowing.
+    _cellStyle = ParagraphStyle("cell", fontSize=7.5, leading=9.5,
+                                wordWrap="CJK")
+    _cellBold = ParagraphStyle("cellB", parent=_cellStyle,
+                               fontName="Helvetica-Bold")
+
+    def _wrap(value, bold=False):
+        """Cell content that wraps. Short values are left as plain strings."""
+        text = "" if value is None else str(value)
+        if len(text) <= 28 and "\n" not in text:
+            return text
+        safe = (text.replace("&", "&amp;").replace("<", "&lt;")
+                    .replace(">", "&gt;").replace("\n", "<br/>"))
+        return Paragraph(safe, _cellBold if bold else _cellStyle)
+
+    def _wrap_rows(rows, bold_first=False):
+        return [[_wrap(c, bold_first and i == 0) for i, c in enumerate(r)]
+                for r in rows]
     NAVY  = colors.HexColor("#1F3864")
     TEAL  = colors.HexColor("#2E75B6")
     LGREY = colors.HexColor("#F2F2F2")
@@ -3061,7 +3153,7 @@ def _generate_pdf_report(path: str, report_title: str,
         wb_data.append(["TOTAL", "", "", f"{last[3]:.1f}", "100.0"])
         ts = _ts()
         ts.add("FONTNAME",(0,len(wb_data)-1),(-1,len(wb_data)-1),"Helvetica-Bold")
-        t = Table(wb_data, colWidths=[usable_w*0.38, usable_w*0.15,
+        t = Table(_wrap_rows(wb_data), colWidths=[usable_w*0.38, usable_w*0.15,
                                        usable_w*0.1, usable_w*0.17, usable_w*0.1])
         t.setStyle(ts); story.append(t)
     story.append(PageBreak())
@@ -3073,7 +3165,7 @@ def _generate_pdf_report(path: str, report_title: str,
         rows_data = [["Parameter","Value","Parameter","Value"]]
         for (la,va),(lb,vb) in zip(left,right): rows_data.append([la,va,lb,vb])
         col_w = usable_w/4
-        t = Table(rows_data, colWidths=[col_w*1.4,col_w*0.6]*2)
+        t = Table(_wrap_rows(rows_data), colWidths=[col_w*1.4,col_w*0.6]*2)
         t.setStyle(_ts()); story.append(t)
     story.append(PageBreak())
     if metrics_rows:
@@ -3084,7 +3176,7 @@ def _generate_pdf_report(path: str, report_title: str,
         rows_data = [["Metric","Value","Metric","Value"]]
         for (la,va),(lb,vb) in zip(left,right): rows_data.append([la,va,lb,vb])
         col_w = usable_w/4
-        t = Table(rows_data, colWidths=[col_w*1.4,col_w*0.6]*2)
+        t = Table(_wrap_rows(rows_data), colWidths=[col_w*1.4,col_w*0.6]*2)
         t.setStyle(_ts()); story.append(t)
     story.append(PageBreak())
     if status_sections:
@@ -3096,11 +3188,16 @@ def _generate_pdf_report(path: str, report_title: str,
             ts = _ts()
             for ri,(metric,val,lim,note,tag) in enumerate(sec_rows, 1):
                 tdata.append([metric,val,lim,note])
-                bg = {"ok":colors.HexColor("#D9F2D9"),"warn":colors.HexColor("#FFF2CC"),
+                bg = {"ok":colors.HexColor("#D9F2D9"),
+                      "edge":colors.HexColor("#E8F4D9"),
+                      "warn":colors.HexColor("#FFF2CC"),
                       "bad":colors.HexColor("#F8D7DA")}.get(tag, colors.white)
                 ts.add("BACKGROUND",(0,ri),(-1,ri),bg)
             cw = [usable_w*0.28,usable_w*0.20,usable_w*0.20,usable_w*0.32]
-            t = Table(tdata, colWidths=cw); t.setStyle(ts); story.append(t)
+            # Status notes are the longest text in the report and were
+            # the one table still unwrapped, so they ran off the page.
+            t = Table(_wrap_rows(tdata), colWidths=cw)
+            t.setStyle(ts); story.append(t)
             story.append(Spacer(1, 4))
     story.append(PageBreak())
     if figures:
@@ -3129,7 +3226,7 @@ def _generate_pdf_report(path: str, report_title: str,
             continue
         story.append(PageBreak())
         story.append(Paragraph(_title, sH1))
-        _data = [list(_headers)] + [list(r) for r in _rows]
+        _data = _wrap_rows([list(_headers)] + [list(r) for r in _rows])
         _tbl = Table(_data, hAlign="LEFT")
         _tbl.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), NAVY),
@@ -3154,16 +3251,63 @@ def _generate_pdf_report(path: str, report_title: str,
 # ------------------------------------------------------------------
 FW_FIELD_HELP = {
     # ---- Airframe ----
-    "weight": ("All-up weight WITHOUT payload: airframe, wing, motor, ESC, "
-               "servos, battery, receiver — everything you always fly with.",
-               "Weigh the finished aircraft. 1.5 m foam trainer ~1200 g, "
-               "2 m surveyor ~3000 g."),
+    "weight": ("All-up weight WITHOUT payload — the whole aircraft "
+               "ready to fly, minus whatever it is carrying.\n\n"
+               "In 'derive airframe' mode this is what you enter, and "
+               "the AIRFRAME mass is worked out from it by subtracting "
+               "the battery, motor, ESC, propeller and avionics. That "
+               "residual is what the Weight Budget shows as "
+               "'Airframe / Structure'.",
+               "Weigh the aircraft with its battery fitted and no payload."),
+    "mass_mode": ("How the masses are entered.\n\n"
+                  "'derive airframe': you give the all-up weight without "
+                  "payload and the airframe mass is the remainder once "
+                  "the components are subtracted. Best when you have "
+                  "weighed the real aircraft.\n\n"
+                  "'enter airframe': you give the bare airframe mass and "
+                  "the all-up weight is built up by adding components. "
+                  "Best when designing from a parts list.",
+                  "derive airframe"),
+    "airframe_mass": ("Bare structure only: frame, booms, wing, skin, "
+                      "fasteners and wiring. No battery, motors, ESCs, "
+                      "propellers, avionics or payload.\n\n"
+                      "Used only in 'enter airframe' mode; in "
+                      "'derive airframe' mode it is calculated for you.",
+                      "Often 30-45% of the all-up weight."),
     "payload_mass_g": ("Extra mass for this flight only — camera, sensor, cargo.",
                        "0 if flying clean."),
     "num_motors": ("Number of propulsion motors.",
                    "1 for a normal tractor/pusher, 2 for a twin."),
     "cruise_speed": ("The airspeed the single-point run is evaluated at.",
                      "Must be above stall. Typical trainer 15-20 m/s."),
+    "avionics_mass": ("Mass of the flight controller, radios, GPS, "
+                      "regulators and payload electronics — everything the "
+                      "Avionics rails power. Counted in the weight budget.",
+                      "Often 100-400 g on a survey aircraft. Leave 0 if it "
+                      "is already inside the airframe weight."),
+    "motor_max_time_s": ("How long the motor may be held at its maximum "
+                         "current or power. Leave blank if unknown — the check "
+                         "then reports duration as unverified rather than "
+                         "assuming it is fine.", "Often 10-60 s."),
+    "motor_temp_limit": ("Winding temperature the motor must stay below.",
+                         "100 °C is a common default."),
+    "motor_v_unit": ("Whether the motor's voltage rating is in volts or as a "
+                     "battery S-count.", "S is usual for hobby motors."),
+    "motor_s_min": ("Lowest battery the motor is rated for.", "e.g. 4"),
+    "motor_s_max": ("Highest battery the motor is rated for. Exceeding it "
+                    "over-speeds the rotor.", "e.g. 6"),
+    "esc_max_time_s": ("How long the ESC may be held at maximum current.",
+                       "Often 10 s."),
+    "esc_temp_limit": ("Temperature the ESC must stay below.", "90 °C typical."),
+    "esc_v_unit": ("Whether the ESC rating is in volts or an S-count.", "S"),
+    "esc_s_min": ("Lowest battery the ESC supports.", "e.g. 3"),
+    "esc_s_max": ("Highest battery the ESC supports. Exceeding it usually "
+                  "destroys the ESC immediately.", "e.g. 6"),
+    "batt_max_time_s": ("How long the pack may be held at its maximum "
+                        "discharge rate.", "Often 10 s for a burst rating."),
+    "batt_temp_limit": ("Cell temperature the pack must stay below. Cells age "
+                        "far faster hot, so this is a longevity limit too.",
+                        "55 °C is common for LiPo."),
     "periph_cur": ("Steady current drawn DIRECTLY from the main pack by "
                    "anything that is not a motor and not behind a regulator. "
                    "Use this for devices wired straight to pack voltage; use "
@@ -3328,8 +3472,30 @@ FW_FIELD_HELP = {
                  "0 = straight and level. 30 deg is a standard turn."),
     "climb_rate": ("Commanded climb rate in m/s. Costs extra power.", "0 for level flight."),
     "descent_rate": ("Commanded descent rate in m/s.", "0 for level flight."),
-    "reserve_percent": ("Fraction of usable energy held back as a landing reserve.",
-                        "20% is a common minimum."),
+    "field_takeoff_m": ("Ground run available at your field. The take-off "
+                        "check compares the computed roll against this.\n\n"
+                        "Leave blank and the roll is reported without a "
+                        "pass/fail, because there is no universal number for "
+                        "how much runway is enough.",
+                        "A 100 m strip is generous for a hand-launch; a club "
+                        "field might be 200-400 m."),
+    "field_landing_m": ("Landing distance available, measured the same way as "
+                        "the reported figure: over a 15 m obstacle.\n\n"
+                        "Leave blank to report the distance without judging it.",
+                        "Include the approach, not just the ground roll."),
+    "min_climb_mps": ("Climb rate you need the aircraft to achieve. The "
+                      "thrust-margin check is judged against this rather than "
+                      "against a fixed percentage, since what matters is "
+                      "whether the excess thrust delivers the climb you want.",
+                      "2-3 m/s is comfortable for a survey aircraft."),
+    "reserve_percent": ("Energy held back at the end of the flight, as a "
+                        "percentage of the USABLE energy, not of the whole "
+                        "pack. A 100 Wh pack at 80% usable gives 80 Wh, so "
+                        "20% reserve holds back 16 Wh of that. Size it to "
+                        "cover landing, return-to-home, and any diversion "
+                        "you want to be able to make.",
+                        "20% is a common minimum. Raise it for long transits "
+                        "or when a diversion may be needed."),
     "rth_reserve_Wh": ("Energy reserved for return-to-home, in watt-hours.",
                        "Estimate: cruise power x return time."),
     "diversion_reserve_Wh": ("Extra energy for diverting to another field.",
@@ -3360,6 +3526,8 @@ FW_FIELD_HELP = {
 # honest endurance figure, and omitting it is a common beginner error.
 # ------------------------------------------------------------------
 FW_SIMPLE_FIELDS = {
+    "mass_mode", "airframe_mass",
+    "avionics_mass", "max_v_plot",
     # Airframe
     "weight", "payload_mass_g", "num_motors", "cruise_speed",
     "wing_span", "wing_area", "CD0", "CL_max", "oswald",
@@ -3581,10 +3749,7 @@ def launch_gui():
             "About",
             f"Fixed-Wing UAV Power Simulator\n"
             f"Version {SIM_VERSION}\n"
-            f"{SIM_BUILD_NOTE}\n\n"
-            "If you do not see the 'Input detail: Simple / Advanced' selector\n"
-            "above the input tabs, or the blue ? help markers beside each\n"
-            "field, you are running an older copy of this script."),
+            f"{SIM_BUILD_NOTE}"),
     )
 
     # -- Window Scale sub-menu --
@@ -3790,6 +3955,7 @@ def launch_gui():
     tab_avionics = make_scrollable_tab(input_nb, "Avionics")
     tab_prop     = make_scrollable_tab(input_nb, "Propeller")
     tab_env      = make_scrollable_tab(input_nb, "Mission/Environment")
+    tab_plotcfg  = make_scrollable_tab(input_nb, "Plot Settings")
     # --- Single notebook-level mouse-wheel binding ----------------------------
     # Replaces the old bind_all-per-tab pattern.  We find whichever canvas
     # belongs to the currently-selected tab and scroll only that one.
@@ -3815,6 +3981,9 @@ def launch_gui():
         return tk.StringVar(value=str(default))
 
     # Airframe
+    # Two ways to describe the same masses — see the mass_mode help.
+    v_mass_mode     = sv("derive airframe")
+    v_airframe_mass = sv("")
     v_weight        = sv(2500)     # base aircraft grams (excluding payload)
     v_payload_mass  = sv(0)        # payload grams
     v_num_motors    = sv(1)
@@ -3866,6 +4035,13 @@ def launch_gui():
     v_motor_r        = sv(0.06)
     v_motor_imax     = sv(40)
     v_motor_pmax     = sv(500)
+    # #10 how long the motor may sit at its maximum, so exceeding it is
+    # judged against duration rather than treated as instantly fatal.
+    v_motor_max_time_s = sv("")
+    v_motor_temp_limit = sv(100)     # #11 was hard-coded
+    v_motor_v_unit     = sv("S")     # #12/#33 volts or an S-count range
+    v_motor_s_min      = sv("")
+    v_motor_s_max      = sv("")
     v_motor_poles    = sv(14)
     v_motor_wt       = sv(120)
     v_motor_size     = sv("")
@@ -3874,6 +4050,13 @@ def launch_gui():
     v_esc_vrating  = sv("")
     v_esc_cont     = sv("")
     v_esc_max      = sv("")
+    v_esc_max_time_s = sv("")        # #13 time allowed at max current
+    v_esc_temp_limit = sv(90)        # #11
+    v_esc_v_unit     = sv("S")       # #12
+    v_esc_s_min      = sv("")
+    v_esc_s_max      = sv("")
+    v_batt_max_time_s = sv("")       # #29 time at max discharge
+    v_batt_temp_limit = sv(55)       # #11
     v_esc_idle     = sv("")
     v_esc_r        = sv("")
     v_esc_wt       = sv("")
@@ -3894,11 +4077,18 @@ def launch_gui():
 
     # Environment / Mission
     v_mission          = sv("")
+    # Site- and operator-dependent limits. There is no universal number
+    # for "how much runway is enough" — it depends on the field.
+    v_field_takeoff_m = sv("")
+    v_field_landing_m = sv("")
+    v_min_climb_mps   = sv("")
     v_altitude         = sv(0)
     v_cruise_altitude = sv("")
     v_prop_eff_model  = sv("curve")
-    v_temp             = sv("")
-    v_pressure         = sv("")
+    # #36 pre-filled with ISA sea level rather than blanks, so a new user
+    # starts from a defined atmosphere instead of an implicit one.
+    v_temp             = sv(15.0)
+    v_pressure         = sv(101325)
     v_wind             = sv(0)
     v_wind_dir         = sv(0)
     v_course_deg       = sv(0)
@@ -3910,6 +4100,7 @@ def launch_gui():
     v_div_reserve_Wh   = sv(0)
     v_max_v_plot       = sv(40)
     v_periph_cur       = sv(0.5)
+    v_avionics_mass    = sv(0)
     # Transient (acceleration) model — mirrors the multicopter simulator.
     v_transient_dt_s   = sv(0.5)
     v_max_accel_mps2   = sv(1.5)
@@ -3926,6 +4117,7 @@ def launch_gui():
 
     config_vars = dict(
         weight=v_weight, payload_mass_g=v_payload_mass, num_motors=v_num_motors,
+        mass_mode=v_mass_mode, airframe_mass=v_airframe_mass,
         wing_span=v_wing_span, wing_area=v_wing_area,
         CD0=v_CD0, CL_max=v_CL_max, oswald=v_oswald,
         mu_roll=v_mu_roll, mu_brake=v_mu_brake, CL_takeoff=v_CL_takeoff,
@@ -3960,12 +4152,21 @@ def launch_gui():
         prop_table=v_prop_table, prop_tconst=v_prop_tconst,
         prop_pconst=v_prop_pconst, prop_wt=v_prop_wt,
         altitude=v_altitude,
+        field_takeoff_m=v_field_takeoff_m, field_landing_m=v_field_landing_m,
+        min_climb_mps=v_min_climb_mps,
         cruise_altitude = v_cruise_altitude,
         prop_eff_model  = v_prop_eff_model, temp=v_temp, pressure=v_pressure,
         mission=v_mission, wind=v_wind, wind_dir=v_wind_dir, course_deg=v_course_deg,
         bank_deg=v_bank_deg, climb_rate=v_climb_rate, descent_rate=v_descent_rate,
         reserve_percent=v_reserve_percent, rth_reserve_Wh=v_rth_reserve_Wh,
         diversion_reserve_Wh=v_div_reserve_Wh, max_v_plot=v_max_v_plot, periph_cur=v_periph_cur,
+        avionics_mass=v_avionics_mass,
+        motor_max_time_s=v_motor_max_time_s, motor_temp_limit=v_motor_temp_limit,
+        motor_v_unit=v_motor_v_unit, motor_s_min=v_motor_s_min,
+        motor_s_max=v_motor_s_max,
+        esc_max_time_s=v_esc_max_time_s, esc_temp_limit=v_esc_temp_limit,
+        esc_v_unit=v_esc_v_unit, esc_s_min=v_esc_s_min, esc_s_max=v_esc_s_max,
+        batt_max_time_s=v_batt_max_time_s, batt_temp_limit=v_batt_temp_limit,
         transient_dt_s=v_transient_dt_s, max_accel_mps2=v_max_accel_mps2,
         max_decel_mps2=v_max_decel_mps2, decel_regen_eff=v_decel_regen_eff,
     )
@@ -4010,11 +4211,47 @@ def launch_gui():
 
     # ===== AIRFRAME TAB =====
     r = 0
-    add_row(tab_airframe, r, "Base Aircraft Weight (g)",    v_weight, key="weight");       r += 1
+    # Two ways to describe the same aircraft. Deriving the airframe
+    # mass is easier when you have weighed the whole thing; entering it
+    # directly is easier when you are building up a design from parts.
+    # A choice between two mutually exclusive ways of describing the
+    # same masses, so it is a dropdown — and whichever field is NOT
+    # driving the calculation is disabled, because leaving both
+    # editable invited entering two numbers that contradict.
+    ttk.Label(tab_airframe, text="Mass Entry Mode").grid(
+        row=r, column=0, sticky="w", padx=6, pady=3)
+    _mass_mode_box = ttk.Combobox(
+        tab_airframe, textvariable=v_mass_mode, state="readonly", width=18,
+        values=("derive airframe", "enter airframe"))
+    _mass_mode_box.grid(row=r, column=1, sticky="w", padx=6, pady=3)
+    r += 1
+    add_row(tab_airframe, r, "All Up Weight without Payload (g)", v_weight, key="weight"); r += 1
+    add_row(tab_airframe, r, "Airframe Mass (g)", v_airframe_mass, key="airframe_mass"); r += 1
+
+    def _apply_mass_mode(*_a):
+        """
+        Grey out whichever mass is being CALCULATED rather than entered.
+        In "derive airframe" the airframe mass is an output; in "enter
+        airframe" the all-up weight is. Showing both as editable made it
+        possible to enter two numbers that disagree, with no indication
+        which one the simulation actually used.
+        """
+        deriving = not str(v_mass_mode.get()).strip().lower().startswith("enter")
+        for key, editable in (("weight", deriving),
+                              ("airframe_mass", not deriving)):
+            for row in _field_rows:
+                if row.get("key") != key:
+                    continue
+                for widget in row.get("widgets", []):
+                    try:
+                        widget.configure(state=("normal" if editable else "disabled"))
+                    except Exception:
+                        pass
+
+    v_mass_mode.trace_add("write", _apply_mass_mode)
+    _apply_mass_mode()
     add_row(tab_airframe, r, "Payload Mass (g)",            v_payload_mass, key="payload_mass_g"); r += 1
     add_row(tab_airframe, r, "Number of Motors",            v_num_motors, key="num_motors");   r += 1
-    add_row(tab_airframe, r, "Cruise Speed (m/s)",          v_cruise_speed, key="cruise_speed"); r += 1
-    add_row(tab_airframe, r, "Peripheral Current (A)",      v_periph_cur, key="periph_cur");   r += 1
     ttk.Separator(tab_airframe, orient="horizontal").grid(
         row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
     ttk.Label(tab_airframe, text="── Wing Geometry ──",
@@ -4068,6 +4305,8 @@ def launch_gui():
     add_row(tab_batt, r, "Cont C-rate",              v_batt_c_cont, key="batt_c_cont");    r += 1
     add_row(tab_batt, r, "Max C-rate",               v_batt_c_max, key="batt_c_max");     r += 1
     add_row(tab_batt, r, "Usable Discharge (%)",     v_batt_dischg_pct, key="batt_dischg_pct"); r += 1
+    add_row(tab_batt, r, "Time at Max C-rate (s)",   v_batt_max_time_s, key="batt_max_time_s"); r += 1
+    add_row(tab_batt, r, "Temp Limit (°C)",          v_batt_temp_limit, key="batt_temp_limit"); r += 1
     add_row(tab_batt, r, "Rcell (mΩ)",               v_batt_r, key="batt_r");         r += 1
     add_row(tab_batt, r, "Series Cells/Packs",       v_batt_series, key="batt_series");    r += 1
     add_row(tab_batt, r, "Parallel Cells/Packs",     v_batt_parallel, key="batt_parallel");  r += 1
@@ -4075,7 +4314,29 @@ def launch_gui():
     cells_p_e = add_row(tab_batt, r, "Cells in parallel/pack",v_batt_cells_p, key="batt_cells_p"); r += 1
     add_row(tab_batt, r, "Chemistry",                v_batt_chem, key="batt_chem");      r += 1
     add_row(tab_batt, r, "SoC model",                v_batt_soc_model, key="batt_soc_model");    r += 1
-    add_row(tab_batt, r, "SoC curve CSV",            v_batt_soc_curve_csv, key="batt_soc_curve_csv"); r += 1
+    # #9 a measured discharge curve is a file, so offer a picker rather
+    # than expecting a path to be typed correctly.
+    _soc_lbl = ttk.Label(tab_batt, text="SoC curve CSV")
+    _soc_lbl.grid(row=r, column=0, sticky="w", padx=6, pady=3)
+    _soc_frame = ttk.Frame(tab_batt)
+    _soc_frame.grid(row=r, column=1, sticky="ew", padx=6, pady=3)
+    ttk.Entry(_soc_frame, textvariable=v_batt_soc_curve_csv, width=14).pack(side="left")
+
+    def _browse_soc_curve():
+        path = filedialog.askopenfilename(
+            title="SoC curve CSV  (columns: soc, ocv_cell, r_scale)",
+            filetypes=[("CSV", "*.csv"), ("All", "*.*")])
+        if path:
+            v_batt_soc_curve_csv.set(path)
+    ttk.Button(_soc_frame, text="Browse...", command=_browse_soc_curve).pack(side="left")
+    _soc_h = FW_FIELD_HELP["batt_soc_curve_csv"]
+    _soc_mark = ttk.Label(tab_batt, text=" ? ", foreground="#0B6BCB",
+                          cursor="question_arrow", font=("TkDefaultFont", 9, "bold"))
+    _soc_mark.grid(row=r, column=2, sticky="w", padx=(0, 6))
+    _Tooltip(_soc_mark, f"{_soc_h[0]}\n\nTypical: {_soc_h[1]}")
+    _register_row("batt_soc_curve_csv", [_soc_lbl, _soc_frame, _soc_mark],
+                  tab_batt, r)
+    r += 1
     add_row(tab_batt, r, "SoC breakpoints (0..1)",   v_batt_soc_bp, key="batt_soc_bp");       r += 1
     add_row(tab_batt, r, "OCV/cell breakpoints (V)", v_batt_ocv_cell_bp, key="batt_ocv_cell_bp");  r += 1
     add_row(tab_batt, r, "R-scale breakpoints",      v_batt_r_scale_bp, key="batt_r_scale_bp");   r += 1
@@ -4098,22 +4359,42 @@ def launch_gui():
     add_row(tab_motor, r, "Kv (RPM/V)",        v_motor_kv, key="motor_kv");    r += 1
     add_row(tab_motor, r, "Idle Current I0 (A)",v_motor_i0, key="motor_i0");   r += 1
     add_row(tab_motor, r, "Idle Voltage V0 (V)",v_motor_v0, key="motor_v0");   r += 1
-    add_row(tab_motor, r, "Rated Voltage (V)",  v_motor_rated_v, key="motor_rated_v"); r += 1
     add_row(tab_motor, r, "Resistance Rm (Ω)",  v_motor_r, key="motor_r");    r += 1
     add_row(tab_motor, r, "Max Current (A)",    v_motor_imax, key="motor_imax"); r += 1
     add_row(tab_motor, r, "Max Power (W)",      v_motor_pmax, key="motor_pmax"); r += 1
+    add_row(tab_motor, r, "Time at Max (s)",    v_motor_max_time_s, key="motor_max_time_s"); r += 1
+    add_row(tab_motor, r, "Temp Limit (°C)",    v_motor_temp_limit, key="motor_temp_limit"); r += 1
+    # #12 a choice, not free text.
+    ttk.Label(tab_motor, text="Voltage Rating Unit").grid(
+        row=r, column=0, sticky="w", padx=6, pady=3)
+    ttk.Combobox(tab_motor, textvariable=v_motor_v_unit, state="readonly",
+                 width=12, values=("S", "V")).grid(
+        row=r, column=1, sticky="w", padx=6, pady=3)
+    r += 1
+    add_row(tab_motor, r, "Rating Min (S or V)", v_motor_s_min, key="motor_s_min"); r += 1
+    add_row(tab_motor, r, "Rating Max (S or V)", v_motor_s_max, key="motor_s_max"); r += 1
     add_row(tab_motor, r, "Pole Count",         v_motor_poles, key="motor_poles"); r += 1
     add_row(tab_motor, r, "Weight (g)",         v_motor_wt, key="motor_wt");   r += 1
     add_row(tab_motor, r, "Size (e.g. 2826)",   v_motor_size, key="motor_size"); r += 1
 
     # ===== ESC TAB =====
     r = 0
-    add_row(tab_esc, r, "Voltage Rating (S cells)",    v_esc_vrating, key="esc_vrating"); r += 1
     add_row(tab_esc, r, "Continuous Current (A)", v_esc_cont, key="esc_cont");   r += 1
     add_row(tab_esc, r, "Max Current (A)",        v_esc_max, key="esc_max");    r += 1
     add_row(tab_esc, r, "Idle Current (A)",       v_esc_idle, key="esc_idle");   r += 1
     add_row(tab_esc, r, "Resistance (Ω)",         v_esc_r, key="esc_r");      r += 1
     add_row(tab_esc, r, "Weight (g)",             v_esc_wt, key="esc_wt");     r += 1
+    add_row(tab_esc, r, "Time at Max (s)",        v_esc_max_time_s, key="esc_max_time_s"); r += 1
+    add_row(tab_esc, r, "Temp Limit (°C)",        v_esc_temp_limit, key="esc_temp_limit"); r += 1
+    # #12 a choice, not free text.
+    ttk.Label(tab_esc, text="Voltage Rating Unit").grid(
+        row=r, column=0, sticky="w", padx=6, pady=3)
+    ttk.Combobox(tab_esc, textvariable=v_esc_v_unit, state="readonly",
+                 width=12, values=("S", "V")).grid(
+        row=r, column=1, sticky="w", padx=6, pady=3)
+    r += 1
+    add_row(tab_esc, r, "Rating Min (S or V)",    v_esc_s_min, key="esc_s_min"); r += 1
+    add_row(tab_esc, r, "Rating Max (S or V)",    v_esc_s_max, key="esc_s_max"); r += 1
 
     # ===== AVIONICS TAB =====
     # Each row = one BEC-regulated rail: voltage (V), current (A), efficiency (0–1].
@@ -4121,7 +4402,15 @@ def launch_gui():
     # so save/load and build_config can share one code path.
 
     tab_avionics.columnconfigure(0, weight=1)
-    tab_avionics.rowconfigure(1, weight=1)   # treeview row expands
+    tab_avionics.rowconfigure(3, weight=1)   # treeview row expands
+
+    # Non-motor loads belong together: peripheral current is drawn straight
+    # from the pack, the rails below are regulated. Splitting them across
+    # tabs made it easy to enter the same device twice.
+    _av_top = ttk.Frame(tab_avionics)
+    _av_top.grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=(6, 2))
+    add_row(_av_top, 0, "Peripheral Current (A)", v_periph_cur, key="periph_cur")
+    add_row(_av_top, 1, "Avionics Mass (g)", v_avionics_mass, key="avionics_mass")
 
     # ---- header label ----
     ttk.Label(
@@ -4129,11 +4418,11 @@ def launch_gui():
         text="BEC / Avionics voltage rails  —  one row per regulated output bus.\n"
              "Double-click any cell to edit it in-place.",
         wraplength=340, justify="left", foreground="#555555",
-    ).grid(row=0, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 2))
+    ).grid(row=2, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 2))
 
     # ---- Treeview ----
     av_tree_frame = ttk.Frame(tab_avionics)
-    av_tree_frame.grid(row=1, column=0, columnspan=2, sticky="nsew", padx=6, pady=(0, 4))
+    av_tree_frame.grid(row=3, column=0, columnspan=2, sticky="nsew", padx=6, pady=(0, 4))
     av_tree_frame.columnconfigure(0, weight=1)
     av_tree_frame.rowconfigure(0, weight=1)
 
@@ -4240,7 +4529,7 @@ def launch_gui():
 
     # ---- Add / edit row controls ----
     av_entry_frame = ttk.Frame(tab_avionics)
-    av_entry_frame.grid(row=2, column=0, columnspan=2, sticky="ew", padx=6, pady=(2, 2))
+    av_entry_frame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=6, pady=(2, 2))
     for c in range(6):
         av_entry_frame.columnconfigure(c, weight=1)
 
@@ -4258,7 +4547,7 @@ def launch_gui():
 
     # ---- Button row ----
     av_btn_frame = ttk.Frame(tab_avionics)
-    av_btn_frame.grid(row=3, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
+    av_btn_frame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=6, pady=(0, 6))
 
     def _av_add_or_update():
         try:
@@ -4369,7 +4658,18 @@ def launch_gui():
         row=0, column=1, padx=(0,6)); r += 1
     ttk.Separator(tab_env, orient="horizontal").grid(
         row=r, column=0, columnspan=2, sticky="ew", pady=6); r += 1
+    # ---- Plot Settings -------------------------------------------
+    # Plot range is a display choice, not a property of the aircraft or
+    # the mission, so it does not belong among the physical inputs.
+    _pr = 0
+    add_row(tab_plotcfg, _pr, "Max speed for plot (m/s)", v_max_v_plot,
+            key="max_v_plot")
+
+    add_row(tab_env, r, "Cruise Speed (m/s)",      v_cruise_speed, key="cruise_speed"); r += 1
     add_row(tab_env, r, "Altitude (m)",            v_altitude, key="altitude");    r += 1
+    add_row(tab_env, r, "Takeoff run available (m)", v_field_takeoff_m, key="field_takeoff_m"); r += 1
+    add_row(tab_env, r, "Landing distance available (m)", v_field_landing_m, key="field_landing_m"); r += 1
+    add_row(tab_env, r, "Minimum climb rate (m/s)", v_min_climb_mps, key="min_climb_mps"); r += 1
     add_row(tab_env, r, "Cruise Altitude (m)",     v_cruise_altitude, key="cruise_altitude"); r += 1
     add_row(tab_env, r, "Temperature (°C, optional)", v_temp, key="temp");     r += 1
     add_row(tab_env, r, "Pressure (Pa, optional)", v_pressure, key="pressure");    r += 1
@@ -4380,8 +4680,6 @@ def launch_gui():
     add_row(tab_env, r, "Climb rate cmd (m/s)",    v_climb_rate, key="climb_rate");  r += 1
     add_row(tab_env, r, "Descent rate cmd (m/s)",  v_descent_rate, key="descent_rate"); r += 1
     add_row(tab_env, r, "Reserve percent (%)",     v_reserve_percent, key="reserve_percent"); r += 1
-    add_row(tab_env, r, "RTH reserve (Wh)",        v_rth_reserve_Wh, key="rth_reserve_Wh"); r += 1
-    add_row(tab_env, r, "Diversion reserve (Wh)",  v_div_reserve_Wh, key="diversion_reserve_Wh"); r += 1
     ttk.Separator(tab_env, orient="horizontal").grid(
         row=r, column=0, columnspan=3, sticky="ew", pady=6)
     ttk.Label(tab_env, text="—— Transients (mission runs) ——",
@@ -4391,7 +4689,6 @@ def launch_gui():
     add_row(tab_env, r, "Max accel (m/s²)",            v_max_accel_mps2,  key="max_accel_mps2");  r += 1
     add_row(tab_env, r, "Max decel (m/s²)",            v_max_decel_mps2,  key="max_decel_mps2");  r += 1
     add_row(tab_env, r, "Decel regen efficiency (0-1)",v_decel_regen_eff, key="decel_regen_eff"); r += 1
-    add_row(tab_env, r, "Max speed for plot (m/s)", v_max_v_plot, key="max_v_plot"); r += 1
 
     # ===== RIGHT: output panels =====
     right = ttk.Frame(main)
@@ -4405,18 +4702,214 @@ def launch_gui():
 
     tab_plots        = ttk.Frame(display_nb, padding=0)
     tab_status       = ttk.Frame(display_nb, padding=0)
+    # After a mission these two tabs answer different questions, and neither
+    # said so: "pack current 33 A" reads like a steady value when it is the
+    # worst instant of an entire flight.
+    _scope_labels = {}
+
+    def _set_result_scope(from_mission: bool):
+        status_text = (
+            "Mission run — every row below is the WORST value reached at any "
+            "point in the mission: the highest current, power and temperature, "
+            "and the LOWEST pack voltage and reserve margin. A row passes only "
+            "if it passed throughout."
+            if from_mission else
+            "Fixed speed run — every row is evaluated at the single cruise "
+            "speed set on the Mission/Environment tab.")
+        metrics_text = (
+            "Mission run — these are the values at the LAST evaluated instant "
+            "of the mission, not an average and not the worst case. For "
+            "worst-case figures see the Status tab."
+            if from_mission else
+            "Fixed speed run — a single steady operating point at the cruise "
+            "speed set on the Mission/Environment tab.")
+        for key, text in (("status", status_text), ("metrics", metrics_text)):
+            lbl = _scope_labels.get(key)
+            if lbl is not None:
+                lbl.configure(text=text)
+
     tab_metrics      = ttk.Frame(display_nb, padding=0)
     tab_mission_plots= ttk.Frame(display_nb, padding=0)
     for t in (tab_plots, tab_status, tab_metrics, tab_mission_plots):
         t.columnconfigure(0, weight=1); t.rowconfigure(0, weight=1)
-    display_nb.add(tab_plots,         text="Plots")
+    display_nb.add(tab_plots,         text="Fixed Speed Plots")
     display_nb.add(tab_status,        text="Status")
+    for _key, _parent in (("status", tab_status), ("metrics", tab_metrics)):
+        _lbl = ttk.Label(_parent, text="", foreground="#0B6BCB",
+                         wraplength=900, justify="left",
+                         font=("TkDefaultFont", 9, "bold"))
+        # These frames are laid out with grid, and this label is created
+        # BEFORE their contents exist. Probing the first child cannot work
+        # here — there isn't one yet — and packing first forces pack on the
+        # frame, which breaks every grid() that follows.
+        _lbl.grid(row=90, column=0, columnspan=3, sticky="ew", padx=6, pady=(2, 4))
+        _scope_labels[_key] = _lbl
+    _set_result_scope(False)
     display_nb.add(tab_metrics,       text="Metrics")
     display_nb.add(tab_mission_plots, text="Mission Plots")
     tab_weight_budget = ttk.Frame(display_nb, padding=0)
     tab_weight_budget.columnconfigure(0, weight=1)
     tab_weight_budget.rowconfigure(0, weight=1)
     display_nb.add(tab_weight_budget, text="Weight Budget")
+
+    # ---- Power Budget tab --------------------------------------------
+    # The weight budget answers "what is this aircraft made of". This answers
+    # "what is the battery actually paying for" — a design can be light and
+    # still lose a third of its energy to heat.
+    tab_power_budget = ttk.Frame(display_nb, padding=0)
+    tab_power_budget.columnconfigure(0, weight=1)
+    tab_power_budget.rowconfigure(0, weight=1)
+    display_nb.add(tab_power_budget, text="Power Budget")
+
+    pb_outer = ttk.Frame(tab_power_budget, padding=4)
+    pb_outer.grid(row=0, column=0, sticky="nsew")
+    pb_outer.columnconfigure(0, weight=3)
+    pb_outer.columnconfigure(1, weight=2)
+    pb_outer.rowconfigure(0, weight=1)
+
+    pb_left = ttk.LabelFrame(pb_outer, text="Power Budget", padding=4)
+    pb_left.grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+    pb_left.columnconfigure(0, weight=1)
+    pb_left.rowconfigure(0, weight=1)
+
+    _pb_cols = ("item", "watts", "pct", "voltage", "current")
+    pb_tv = ttk.Treeview(pb_left, columns=_pb_cols, show="headings", height=14)
+    for col, heading, width in [("item", "Component / Loss", 250),
+                                ("watts", "Power (W)", 85),
+                                ("pct", "% of P_in", 75),
+                                ("voltage", "Voltage", 80),
+                                ("current", "Current (A)", 85)]:
+        pb_tv.heading(col, text=heading)
+        pb_tv.column(col, width=width,
+                     anchor="w" if col == "item" else "center", stretch=True)
+    pb_tv.grid(row=0, column=0, sticky="nsew")
+    pb_sb = ttk.Scrollbar(pb_left, orient="vertical", command=pb_tv.yview)
+    pb_sb.grid(row=0, column=1, sticky="ns")
+    pb_tv.configure(yscrollcommand=pb_sb.set)
+    pb_tv.tag_configure("delivered", background="#e8f4d9")
+    pb_tv.tag_configure("lost", background="#fdecea")
+    pb_tv.tag_configure("subtotal", font=("TkDefaultFont", 9, "bold"))
+    pb_tv.tag_configure("total", font=("TkDefaultFont", 10, "bold"),
+                        background="#e3eefb")
+
+    pb_right = ttk.LabelFrame(pb_outer, text="Power Distribution", padding=4)
+    pb_right.grid(row=0, column=1, sticky="nsew")
+    pb_right.columnconfigure(0, weight=1)
+    pb_right.rowconfigure(0, weight=1)
+    _pb_canvas = {"widget": None}
+    pb_placeholder = ttk.Label(pb_right, foreground="#888888",
+                               text="Run a fixed speed sweep to see where the "
+                                    "battery's power goes.", wraplength=260,
+                               justify="center")
+    pb_placeholder.grid(row=0, column=0, padx=12, pady=30)
+
+    def clear_power_budget(reason: str):
+        """
+        Empty the Power Budget rather than leave a stale sweep on screen.
+
+        A mission has no single operating point, so a per-component split from
+        an earlier fixed speed sweep describes a condition the mission never
+        held — and it looks perfectly plausible sitting there.
+        """
+        for iid in pb_tv.get_children():
+            pb_tv.delete(iid)
+        pb_tv.insert("", "end", tags=("total",), values=(reason, "", "", "", ""))
+        old = _pb_canvas.get("widget")
+        if old is not None:
+            try:
+                old.get_tk_widget().destroy()
+            except Exception:
+                pass
+            _pb_canvas["widget"] = None
+        pb_placeholder.configure(
+            text="A mission has no single operating point, so there is no "
+                 "power split to show.\n\nPress Run Fixed Speed Sweep to "
+                 "build one.")
+        pb_placeholder.grid()
+
+    def update_power_budget(cfg, metrics):
+        """
+        Fill the Power Budget from the run just completed.
+
+        Motor SHAFT power is what reaches the air; the copper loss that got it
+        there is a separate, lost row. Adding them would count winding heat as
+        useful output — the same mistake the Propulsion Power metric used to
+        make.
+        """
+        for iid in pb_tv.get_children():
+            pb_tv.delete(iid)
+
+        total_W = float(metrics.get("total_power_W", 0.0))
+        if total_W <= 0:
+            return
+
+        copper_W = float(metrics.get("motor_copper_loss_W", 0.0) or 0.0)
+        shaft_W = max(float(metrics.get("motor_power_W", 0.0)) - copper_W, 0.0)
+
+        rails = []
+        avionics = getattr(cfg, "avionics", None)
+        tree = getattr(avionics, "voltage_tree", None) or {}
+        for volts, spec in sorted(tree.items()):
+            try:
+                amps, eff = float(spec[0]), float(spec[1])
+            except Exception:
+                continue
+            rails.append({"name": f"{float(volts):.0f}V", "voltage_V": float(volts),
+                           "current_A": amps, "efficiency": eff})
+
+        periph_A = float(getattr(cfg, "periph_current_A", 0.0) or 0.0)
+        rows = core.build_power_budget(
+            total_in_W=total_W,
+            motor_shaft_W=shaft_W,
+            motor_copper_W=copper_W,
+            battery_i2r_W=float(metrics.get("battery_loss_W", 0.0) or 0.0),
+            esc_loss_W=float(metrics.get("esc_loss_W", 0.0) or 0.0),
+            # Valued at NOMINAL pack voltage, matching how the model
+            # charges it. Using the loaded voltage here disagreed with
+            # the model by the sag, which showed up as "Unaccounted".
+            peripheral_W=(periph_A * float(cfg.battery.vnom_pack)),
+            peripheral_A=periph_A,
+            rails=rails)
+
+        for row in rows:
+            current = ("" if row["current"] is None
+                       else f"{float(row['current']):.2f}")
+            pb_tv.insert("", "end", tags=(row["kind"],), values=(
+                row["name"], f"{row['watts']:.1f}", f"{row['pct']:.1f}%",
+                row["voltage"], current))
+
+        # Share diagram: delivered against each loss, so the eye goes to the
+        # biggest waste rather than to the biggest number.
+        try:
+            slices = [(r["name"], r["watts"]) for r in rows
+                      if r["kind"] in ("delivered", "lost") and r["watts"] > 0.01]
+            if slices:
+                fig, ax = core.make_figure(figsize=(4.6, 4.2))
+                labels = [s[0] for s in slices]
+                values = [s[1] for s in slices]
+                colours = ["#2E7D32" if r["kind"] == "delivered" else "#C62828"
+                           for r in rows
+                           if r["kind"] in ("delivered", "lost") and r["watts"] > 0.01]
+                ax.pie(values, labels=None, colors=colours, autopct="%1.0f%%",
+                       textprops={"fontsize": 7}, startangle=90)
+                ax.legend(labels, fontsize=6, loc="center left",
+                          bbox_to_anchor=(-0.35, 0.5))
+                ax.set_title("Green = delivered, red = lost", fontsize=9)
+                fig.tight_layout()
+                old = _pb_canvas.get("widget")
+                if old is not None:
+                    try:
+                        old.get_tk_widget().destroy()
+                    except Exception:
+                        pass
+                pb_placeholder.grid_remove()
+                canvas = FigureCanvasTkAgg(fig, master=pb_right)
+                canvas.draw()
+                canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+                _pb_canvas["widget"] = canvas
+        except Exception:
+            pass
+
 
     # ---- Airframe Diagram tab ----------------------------------------
     # A plan-view sketch drawn from the entered dimensions. Its job is to make
@@ -4437,7 +4930,7 @@ def launch_gui():
     ad_holder.columnconfigure(0, weight=1)
     ad_holder.rowconfigure(0, weight=1)
     ad_placeholder = ttk.Label(
-        ad_holder, text="Press Run Single-Point to draw the airframe.",
+        ad_holder, text="Press Run Fixed Speed Sweep to draw the airframe.",
         foreground="#888888")
     ad_placeholder.grid(row=0, column=0)
     _ad_canvas = {"widget": None}
@@ -4457,9 +4950,63 @@ def launch_gui():
     sens_bar.grid(row=0, column=0, sticky="ew")
     ttk.Label(sens_bar, text="Output:").pack(side="left")
     v_sens_metric = tk.StringVar(value="Flight time (min)")
-    ttk.Combobox(sens_bar, textvariable=v_sens_metric, state="readonly", width=22,
+    sens_metric_box = ttk.Combobox(sens_bar, textvariable=v_sens_metric,
+                                   state="readonly", width=22,
                  values=["Flight time (min)", "Range (km)",
-                         "Total power (W)"]).pack(side="left", padx=(4, 10))
+                         "Total power (W)", "Stall speed (m/s)",
+                         "L/D ratio", "Rate of climb (m/s)",
+                         "Takeoff distance (m)"])
+    sens_metric_box.pack(side="left", padx=(4, 10))
+
+    # A mission asks different questions than one operating point, so the
+    # output list changes with the run type.
+    _SENS_OUTPUTS_POINT = ["Flight time (min)", "Range (km)", "Total power (W)",
+                           "Stall speed (m/s)", "L/D ratio",
+                           "Rate of climb (m/s)", "Takeoff distance (m)"]
+    _SENS_OUTPUTS_MISSION = ["Mission energy (Wh)", "Mission time (min)",
+                             "Mission distance (km)", "Reserve margin (Wh)",
+                             "Peak pack current (A)", "Peak motor temp (°C)"]
+
+    sens_scope = ttk.Label(sens_bar, text="", foreground="#0B6BCB",
+                           wraplength=520, justify="left",
+                           font=("TkDefaultFont", 8))
+    sens_scope.pack(side="left", padx=(10, 0))
+
+    def _clear_sensitivity(reason: str):
+        """
+        Empty the sensitivity table when a new run makes it stale.
+
+        A sensitivity sweep is tied to the run it was computed from. Leaving
+        the previous run's rankings on screen after the design or the mission
+        changes is worse than showing nothing: the numbers look current and
+        there is no way to tell they are not.
+        """
+        for iid in sens_tv.get_children():
+            sens_tv.delete(iid)
+        sens_tv.insert("", "end", values=(
+            reason, "", "", "", "", "", "Press Run Sensitivity"))
+        canvas = _sens_canvas.get("widget")
+        if canvas is not None:
+            try:
+                canvas.get_tk_widget().destroy()
+            except Exception:
+                pass
+            _sens_canvas["widget"] = None
+
+    def _set_sensitivity_outputs(from_mission: bool):
+        values = _SENS_OUTPUTS_MISSION if from_mission else _SENS_OUTPUTS_POINT
+        sens_metric_box.configure(values=values)
+        if v_sens_metric.get() not in values:
+            v_sens_metric.set(values[0])
+        sens_scope.configure(text=(
+            "Mission mode — each input is perturbed and the WHOLE mission "
+            "re-flown, because what a change does to a mission is not always "
+            "what it does to one operating point."
+            if from_mission else
+            "Fixed speed mode — each input is perturbed at the single cruise "
+            "operating point."))
+
+    _set_sensitivity_outputs(False)
     ttk.Label(sens_bar, text="Vary each input by ±10% and ±20%",
               foreground="#666666", font=("TkDefaultFont", 8)).pack(side="left")
 
@@ -4515,6 +5062,23 @@ def launch_gui():
             ("Prop efficiency",   lambda c, f: setattr(c.airframe, "prop_efficiency", min(c.airframe.prop_efficiency * f, 0.95))),
             ("Cruise speed",      lambda c, f: setattr(c, "cruise_speed_mps", c.cruise_speed_mps * f)),
             ("Motor resistance",  lambda c, f: setattr(c.motor, "resistance", c.motor.resistance * f)),
+
+            # Missing before, and each is a real design trade.
+            ("Payload mass",      lambda c, f: setattr(c, "payload_mass_g",
+                                                       (getattr(c, "payload_mass_g", 0.0) or 0.0) * f)),
+            # Span at fixed area changes aspect ratio, which is the single
+            # biggest lever on induced drag and therefore on endurance.
+            ("Wing span",         lambda c, f: setattr(c.airframe, "wing_span_m",
+                                                       c.airframe.wing_span_m * f)),
+            ("CL_max",            lambda c, f: setattr(c.airframe, "CL_max",
+                                                       c.airframe.CL_max * f)),
+            ("Air density",       lambda c, f: setattr(c, "air_density", c.air_density * f)),
+            ("Prop diameter",     lambda c, f: setattr(c.propeller, "diameter_in",
+                                                       c.propeller.diameter_in * f)),
+            ("Battery resistance", lambda c, f: setattr(c.battery, "resistance_cell",
+                                                        float(c.battery.resistance_cell) * f)),
+            ("Avionics draw",     lambda c, f: setattr(c, "periph_current_A",
+                                                       (getattr(c, "periph_current_A", 0.0) or 0.0) * f)),
         ]
 
     def run_sensitivity():
@@ -4525,8 +5089,36 @@ def launch_gui():
         speed = float(_last_run.get("speed", base_cfg.cruise_speed_mps))
         choice = v_sens_metric.get()
 
+        mission_obj = _last_run.get("mission") if _last_run.get("from_mission") else None
+        mission_args = dict(_last_run.get("mission_args") or {})
+
+        def _mission_outcome(cfg, which):
+            """Fly the mission with this configuration and report one number."""
+            _res, worst, series = simulate_fw_mission(cfg, mission_obj, **mission_args)
+            if which.startswith("Mission energy"):
+                e = series.get("energy_Wh") or series.get("battery_energy_Wh") or []
+                return float(e[-1]) if e else None
+            if which.startswith("Mission time"):
+                t = series.get("t_s") or []
+                return (t[-1] / 60.0) if t else None
+            if which.startswith("Mission distance"):
+                d = series.get("distance_km") or []
+                return float(d[-1]) if d else None
+            if which.startswith("Reserve margin"):
+                return float(worst.get("reserve_margin_Wh", float("nan"))) if worst else None
+            if which.startswith("Peak pack current"):
+                return float(worst.get("pack_current_A", float("nan"))) if worst else None
+            if which.startswith("Peak motor temp"):
+                return float(worst.get("motor_temp_est_C", float("nan"))) if worst else None
+            return None
+
         def evaluate(cfg):
             cfg = base_cfg if cfg is None else cfg
+            if mission_obj is not None:
+                try:
+                    return _mission_outcome(cfg, choice)
+                except Exception:
+                    return None
             spd = float(getattr(cfg, "cruise_speed_mps", speed) or speed)
             try:
                 m = compute_metrics(cfg, spd)
@@ -4534,6 +5126,14 @@ def launch_gui():
                     return float(m["flight_time_min"])
                 if choice.startswith("Range"):
                     return float(m["flight_range_km"])
+                if choice.startswith("Stall speed"):
+                    return float(m["stall_speed_mps"])
+                if choice.startswith("L/D"):
+                    return float(m["LD_ratio"])
+                if choice.startswith("Rate of climb"):
+                    return float(m["rate_of_climb_mps"])
+                if choice.startswith("Takeoff"):
+                    return float(m["takeoff_dist_m"])
                 return float(m["total_power_W"])
             except Exception:
                 return None
@@ -4634,6 +5234,24 @@ def launch_gui():
         ("rate_of_climb_mps", "Rate of climb (m/s)", 2,  1),
         ("wing_loading_N_m2", "Wing loading (N/m²)", 1, -1),
         ("reserve_margin_Wh", "Reserve margin (Wh)", 2,  1),
+
+        # Aerodynamic margins, which is what most wing changes are buying.
+        ("thrust_available_N", "Thrust available (N)", 2,  1),
+        ("max_rc_mps",        "Best climb rate (m/s)", 2,  1),
+        ("takeoff_dist_m",    "Takeoff distance (m)",  1, -1),
+        ("glide_ratio",       "Glide ratio",           2,  1),
+        ("best_range_speed_mps", "Best range speed (m/s)", 2, 0),
+        ("best_endurance_speed_mps", "Best endurance speed (m/s)", 2, 0),
+
+        # Losses, itemised: two designs can draw the same power while
+        # wasting very different amounts of it as heat.
+        ("motor_copper_loss_W", "Motor copper loss (W)", 2, -1),
+        ("battery_loss_W",    "Pack I2R loss (W)",     2, -1),
+        ("esc_loss_W",        "ESC loss (W)",          2, -1),
+        ("motor_temp_est_C",  "Motor temp (°C)",       1, -1),
+        ("esc_temp_est_C",    "ESC temp (°C)",         1, -1),
+        ("battery_temp_est_C", "Battery temp (°C)",    1, -1),
+        ("reynolds_number",   "Reynolds number",       0,  1),
     ]
 
     def _current_comparison_metrics():
@@ -4796,6 +5414,32 @@ def launch_gui():
     # ---- Mission Plots panel (matches multicopter layout) ----
     # Series data stored as a one-element list so closures capture the reference.
     last_mission_series = [None]
+    v_mission_x = tk.StringVar(value="time")   # #19 time or distance
+
+    # #17/#18 the two plot tabs answer different questions and are filled by
+    # different runs. A stale chart from the other kind of run is worse than
+    # an empty tab, because the axes look perfectly plausible.
+    def _show_plot_placeholder(frame, message):
+        for w in frame.winfo_children():
+            w.destroy()
+        ttk.Label(frame, text=message, foreground="#888888",
+                  justify="center", wraplength=420).grid(row=0, column=0,
+                                                         padx=20, pady=40)
+
+    def _clear_fixed_speed_plots():
+        _show_plot_placeholder(
+            plot_inner,
+            "These plots come from a fixed speed sweep.\n\n"
+            "You have just run a mission, so there is nothing to show here.\n"
+            "Press Run Fixed Speed Sweep to build them.")
+
+    def _clear_mission_plots_panel():
+        _show_plot_placeholder(
+            mission_plot_frame,
+            "These plots come from a mission run.\n\n"
+            "You have just run a fixed speed sweep, so there is no mission "
+            "history to plot.\n"
+            "Press Run Mission (JSON) first.")
 
     # Variables: (series_key, display_label, y-axis_unit)
     # Variables that share the same unit string are plotted on the same y-axis.
@@ -4845,7 +5489,9 @@ def launch_gui():
     mission_plot_frame.rowconfigure(0, weight=1)
 
     ttk.Label(mission_controls,
-              text="Select variables to plot vs mission time.").grid(
+              text="Select up to 4 variables to plot.\n"
+                   "Two y-axes on the left, two on the right.",
+              justify="left").grid(
         row=0, column=0, sticky="w")
 
     mission_var_list = tk.Listbox(mission_controls, selectmode="extended",
@@ -4881,57 +5527,87 @@ def launch_gui():
             messagebox.showinfo("Mission plot", "Select at least one variable.")
             return
 
-        t_min = [x / 60.0 for x in ms.get("t_s", [])]
-        if not t_min:
+        if len(sel) > 4:
+            messagebox.showinfo(
+                "Mission plot",
+                f"{len(sel)} variables selected, but the plot takes at most 4 "
+                "— two y-axes on the left and two on the right. Beyond that "
+                "the axes crowd each other and nothing is readable.\n\n"
+                "Only the first 4 will be plotted.")
+            sel = sel[:4]
+
+        # #19 elapsed time, or cumulative distance flown. Distance is the more
+        # useful axis on a survey pattern, where what matters is where along
+        # the route something happened.
+        if v_mission_x.get() == "distance":
+            xs = [float(d) for d in ms.get("distance_km", [])]
+            x_label = "Mission distance (km)"
+        else:
+            xs = [x / 60.0 for x in ms.get("t_s", [])]
+            x_label = "Mission time (min)"
+        if not xs:
+            messagebox.showinfo("Mission plot",
+                                "That axis is not available for this mission.")
             return
 
-        # Group selected variables by unit so same-unit series share a y-axis
         selected = [_mission_items[i] for i in sel]
-        by_unit: dict = {}
-        for k, lbl, unit in selected:
-            by_unit.setdefault(unit, []).append((k, lbl))
 
         import matplotlib.pyplot as _plt
         fig = _plt.Figure(figsize=(7.5, 4.5), dpi=100)
         ax0 = fig.add_subplot(111)
-        unit_list = list(by_unit.keys())
 
-        axes = [(ax0, unit_list[0])]
-        ax0.set_ylabel(unit_list[0])
-        for ui, unit in enumerate(unit_list[1:], 1):
-            axn = ax0.twinx()
-            axn.spines["right"].set_position(("outward", 55 * (ui - 1)))
-            axn.set_ylabel(unit)
-            axes.append((axn, unit))
-
+        # #4 one axis per variable, up to four: first two on the left, next
+        # two on the right, each offset so the labels do not overlap. Fixed
+        # distinct colours so a trace is identifiable without the legend.
+        SERIES_COLORS = ["#1565C0", "#C62828", "#2E7D32", "#EF6C00"]
         lines, labels = [], []
-        for ax, unit in axes:
-            for key, lbl in by_unit.get(unit, []):
-                y = ms.get(key, [])
-                if not y:
-                    continue
-                yy = []
-                for v in y:
-                    try:
-                        yy.append(float("nan") if isinstance(v, float) and v != v
-                                  else float(v))
-                    except Exception:
-                        yy.append(float("nan"))
-                ln, = ax.plot(t_min, yy, label=lbl)
-                lines.append(ln)
-                labels.append(lbl)
+        for idx, (key, lbl, unit) in enumerate(selected):
+            if idx == 0:
+                ax = ax0
+            else:
+                ax = ax0.twinx()
+                if idx == 1:                       # second left-hand axis
+                    ax.yaxis.set_label_position("left")
+                    ax.yaxis.set_ticks_position("left")
+                    ax.spines["left"].set_position(("outward", 52))
+                else:                              # right-hand axes
+                    ax.spines["right"].set_position(("outward", 52 * (idx - 2)))
 
-        ax0.set_xlabel("Mission time (min)")
-        ax0.grid(True)
-        fig.suptitle("Mission variables vs time")
+            y = ms.get(key, []) or []
+            yy = []
+            for v in y:
+                try:
+                    fv = float(v)
+                    yy.append(fv if fv == fv else float("nan"))
+                except Exception:
+                    yy.append(float("nan"))
+            colour = SERIES_COLORS[idx % len(SERIES_COLORS)]
+            ln, = ax.plot(xs[:len(yy)], yy, color=colour, label=lbl)
+            ax.set_ylabel(f"{lbl} ({unit})" if unit and unit != "—" else lbl,
+                          color=colour)
+            ax.tick_params(axis="y", colors=colour)
+            lines.append(ln); labels.append(lbl)
+
+        ax0.set_xlabel(x_label)
+        ax0.grid(True, alpha=0.4)
+        fig.suptitle(f"Mission variables vs "
+                     f"{'distance' if v_mission_x.get() == 'distance' else 'time'}")
         if lines:
-            ax0.legend(lines, labels, loc="best")
+            ax0.legend(lines, labels, loc="best", fontsize=8)
 
         _clear_mission_plot()
         mc = FigureCanvasTkAgg(fig, master=mission_plot_frame)
         mc.draw()
         mc.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         mission_canvas_ref[0] = mc
+
+    mission_x_bar = ttk.Frame(mission_controls)
+    mission_x_bar.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+    ttk.Label(mission_x_bar, text="X axis:").pack(side="left")
+    for _txt, _val in (("Time", "time"), ("Distance", "distance")):
+        ttk.Radiobutton(mission_x_bar, text=_txt, value=_val,
+                        variable=v_mission_x,
+                        command=_update_mission_plot).pack(side="left")
 
     mission_btns = ttk.Frame(mission_controls)
     mission_btns.grid(row=2, column=0, columnspan=2, sticky="ew")
@@ -5071,10 +5747,44 @@ def launch_gui():
             tv.heading(c, text=c.capitalize())
             tv.column(c, width=w, anchor="w" if c in ("metric","note") else "center")
         tv.pack(fill="both", expand=True)
+        # #25 four states, matching the PDF report:
+        #   ok    comfortably inside the limit
+        #   edge  within 5% of it — passing, but with nothing spare
+        #   warn  past the continuous limit, still under the absolute maximum
+        #   bad   past the absolute maximum
         tv.tag_configure("ok",   background="#d9f2d9")
+        tv.tag_configure("edge", background="#e8f4d9")
         tv.tag_configure("warn", background="#fff2cc")
         tv.tag_configure("bad",  background="#f8d7da")
         tv.tag_configure("na",   background="#efefef")
+        # ttk.Treeview cannot wrap text inside a cell — there is no option
+        # for it. Rather than truncating notes invisibly, the full text of
+        # whichever row is selected is shown in a wrapping strip underneath.
+        detail = ttk.Label(parent, text="", wraplength=760, justify="left",
+                           foreground="#333333")
+        # Match whichever geometry manager the parent already uses; these
+        # panels are packed, and mixing grid into a packed frame raises.
+        try:
+            if parent.winfo_children() and parent.winfo_children()[0].winfo_manager() == "grid":
+                detail.grid(row=98, column=0, columnspan=3, sticky="ew",
+                            padx=6, pady=(2, 6))
+            else:
+                detail.pack(side="bottom", fill="x", padx=6, pady=(2, 6))
+        except Exception:
+            detail.pack(side="bottom", fill="x", padx=6, pady=(2, 6))
+
+        def _show_detail(_event=None, _tv=tv, _lbl=detail):
+            sel = _tv.selection()
+            if not sel:
+                _lbl.configure(text="")
+                return
+            vals = _tv.item(sel[0], "values")
+            if len(vals) >= 4 and str(vals[3]).strip():
+                _lbl.configure(text=f"{vals[0]}  —  {vals[3]}")
+            else:
+                _lbl.configure(text=f"{vals[0]}: no further detail.")
+
+        tv.bind("<<TreeviewSelect>>", _show_detail)
         return tv
 
     status_scroll = ttk.Frame(tab_status)
@@ -5085,8 +5795,99 @@ def launch_gui():
     motor_tv = _make_status_tv(status_scroll, "Motor / ESC Status")
     aero_tv  = _make_status_tv(status_scroll, "Aerodynamic Status")
 
+    def _fix_treeview_tag_colors():
+        """
+        Tk 8.6.9 and later drop Treeview tag backgrounds unless the default
+        style map is stripped of its background/foreground entries. The tags
+        were always configured; they simply were not being drawn.
+        """
+        style = ttk.Style()
+        for option in ("background", "foreground"):
+            style.map("Treeview", **{option: [
+                spec for spec in style.map("Treeview", query_opt=option)
+                if spec[:2] != ("!disabled", "!selected")]})
+
+    _fix_treeview_tag_colors()
+
     def _ins_row(tv, metric, val_str, lim_str, tag, note=""):
         tv.insert("", "end", values=(metric, val_str, lim_str, note), tags=(tag,))
+
+    def _field_text(key, default=""):
+        var = config_vars.get(key)
+        return var.get() if var is not None else default
+
+    def _limit_value(key, default=None):
+        """Numeric value of an optional limit field; None when left blank."""
+        raw = str(_field_text(key, "")).strip()
+        if raw == "":
+            return default
+        try:
+            return float(raw)
+        except ValueError:
+            return default
+
+    def _classify(value, limit, edge_frac=0.05):
+        """
+        Single-limit classification with an "edge" band. Within `edge_frac`
+        of the limit still passes, but is worth seeing: an aircraft at 99% of
+        its motor current rating has nothing left for a gust or a hot day.
+        """
+        try:
+            v, lim = float(value), float(limit)
+        except (TypeError, ValueError):
+            return "na"
+        if not (math.isfinite(v) and math.isfinite(lim)) or lim == 0:
+            return "na"
+        ratio = v / lim
+        if ratio > 1.0:
+            return "bad"
+        if ratio > 1.0 - edge_frac:
+            return "edge"
+        return "ok"
+
+    def _dual_limit_row(tv, metric, value, cont_limit, max_limit, unit,
+                        time_at_max_s=None, decimals=2):
+        """
+        A row for a quantity with BOTH a continuous and an absolute limit.
+
+        Green below the continuous rating, amber between the two, red above
+        the maximum. When a time allowance is given, the note says how long
+        the condition may be held — "over the continuous rating" only means
+        anything in relation to duration.
+        """
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = float("nan")
+        cont = float(cont_limit) if cont_limit and math.isfinite(float(cont_limit)) else None
+        mx = float(max_limit) if max_limit and math.isfinite(float(max_limit)) else None
+
+        if not math.isfinite(v) or (cont is None and mx is None):
+            _ins_row(tv, metric,
+                     f"{v:.{decimals}f} {unit}" if math.isfinite(v) else "—",
+                     "Not Specified", "na",
+                     "No rating entered, so nothing to check against.")
+            return
+
+        limit_txt = " / ".join(filter(None, [
+            f"cont {cont:.{decimals}f} {unit}" if cont else None,
+            f"max {mx:.{decimals}f} {unit}" if mx else None]))
+
+        if mx is not None and v > mx:
+            tag, note = "bad", f"Above the absolute maximum of {mx:.{decimals}f} {unit}."
+        elif cont is not None and v > cont:
+            tag = "warn"
+            note = f"Above the continuous rating of {cont:.{decimals}f} {unit}."
+            note += (f" Rated for {float(time_at_max_s):.0f} s at this level."
+                     if time_at_max_s else
+                     " No time-at-maximum entered, so duration is unchecked.")
+        else:
+            ref = cont if cont is not None else mx
+            tag = _classify(v, ref)
+            note = ("Within the continuous rating." if tag == "ok" else
+                    f"Within 5% of the {ref:.{decimals}f} {unit} rating — no margin left.")
+
+        _ins_row(tv, metric, f"{v:.{decimals}f} {unit}", limit_txt, tag, note)
 
     def _clear_status():
         for tv in (batt_tv, motor_tv, aero_tv):
@@ -5119,28 +5920,27 @@ def launch_gui():
                  _color_tag(Vload, batt.vmin_pack, "min"),
                  f"Sag: {Vdrop:.2f} V ({vsag_pct:.1f}%)")
 
-        if math.isfinite(batt.discharge_cont_A):
-            _ins_row(batt_tv, "Pack current vs cont rating",
-                     f"{Ipack:.1f} A", f"<= {batt.discharge_cont_A:.1f} A",
-                     _color_tag(Ipack, batt.discharge_cont_A, "max"))
-        if math.isfinite(batt.discharge_max_A):
-            _ins_row(batt_tv, "Pack current vs max rating",
-                     f"{Ipack:.1f} A", f"<= {batt.discharge_max_A:.1f} A",
-                     _color_tag(Ipack, batt.discharge_max_A, "max"))
+        # #28 one row per quantity carrying BOTH ratings. Separate "vs cont"
+        # and "vs max" rows made a design sitting between them look like one
+        # pass and one fail, when it is really a time-limited condition.
+        _batt_time = _limit_value("batt_max_time_s", None)   # #29
+        _dual_limit_row(batt_tv, "Pack current", Ipack,
+                        batt.discharge_cont_A, batt.discharge_max_A,
+                        "A", _batt_time, decimals=1)
 
         cap_Ah = batt.capacity_Ah
         if cap_Ah > 0:
-            c_rate = Ipack / cap_Ah
-            _ins_row(batt_tv, "Discharge C-rate",
-                     f"{c_rate:.2f} C",
-                     f"<= {batt.discharge_cont_A/cap_Ah:.1f} C (cont)" if math.isfinite(batt.discharge_cont_A) else "—",
-                     _color_tag(c_rate, batt.discharge_cont_A/cap_Ah if math.isfinite(batt.discharge_cont_A) else 1e9, "max"),
-                     "Continuous C-rate at cruise")
+            _dual_limit_row(batt_tv, "Discharge C-rate", Ipack / cap_Ah,
+                            (batt.discharge_cont_A / cap_Ah)
+                            if math.isfinite(batt.discharge_cont_A) else None,
+                            (batt.discharge_max_A / cap_Ah)
+                            if math.isfinite(batt.discharge_max_A) else None,
+                            "C", _batt_time, decimals=1)
 
         _ins_row(batt_tv, "Usable energy",
                  f"{batt.usable_Wh:.1f} Wh", "—", "na",
                  f"Total: {batt.capacity_Wh:.1f} Wh ({batt.discharge_percent:.0f}% usable)")
-        _ins_row(batt_tv, "Total electrical power", f"{Ptot:.1f} W", "—", "na")
+        _ins_row(batt_tv, "Total electrical power", f"{Ptot:.1f} W", "Not Specified", "na")
 
         if Ptot > 0:
             pct_motor = Pmotor / Ptot * 100
@@ -5170,23 +5970,81 @@ def launch_gui():
                      f"{I_motor_est:.2f} A", f"<= {cfg.motor.max_current:.2f} A",
                      _color_tag(I_motor_est, cfg.motor.max_current, "max"))
 
+        # A percentage on its own does not say whether the aircraft climbs.
+        # Excess thrust becomes climb rate directly: RC = (T - D) * V / W.
+        # So report the climb the margin actually buys, and judge it against
+        # the climb the operator says they need.
         T_margin_pct = (T_avail - T_req) / max(T_avail, 1e-9) * 100
-        _ins_row(motor_tv, "Thrust margin",
-                 f"{T_margin_pct:.1f}%", ">= 20%",
-                 "ok" if T_margin_pct >= 20 else ("warn" if T_margin_pct >= 5 else "bad"),
-                 f"T_avail={T_avail:.2f}N  T_req={T_req:.2f}N")
+        _rc_from_margin = ((T_avail - T_req) * float(m.get("airspeed_mps", 0.0))
+                           / max(cfg.weight_N, 1e-9))
+        _rc_needed = _limit_value("min_climb_mps", None)
+        if _rc_needed:
+            _ins_row(motor_tv, "Thrust margin",
+                     f"{T_margin_pct:.1f}%  ({_rc_from_margin:.1f} m/s climb)",
+                     f">= {_rc_needed:.1f} m/s climb",
+                     _classify(_rc_needed, max(_rc_from_margin, 1e-9)),
+                     f"Excess thrust becomes climb: RC = (T - D) x V / W. "
+                     f"T_avail={T_avail:.2f} N, T_req={T_req:.2f} N.")
+        else:
+            _ins_row(motor_tv, "Thrust margin",
+                     f"{T_margin_pct:.1f}%  ({_rc_from_margin:.1f} m/s climb)",
+                     "Not Specified",
+                     "bad" if _rc_from_margin <= 0 else "na",
+                     f"Excess thrust becomes climb: RC = (T - D) x V / W. "
+                     f"Set a minimum climb rate to have this checked. "
+                     f"T_avail={T_avail:.2f} N, T_req={T_req:.2f} N.")
 
+        # A fixed-wing does NOT need thrust-to-weight above 1. That is a
+        # rotorcraft criterion, and applying it here flagged healthy aircraft
+        # as dangerous: the 2 m survey example was marked red at 0.54:1 while
+        # climbing at 494 m/min with an 80% thrust margin and a 19 m take-off.
+        #
+        # A wing needs only  T/W > 1/(L/D)  to hold level flight, because the
+        # wing carries the weight and thrust only has to beat drag. The useful
+        # threshold therefore scales with the aircraft's own efficiency rather
+        # than being a fixed number.
         TWR = T_avail / max(cfg.weight_N, 1e-9)
-        _ins_row(motor_tv, "Thrust-to-weight ratio",
-                 f"{TWR:.2f}:1", ">= 1.2:1",
-                 "ok" if TWR >= 1.4 else ("warn" if TWR >= 1.1 else "bad"),
-                 "< 1.2 means marginal climb performance")
+        _ld = float(m.get("LD_ratio", 0.0))
+        if _ld > 0:
+            _need_level = 1.0 / _ld
+            _need_climb = 2.5 * _need_level     # comfortable climb margin
+            if TWR < _need_level:
+                _twr_tag = "bad"
+                _twr_note = (f"Below {_need_level:.2f}, the thrust needed just to "
+                             f"hold level flight at this L/D of {_ld:.1f}.")
+            elif TWR < _need_climb:
+                _twr_tag = "warn"
+                _twr_note = (f"Enough for level flight (needs {_need_level:.2f}) "
+                             f"but climb will be leisurely.")
+            else:
+                _twr_tag = "ok"
+                _twr_note = (f"Level flight needs only {_need_level:.2f} at an "
+                             f"L/D of {_ld:.1f}, so this is a "
+                             f"{TWR * _ld:.1f}x margin. A wing needs T/W above "
+                             f"1 only to climb vertically.")
+            _ins_row(motor_tv, "Thrust-to-weight ratio",
+                     f"{TWR:.2f}:1", f">= {_need_climb:.2f}:1",
+                     _twr_tag, _twr_note)
+        else:
+            _ins_row(motor_tv, "Thrust-to-weight ratio",
+                     f"{TWR:.2f}:1", "Not Specified", "na",
+                     "Needs an L/D to judge against.")
 
-        _ins_row(motor_tv, "Estimated RPM", f"{rpm:.0f}", "—", "na")
+        _ins_row(motor_tv, "Estimated RPM", f"{rpm:.0f}", "Not Specified", "na")
+        # The knee is a MACH number, not a speed: compressibility at the blade
+        # tip is what costs efficiency and makes noise. The speed of sound
+        # falls with temperature, so a fixed 200 m/s limit is several percent
+        # wrong on a cold day. Scale it with conditions instead.
+        _a_sound = math.sqrt(1.4 * 287.05 *
+                             (float(m.get("ambient_temp_C", 15.0)) + 273.15))
+        _tip_mach = V_tip / max(_a_sound, 1e-9)
         _ins_row(motor_tv, "Prop tip speed",
-                 f"{V_tip:.1f} m/s", "<= 200 m/s",
-                 _color_tag(V_tip, 200, "max"),
-                 "Mach 0.6 ≈ 200 m/s — keep below for noise & efficiency")
+                 f"{V_tip:.1f} m/s  (Mach {_tip_mach:.2f})",
+                 f"<= Mach 0.60  ({0.60 * _a_sound:.0f} m/s here)",
+                 _classify(_tip_mach, 0.60),
+                 f"Above about Mach 0.6 the tip goes transonic: noise rises "
+                 f"sharply and efficiency falls. Speed of sound is "
+                 f"{_a_sound:.0f} m/s at this temperature.")
 
         V_pitch = float(m.get("pitch_speed_mps", 0.0))
         if V_pitch > 0:
@@ -5198,19 +6056,59 @@ def launch_gui():
         T_motor = float(m.get("motor_temp_est_C", float("nan")))
         T_esc   = float(m.get("esc_temp_est_C",   float("nan")))
         T_batt  = float(m.get("battery_temp_est_C",float("nan")))
+        # #11 thermal limits come from the inputs now, not hard-coded numbers.
+        _lim_motor = _limit_value("motor_temp_limit", 100.0)
+        _lim_esc   = _limit_value("esc_temp_limit", 90.0)
+        _lim_batt  = _limit_value("batt_temp_limit", 55.0)
+
         if math.isfinite(T_motor):
             _ins_row(motor_tv, "Motor temperature (est)",
-                     f"{T_motor:.1f} °C", "<= 100 °C",
-                     "ok" if T_motor < 80 else ("warn" if T_motor < 100 else "bad"),
-                     f"Thermal status: {m.get('thermal_status','n/a')}")
+                     f"{T_motor:.1f} °C", f"<= {_lim_motor:.0f} °C",
+                     _classify(T_motor, _lim_motor),
+                     f"Headroom: {_lim_motor - T_motor:.1f} °C. Above this the "
+                     f"magnets weaken and the insulation degrades.")
         if math.isfinite(T_esc):
             _ins_row(motor_tv, "ESC temperature (est)",
-                     f"{T_esc:.1f} °C", "<= 90 °C",
-                     "ok" if T_esc < 70 else ("warn" if T_esc < 90 else "bad"))
+                     f"{T_esc:.1f} °C", f"<= {_lim_esc:.0f} °C",
+                     _classify(T_esc, _lim_esc),
+                     f"Headroom: {_lim_esc - T_esc:.1f} °C. ESCs run hot "
+                     f"because they sit in still air inside the fuselage.")
         if math.isfinite(T_batt):
             _ins_row(motor_tv, "Battery temperature (est)",
-                     f"{T_batt:.1f} °C", "<= 55 °C",
-                     "ok" if T_batt < 40 else ("warn" if T_batt < 55 else "bad"))
+                     f"{T_batt:.1f} °C", f"<= {_lim_batt:.0f} °C",
+                     _classify(T_batt, _lim_batt),
+                     f"Headroom: {_lim_batt - T_batt:.1f} °C. Cells age far "
+                     f"faster hot, so this is a longevity limit too.")
+
+        # #28 motor current and power against BOTH ratings, with duration.
+        _motor_time = _limit_value("motor_max_time_s", None)
+        _n_mot = max(int(cfg.num_motors), 1)
+        _p_motor_each = float(m.get("motor_power_W", 0.0)) / _n_mot
+        _i_motor_each = (float(m.get("motor_power_W", 0.0))
+                         / max(float(m.get("v_load_V", 0.0)), 1.0) / _n_mot)
+        _dual_limit_row(motor_tv, "Motor current / motor", _i_motor_each,
+                        None, getattr(cfg.motor, "max_current", None),
+                        "A", _motor_time)
+        _dual_limit_row(motor_tv, "Motor power / motor", _p_motor_each,
+                        None, getattr(cfg.motor, "max_power", None),
+                        "W", _motor_time, decimals=0)
+
+        # #33 the motor's own voltage rating against the pack.
+        _mv_lo = _limit_value("motor_s_min", None)
+        _mv_hi = _limit_value("motor_s_max", None)
+        if _mv_lo or _mv_hi:
+            _as_volts = str(_field_text("motor_v_unit", "S")).strip().upper().startswith("V")
+            _pack = batt.vmax_pack if _as_volts else batt.series_cells
+            _unit = "V" if _as_volts else "S"
+            _ok = ((_mv_lo is None or _pack >= _mv_lo)
+                   and (_mv_hi is None or _pack <= _mv_hi))
+            _ins_row(motor_tv, "Motor voltage rating",
+                     f"pack is {_pack:.0f} {_unit}",
+                     f"{_mv_lo or '?'}-{_mv_hi or '?'} {_unit}",
+                     "ok" if _ok else "bad",
+                     "Within the motor's rated range." if _ok else
+                     "Outside the motor's rated range: below it the motor "
+                     "underperforms, above it the rotor over-speeds.")
 
         if cfg.esc is not None:
             I_esc_est = (Pmotor / max(cfg.num_motors, 1)) / max(Vload, 1.0)
@@ -5279,17 +6177,29 @@ def launch_gui():
 
         ceil_m = float(m.get("service_ceiling_m", float("inf")))
         ceil_s = f"{ceil_m:.0f} m ASL" if math.isfinite(ceil_m) else "> 6000 m"
-        _ins_row(aero_tv, "Service ceiling", ceil_s, "—", "na",
+        _ins_row(aero_tv, "Service ceiling", ceil_s, "Not Specified", "na",
                  "Altitude where max RC drops to 0.5 m/s")
 
+        # Judged against the field you actually fly from. A 100 m constant
+        # said nothing: it is generous for a hand-launch and impossible off a
+        # short strip. With no field entered, report the number and do not
+        # pretend to have an opinion about it.
         S_to = float(m.get("takeoff_dist_m", float("inf")))
-        if math.isfinite(S_to):
-            _ins_row(aero_tv, "Takeoff ground roll",
-                     f"{S_to:.1f} m", "<= 100 m",
-                     "ok" if S_to <= 60 else ("warn" if S_to <= 120 else "bad"))
+        _field_to = _limit_value("field_takeoff_m", None)
+        if not math.isfinite(S_to):
+            _ins_row(aero_tv, "Takeoff ground roll", "∞", "Not Specified", "bad",
+                     "Thrust never exceeds rolling friction — it cannot take off "
+                     "at all, whatever the field length.")
+        elif _field_to:
+            _ins_row(aero_tv, "Takeoff ground roll", f"{S_to:.1f} m",
+                     f"<= {_field_to:.0f} m", _classify(S_to, _field_to),
+                     f"Uses {S_to / _field_to * 100:.0f}% of the run available. "
+                     f"Add margin for wind, grass and a hot day.")
         else:
-            _ins_row(aero_tv, "Takeoff ground roll",
-                     "∞", "—", "bad", "Thrust < rolling friction — cannot take off")
+            _ins_row(aero_tv, "Takeoff ground roll", f"{S_to:.1f} m",
+                     "Not Specified", "na",
+                     "Enter the run available on the Mission/Environment tab "
+                     "to have this checked.")
 
         S_ld = float(m.get("landing_dist_m", float("inf")))
         if math.isfinite(S_ld):
@@ -5297,10 +6207,20 @@ def launch_gui():
             # obstacle, so it is dominated by the 15 m x L/D approach segment.
             # Thresholds are scaled accordingly — a clean glider with a high
             # L/D legitimately needs a long approach.
-            _ins_row(aero_tv, "Landing distance (over 15 m obstacle)",
-                     f"{S_ld:.1f} m", "<= 400 m",
-                     "ok" if S_ld <= 300 else ("warn" if S_ld <= 450 else "bad"),
-                     "Approach segment = 15 m x L/D; ground roll is the remainder")
+            _field_ld = _limit_value("field_landing_m", None)
+            if _field_ld:
+                _ins_row(aero_tv, "Landing distance (over 15 m obstacle)",
+                         f"{S_ld:.1f} m", f"<= {_field_ld:.0f} m",
+                         _classify(S_ld, _field_ld),
+                         f"Uses {S_ld / _field_ld * 100:.0f}% of what is "
+                         f"available. Approach segment = 15 m x L/D; the "
+                         f"ground roll is the remainder.")
+            else:
+                _ins_row(aero_tv, "Landing distance (over 15 m obstacle)",
+                         f"{S_ld:.1f} m", "Not Specified", "na",
+                         "Approach segment = 15 m x L/D; ground roll is the "
+                         "remainder. Enter the distance available to have this "
+                         "checked.")
 
         SR = float(m.get("specific_range_m_per_Wh", 0.0))
         _ins_row(aero_tv, "Specific range",
@@ -5336,12 +6256,28 @@ def launch_gui():
                     f"operating at {_t_op:.0f} g",
                     f"within {_t_lo:.0f}-{_t_hi:.0f} g measured", "ok")
 
+        # Re is a regime marker rather than a pass/fail, and the bands are
+        # real: below about 70 k the laminar separation bubble fails to
+        # reattach and section drag climbs steeply; above roughly 200 k
+        # ordinary published airfoil data applies. Between them the airfoil
+        # simply has to be chosen for low Re, which is a design decision.
         Re = float(m.get("reynolds_number", 0.0))
-        re_tag = "ok" if Re >= 200000 else ("warn" if Re >= 70000 else "bad")
-        _ins_row(aero_tv, "Reynolds number",
-                 f"{Re:,.0f}", ">= 200 000",
-                 re_tag,
-                 "< 70 k → laminar separation; 70–200 k → transitional regime")
+        _chord = cfg.airframe.wing_area_m2 / max(cfg.airframe.wing_span_m, 1e-9)
+        if Re >= 200000:
+            re_tag = "ok"
+            re_note = "Ordinary published airfoil data applies here."
+        elif Re >= 70000:
+            re_tag = "warn"
+            re_note = ("Transitional regime: flyable, but the airfoil must be "
+                       "chosen for low Re. High-Re polars will overstate it.")
+        else:
+            re_tag = "bad"
+            re_note = ("Laminar separation without reattachment: section drag "
+                       "rises steeply and CL_max falls well below the "
+                       "published figure.")
+        _ins_row(aero_tv, "Reynolds number", f"{Re:,.0f}",
+                 ">= 200 000 for ordinary polars", re_tag,
+                 f"{re_note} Computed at the {_chord * 1000:.0f} mm mean chord.")
 
     # ---- Metrics panel ----
     metrics_frame = ttk.Frame(tab_metrics, padding=4)
@@ -5350,11 +6286,13 @@ def launch_gui():
     metrics_frame.rowconfigure(0, weight=1)
 
     metrics_tv = ttk.Treeview(metrics_frame,
-                               columns=("metric","value"), show="headings", height=30)
+                               columns=("metric","value","note"), show="headings", height=30)
     metrics_tv.heading("metric", text="Metric")
     metrics_tv.heading("value",  text="Value")
-    metrics_tv.column("metric", width=300, anchor="w")
-    metrics_tv.column("value",  width=280, anchor="w")
+    metrics_tv.heading("note",   text="What it means")
+    metrics_tv.column("metric", width=250, anchor="w")
+    metrics_tv.column("value",  width=250, anchor="w")
+    metrics_tv.column("note",   width=520, anchor="w")
     metrics_sb = ttk.Scrollbar(metrics_frame, orient="vertical", command=metrics_tv.yview)
     metrics_tv.configure(yscrollcommand=metrics_sb.set)
     metrics_tv.grid(row=0, column=0, sticky="nsew")
@@ -5381,15 +6319,21 @@ def launch_gui():
     def _sep_metric(title: str):
         """Start a new collapsible section and make later rows its children."""
         node = metrics_tv.insert(
-            "", "end", text=str(title), values=(f"── {title} ──", ""),
+            "", "end", text=str(title), values=(f"── {title} ──", "", ""),
             tags=("section",), open=_metrics_open_state.get(str(title), True))
         _metrics_section_stack["current"] = node
         return node
 
-    def _metrics_row(metric: str, value: str):
-        """Add a row under the current section (or at top level if none)."""
+    def _metrics_row(metric: str, value: str, note: str = ""):
+        """
+        Add a row under the current section.
+
+        `note` is a short plain-language explanation in a third column. A
+        table of bare numbers assumes the reader already knows which of two
+        similar figures is which, and several here genuinely need saying.
+        """
         metrics_tv.insert(_metrics_section_stack["current"], "end",
-                          values=(metric, value))
+                          values=(metric, value, note))
 
     def _metrics_remember_open_state(_event=None):
         """Persist which sections the user left open across re-runs."""
@@ -5411,8 +6355,8 @@ def launch_gui():
             metrics_tv.item(node, open=False)
         _metrics_remember_open_state()
 
-    def _ins_metric(metric: str, value: str):
-        _metrics_row(metric, value)
+    def _ins_metric(metric: str, value: str, note: str = ""):
+        _metrics_row(metric, value, note)
 
 
     def update_metrics(cfg: FixedWingConfig, m: dict):
@@ -5423,7 +6367,27 @@ def launch_gui():
 
         # ── Aircraft ─────────────────────────────────────────────────────
         _sep_metric("Aircraft")
-        _ins_metric("Total Weight",              f"{cfg.aircraft_weight_g:.0f} g  ({cfg.weight_N:.2f} N)")
+        _auw_g = float(cfg.aircraft_weight_g) + float(getattr(cfg, "payload_mass_g", 0.0) or 0.0)
+        _pay_g = float(getattr(cfg, "payload_mass_g", 0.0) or 0.0)
+        _batt_g = float(getattr(cfg.battery, "weight_g", 0.0) or 0.0)
+        _drive_g = (float(getattr(cfg.motor, "weight_g", 0.0) or 0.0)
+                    + float(getattr(cfg.propeller, "weight_g", 0.0) or 0.0)
+                    + float(getattr(getattr(cfg, "esc", None), "weight_g", 0.0) or 0.0)
+                    ) * max(int(cfg.num_motors), 1)
+
+        _ins_metric("All-Up Weight (AUW)",
+                    f"{_auw_g:.0f} g  ({cfg.weight_N:.2f} N)",
+                    "Everything the wing must carry, payload included.")
+        _ins_metric("Payload", f"{_pay_g:.0f} g",
+                    "The part of the AUW that earns the flight.")
+        _ins_metric("Battery Mass Fraction",
+                    f"{_batt_g / max(_auw_g, 1e-9) * 100:.1f} %",
+                    "On a fixed-wing this can go higher than on a multirotor, "
+                    "because cruise power rises only slowly with weight.")
+        _ins_metric("Drive Mass Fraction",
+                    f"{_drive_g / max(_auw_g, 1e-9) * 100:.1f} %",
+                    "Motor, ESC and prop as a share of AUW. High values mean "
+                    "the propulsion system is oversized for the airframe.")
         _ins_metric("Wing Span",                 f"{af.wing_span_m:.3f} m  ({af.wing_span_m*39.37:.1f} in)")
         _ins_metric("Wing Area",                 f"{af.wing_area_m2:.4f} m²  ({af.wing_area_m2*1e4:.1f} cm²)")
         _ins_metric("Wing Loading",              f"{m.get('wing_loading_N_m2',0):.1f} N/m²  "
@@ -5475,6 +6439,10 @@ def launch_gui():
 
         # ── Thrust & Power ────────────────────────────────────────────────
         _sep_metric("Thrust & Power")
+        _ins_metric("Motor Copper Loss",
+                    f"{float(m.get('motor_copper_loss_W', 0.0)):.2f} W",
+                    "I2Rm heat in the windings, all motors. Rises with the "
+                    "SQUARE of current, so it punishes high-current designs.")
         T_req   = m.get('thrust_required_N', 0.0)
         T_avail = m.get('thrust_available_N', 0.0)
         T_margin_N   = T_avail - T_req
@@ -5507,6 +6475,10 @@ def launch_gui():
 
         # ── Battery ───────────────────────────────────────────────────────
         _sep_metric("Battery")
+        _ins_metric("Pack I2R Loss",
+                    f"{float(m.get('battery_loss_W', 0.0)):.2f} W",
+                    "Heat in the pack's own resistance. It is why the loaded "
+                    "voltage sags, and it is energy you paid for but did not fly on.")
         Ipack = m.get('pack_current_A', 0.0)
         Vload = m.get('v_load_V', 0.0)
         Vsag  = batt.vmax_pack - Vload
@@ -5532,6 +6504,31 @@ def launch_gui():
 
         # ── Propeller ─────────────────────────────────────────────────────
         _sep_metric("Propeller")
+        # #46 thrust and power coefficients. Derived from a measured table when
+        # one is loaded, since that describes the real blade; otherwise from a
+        # geometry fit, which is only an order-of-magnitude default.
+        _pc = core.derive_prop_coefficients_from_table(
+            getattr(cfg.propeller, "table", None), cfg.propeller.diameter_in)
+        if _pc:
+            _ins_metric("TConst (C_T)", f"{_pc['c_t']:.4f}",
+                 f"Measured from the loaded table over {_pc['points']} points "
+                 f"(spread {_pc['c_t_spread']:.2f}x). T = C_T x rho x n^2 x D^4.")
+            if _pc.get("c_p"):
+                _ins_metric("PConst (C_P)", f"{_pc['c_p']:.4f}",
+                     "Measured from the loaded table. P = C_P x rho x n^3 x D^5. "
+                     "Assumes the bench data was taken at sea level.")
+        else:
+            _ct_est = core.estimate_prop_thrust_coefficient(
+                cfg.propeller.diameter_in, cfg.propeller.pitch_in,
+                getattr(cfg.propeller, "blades", 2))
+            _ins_metric("TConst (C_T)", f"{_ct_est:.4f}  (estimated)",
+                 "Estimated from pitch and diameter — no table loaded. "
+                 "T = C_T x rho x n^2 x D^4. Load a table or enter TConst for a "
+                 "figure that describes your actual propeller.")
+            _ins_metric("PConst (C_P)",
+                 f"{core.estimate_prop_power_coefficient(_ct_est):.4f}  (estimated)",
+                 "Derived from C_T through momentum theory and a figure of "
+                 "merit, so the two cannot disagree with each other.")
         rpm_est = m.get('rpm_est', 0.0)
         n_rps   = rpm_est / 60.0 if rpm_est > 0 else 1e-9
         J       = V / (n_rps * prop.diameter_m) if n_rps > 0 and prop.diameter_m > 0 else 0.0
@@ -5597,6 +6594,14 @@ def launch_gui():
 
         # ── Thermal & Losses ──────────────────────────────────────────────
         _sep_metric("Thermal & Losses")
+        _esc_head = 90.0 - float(m.get("esc_temp_est_C", float("nan")))
+        _bat_head = 55.0 - float(m.get("battery_temp_est_C", float("nan")))
+        _ins_metric("ESC Thermal Headroom", f"{_esc_head:.1f} °C",
+                    "Margin to a 90 °C ESC limit. ESCs often run hotter than "
+                    "motors because they sit in still air inside the fuselage.")
+        _ins_metric("Battery Thermal Headroom", f"{_bat_head:.1f} °C",
+                    "Margin to a 55 °C pack limit. Cells age far faster when "
+                    "hot, so this is a longevity number as much as a safety one.")
         _ins_metric("Motor temperature (est)", f"{m.get('motor_temp_est_C',0):.1f} °C")
         _ins_metric("ESC temperature (est)", f"{m.get('esc_temp_est_C',0):.1f} °C")
         _ins_metric("Battery temperature (est)", f"{m.get('battery_temp_est_C',0):.1f} °C")
@@ -5609,7 +6614,26 @@ def launch_gui():
         rho = cfg.air_density
         rho_sl = 1.225
         rho_drop = (rho_sl - rho) / rho_sl * 100
-        _ins_metric("Air Density",               f"{rho:.4f} kg/m³  ({rho_drop:+.1f}% vs ISA sea level)")
+        _ins_metric("Altitude", f"{float(getattr(cfg,'reference_altitude_m',0.0)):.0f} m",
+                    "Field elevation used to set air density.")
+        _ins_metric("Cruise Altitude",
+                    f"{float(cfg.glide_reference_altitude_m):.0f} m",
+                    "Height actually flown at; drives the glide-distance figure.")
+        _ins_metric("Temperature",
+                    f"{float(m.get('ambient_temp_C', float('nan'))):.1f} °C",
+                    "Hot air is thinner, so the wing must fly faster for the "
+                    "same lift.")
+        _ins_metric("Wind Speed", f"{float(m.get('wind_mps', 0.0)):.2f} m/s",
+                    "Wind does not change power at a given AIRSPEED; it "
+                    "changes the ground track and therefore range.")
+        _ins_metric("Head / Cross Wind",
+                    f"{float(m.get('wind_head_mps', 0.0)):.2f} / "
+                    f"{float(m.get('wind_cross_mps', 0.0)):.2f} m/s",
+                    "Headwind is positive when it opposes the course. "
+                    "Crosswind is spent crabbing and buys no progress.")
+        _ins_metric("Air Density", f"{rho:.4f} kg/m³  ({rho_drop:+.1f}% vs ISA sea level)",
+                    "The single number that sets both wing and propeller "
+                    "performance.")
         _ins_metric("ISA Sea Level Density", f"{rho_sl:.4f} kg/m³")
         # Approximate density altitude from ISA
         try:
@@ -5650,6 +6674,63 @@ def launch_gui():
         out_text.configure(state="disabled")
 
     # ---- Build config from GUI ----
+    def _battery_total_mass_g():
+        """
+        Mass of the whole pack assembly, not of one cell or one pack.
+
+        The weight fields describe a single unit; the aircraft carries
+        series x parallel of them. Using the raw field understated the
+        battery and let impossible mass combinations pass validation.
+        """
+        units = (max(int(safe_float(v_batt_series.get(), 1)), 1)
+                 * max(int(safe_float(v_batt_parallel.get(), 1)), 1))
+        if str(v_batt_unit_mode.get()).strip().lower().startswith("cell"):
+            return safe_float(v_batt_cell_wt.get(), 0.0) * units
+        return safe_float(v_batt_pack_wt.get(), 0.0) * units
+
+    def _resolve_aircraft_mass():
+        """
+        All-up weight without payload, from whichever mass mode is set.
+
+        "derive airframe" takes the total as given and lets the airframe
+        mass fall out as the residual in the weight budget.
+        "enter airframe" does the reverse: the user gives the bare
+        structure and the total is built up from the components, so a
+        parts-list design does not require pre-computing the total.
+        """
+        if not str(v_mass_mode.get()).strip().lower().startswith("enter"):
+            total = safe_float(v_weight.get(), 2500)
+
+            # In "derive airframe" mode the airframe mass is the RESIDUAL
+            # after components are subtracted. If the components already
+            # exceed the all-up weight, the residual is negative — an
+            # impossible aircraft, not a slightly-wrong one. Refuse rather
+            # than reporting performance for a structure of negative mass.
+            n = max(int(safe_float(v_num_motors.get(), 1)), 1)
+            components = ((safe_float(v_motor_wt.get(), 0.0)
+                           + safe_float(v_prop_wt.get(), 0.0)
+                           + safe_float(v_esc_wt.get(), 0.0)) * n
+                          + _battery_total_mass_g()
+                          + safe_float(v_avionics_mass.get(), 0.0))
+            if components > total:
+                raise ValueError(
+                    f"The components already weigh {components:.0f} g, which is "
+                    f"more than the {total:.0f} g all-up weight without "
+                    f"payload.\n\nThat leaves {total - components:.0f} g for "
+                    f"the airframe, which is impossible. Either raise the "
+                    f"all-up weight, reduce the component masses, or switch "
+                    f"Mass Entry Mode to 'enter airframe' and give the "
+                    f"structure mass directly.")
+            return total
+        n = max(int(safe_float(v_num_motors.get(), 1)), 1)
+        per_motor = (safe_float(v_motor_wt.get(), 0.0)
+                     + safe_float(v_prop_wt.get(), 0.0)
+                     + safe_float(v_esc_wt.get(), 0.0))
+        return (safe_float(v_airframe_mass.get(), 0.0)
+                + per_motor * n
+                + _battery_total_mass_g()
+                + safe_float(v_avionics_mass.get(), 0.0))
+
     def build_config() -> FixedWingConfig:
         alt  = safe_float(v_altitude.get(), 0.0)
         temp = parse_float("Temp", v_temp.get())
@@ -5748,10 +6829,14 @@ def launch_gui():
             battery             = batt,
             motor               = motor,
             propeller           = prop,
-            aircraft_weight_g   = safe_float(v_weight.get(), 2500),
+            aircraft_weight_g   = _resolve_aircraft_mass(),
             payload_mass_g      = max(safe_float(v_payload_mass.get(), 0.0), 0.0),
             cruise_speed_mps    = safe_float(v_cruise_speed.get(), 18.0),
             periph_current_A    = safe_float(v_periph_cur.get(), 0.0),
+            avionics_mass_g     = safe_float(v_avionics_mass.get(), 0.0),
+            airframe_mass_g     = (safe_float(v_airframe_mass.get(), 0.0)
+                                   if str(v_mass_mode.get()).strip().lower().startswith("enter")
+                                   else 0.0),
             esc                 = esc,
             avionics            = avionics,
             air_density         = rho,
@@ -5831,6 +6916,9 @@ def launch_gui():
             # Needed by the Sensitivity tab, which re-evaluates this point.
             _last_run["speed"]   = V_cruise
             _last_run["from_mission"] = False
+            _set_result_scope(False)
+            _set_sensitivity_outputs(False)
+            _clear_sensitivity("Fixed speed sweep re-run — sensitivity is out of date")
             _last_run["metrics"] = m
             _last_run["wind"]    = wind_speed
 
@@ -5861,7 +6949,14 @@ def launch_gui():
                 "Speed (m/s)":           _sp_vs,
                 "Flight Time (min)":     [flight_time_min(cfg, v) for v in _sp_vs],
                 "Range (km)":            [flight_range_km(cfg, v) for v in _sp_vs],
-                "Power Required (W)":    [power_required_W(cfg, v) for v in _sp_vs],
+                # #21 both power curves the panel now draws, so a column in
+                # the file corresponds to a curve on screen.
+                "Power Electrical (W)":  [power_required_W(cfg, v) for v in _sp_vs],
+                "Power Mechanical (W)":  [power_required_W(cfg, v)
+                                          * max(float(cfg.airframe.prop_efficiency), 0.05)
+                                          for v in _sp_vs],
+                "Thrust Required (N)":   [drag_N(cfg, v) for v in _sp_vs],
+                "Thrust Available (N)":  [thrust_available_N(cfg, v) for v in _sp_vs],
                 "Drag (N)":              [drag_N(cfg, v) for v in _sp_vs],
                 "Induced Drag (N)":      [drag_components_N(cfg, v)[0] for v in _sp_vs],
                 "Parasitic Drag (N)":    [drag_components_N(cfg, v)[1] for v in _sp_vs],
@@ -5872,10 +6967,12 @@ def launch_gui():
             })
             _last_run_cfg[0] = cfg
             update_weight_budget(cfg)
+            update_power_budget(cfg, m)
             _refresh_airframe_diagram(cfg)
             refresh_comparison()
+            _clear_mission_plots_panel()   # #18
 
-            log(f"=== Fixed-Wing Single-Point @ {V_cruise:.1f} m/s ({V_cruise*3.6:.1f} km/h) ===")
+            log(f"=== Fixed-Wing Fixed Speed Run @ {V_cruise:.1f} m/s ({V_cruise*3.6:.1f} km/h) ===")
             log(f"Stall Speed   : {V_stall:.1f} m/s")
             log(f"Turn Stall    : {m.get('stall_speed_turn_mps',0):.1f} m/s @ {bank_deg:.1f}° bank")
             log(f"Wind Components: head {headwind:+.1f} m/s, cross {crosswind:+.1f} m/s")
@@ -5954,16 +7051,52 @@ def launch_gui():
 
             # Stash series for Mission Plots tab
             last_mission_series[0] = series
+            _clear_fixed_speed_plots()     # #17
+
+            # #21 exports follow the run: after a mission the CSV/Excel should
+            # carry the mission history that Mission Plots shows, not the
+            # speed sweep from some earlier run.
+            _last_run_sweep.clear()
+            for _k, _v in (series or {}).items():
+                if isinstance(_v, list) and _v:
+                    _last_run_sweep[_k] = list(_v)
 
             # Populate status with worst-case metrics
             if worst_m:
                 update_status(cfg, worst_m)
+                _set_result_scope(True)
+                # The mission path never refreshed the Compare tab, so a
+                # pinned baseline sat there unchanged while the run behind it
+                # moved — every delta read +0.00 no matter what was altered.
+                # The multicopter had this same fault and it was fixed in
+                # v2.16.0; the fix was never carried across.
+                # Store the result BEFORE refreshing: the comparison reads
+                # _last_run["metrics"], so refreshing first compared the new
+                # baseline against the PREVIOUS run's numbers and every delta
+                # came out zero.
                 _last_run["metrics"] = dict(worst_m)
                 _last_run["from_mission"] = True
+                refresh_comparison()
+                _set_sensitivity_outputs(True)
+                _clear_sensitivity("Mission re-run — sensitivity is out of date")
+                # Everything the sensitivity sweep needs to re-fly this exact
+                # mission with a perturbed configuration.
+                _last_run["mission"] = mission
+                _last_run["mission_args"] = {
+                    "wind_mps": wind,
+                    "temperature_C": float(temp) if temp else None,
+                    "pressure_Pa": float(pres) if pres else None,
+                }
 
             # Rebuild metrics from worst-case point
             if worst_m:
-                update_metrics(cfg, worst_m)
+                # Status shows the WORST value each check reached; Metrics
+                # shows the LAST evaluated instant. Feeding Metrics the
+                # worst-case dict presents a point the aircraft never flew,
+                # because each field's worst moment happens at a different
+                # time.
+                _last_inst = (worst_m or {}).get("_last_instant") or {}
+                update_metrics(cfg, _last_inst if _last_inst else worst_m)
 
             max_v = safe_float(v_max_v_plot.get(), 40.0)
             _last_run["cfg"]   = cfg
@@ -5972,22 +7105,15 @@ def launch_gui():
 
             _last_run_cfg[0] = cfg
             update_weight_budget(cfg)
-            fig = make_performance_figure(
-                cfg, max_speed=max_v,
-                figsize=(_view["plot_w"], _view["plot_h"]))
-            # Generate motor operating point figure if available
-            motor_fig = None
-            if cfg.propeller.table is not None and worst_m:
-                try:
-                    motor_fig = make_motor_operating_point_figure(cfg, worst_m, figsize=(_view["plot_w"], 6))
-                except Exception:
-                    pass
-            # Display both figures
-            if motor_fig:
-                show_figure([fig, motor_fig])
-            else:
-                show_figure(fig)
-            display_nb.select(tab_plots)
+            # A mission produces no fixed speed sweep and no single operating
+            # point, so both those tabs are emptied with a note. Drawing the
+            # sweep here anyway implied the mission generated it.
+            _clear_fixed_speed_plots()
+            clear_power_budget(
+                "Mission run — no single operating point to break down")
+            # No sweep figure is built for a mission, and the run lands on
+            # Mission Plots rather than an empty Fixed Speed Plots tab.
+            display_nb.select(tab_mission_plots)
 
             import os as _os
             log(f"=== Fixed-Wing Mission: {_os.path.basename(mission_path)} ===")
@@ -6017,11 +7143,26 @@ def launch_gui():
     _last_run_cfg   = [None]
 
     def _get_metrics_rows() -> list:
+        """
+        Read every row from the metrics Treeview, headers AND their children.
+
+        Since the metrics became collapsible sections, `get_children()` on the
+        root returns only the section headings — so the report was printing
+        the group titles with none of the numbers under them. Walk the tree.
+        """
         rows = []
-        for iid in metrics_tv.get_children():
-            vals = metrics_tv.item(iid, "values")
+        for section in metrics_tv.get_children(""):
+            vals = metrics_tv.item(section, "values")
             if vals and len(vals) >= 2:
                 rows.append((str(vals[0]), str(vals[1])))
+            for child in metrics_tv.get_children(section):
+                cvals = metrics_tv.item(child, "values")
+                if cvals and len(cvals) >= 2:
+                    # Fold the note in with the value so the report carries
+                    # the explanation without needing a third column.
+                    note = str(cvals[2]) if len(cvals) > 2 else ""
+                    value = str(cvals[1]) + (f"  — {note}" if note else "")
+                    rows.append((str(cvals[0]), value))
         return rows
 
     def _get_status_sections() -> list:
@@ -6152,7 +7293,7 @@ def launch_gui():
     btn_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
     btn_frame.columnconfigure(2, weight=1)  # spacer
 
-    ttk.Button(btn_frame, text="▶  Run Single-Point",
+    ttk.Button(btn_frame, text="▶  Run Fixed Speed Sweep",
                command=run_single_point).grid(row=0, column=0, padx=(0, 6), pady=4)
     ttk.Button(btn_frame, text="🗺  Run Mission (JSON)",
                command=run_mission).grid(row=0, column=1, padx=(0, 6), pady=4)

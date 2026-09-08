@@ -1,8 +1,6 @@
 {
-  "_comment": "Simplest possible mission: climb to 30 m, hover 8 minutes, land. Use this to check pure hover endurance against your battery reserve.",
+  "_comment": "Simplest possible mission: climb to 30 m, hover 8 minutes, land. Use this to check pure hover endurance against your battery reserve. Reserve is a percentage of USABLE energy and should cover landing, return-to-home and any diversion.",
   "reserve_percent": 20,
-  "rth_reserve_Wh": 0,
-  "diversion_reserve_Wh": 0,
   "wind_direction_deg": 0,
   "transient_dt_s": 0.5,
   "max_accel_mps2": 2.0,

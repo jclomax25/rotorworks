@@ -263,7 +263,7 @@ def _load_and_run(gui, config_path, table_path):
     errors = gui.click("Load Config")
     assert errors == [], f"loading {os.path.basename(config_path)}: {errors[:1]}"
     _set_prop_table(gui, table_path)
-    return gui.click("Single-Point")
+    return gui.click("Fixed Speed Sweep")
 
 
 @pytest.mark.parametrize("with_table", [False, True], ids=["no-table", "table"])

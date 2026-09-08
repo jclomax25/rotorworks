@@ -1,8 +1,6 @@
 {
-  "_comment": "Mapping mission: 3 km transit, four 2 km survey lines, 3 km home. Carries both a 15 Wh return-to-home and a 10 Wh diversion reserve on top of 25%.",
-  "reserve_percent": 25,
-  "rth_reserve_Wh": 15,
-  "diversion_reserve_Wh": 10,
+  "_comment": "Mapping mission: 3 km transit, four 2 km survey lines, 3 km home. Carries both a 15 Wh return-to-home and a 10 Wh diversion reserve on top of 25%. Reserve is 35% of USABLE energy, which replaces the old '25% plus 15 Wh RTH and 10 Wh diversion' \u2014 the separate reserve fields were removed in v2.19.0 and one percentage now covers landing, return-to-home and diversion.",
+  "reserve_percent": 35,
   "wind_direction_deg": 225,
   "phases": [
     {

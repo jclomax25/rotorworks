@@ -1,8 +1,6 @@
 {
-  "_comment": "ISR-style profile: transit 10 km out, loiter on station for 30 minutes in a 20-degree banked orbit at best-endurance speed, then transit home. Loiter speed is deliberately slower than cruise.",
-  "reserve_percent": 25,
-  "rth_reserve_Wh": 20,
-  "diversion_reserve_Wh": 0,
+  "_comment": "ISR-style profile: transit 10 km out, loiter on station for 30 minutes in a 20-degree banked orbit at best-endurance speed, then transit home. Loiter speed is deliberately slower than cruise. Reserve is 35% of USABLE energy, which replaces the old '25% plus a 20 Wh return-to-home' \u2014 the separate reserve fields were removed in v2.19.0 and one percentage now covers landing, return-to-home and diversion.",
+  "reserve_percent": 35,
   "wind_direction_deg": 180,
   "phases": [
     {

@@ -349,46 +349,46 @@
     "disk_loading_N_m2": 57.500839,
     "esc_loss_W": 0.0,
     "figure_of_merit": 0.617185,
-    "flight_time_min": 53.225417,
+    "flight_time_min": 52.435097,
     "hover_efficiency_gW": 12.676866,
-    "motor_power_W": 618.456323,
+    "motor_power_W": 628.112517,
     "motor_temp_est_C": 25.0,
-    "pack_current_A": 12.88944,
+    "pack_current_A": 13.086516,
     "thrust_per_motor_N": 14.129459,
     "thrust_total_N": 113.035674,
     "tilt_required_deg": 3.580771,
-    "total_power_W": 640.656323,
-    "v_load_V": 49.70397
+    "total_power_W": 650.312517,
+    "v_load_V": 49.693328
   },
   "mc/x8_12s_coaxial/forward@18.0": {
     "disk_loading_N_m2": 57.500839,
     "esc_loss_W": 0.0,
     "figure_of_merit": 0.617185,
-    "flight_time_min": 37.909792,
+    "flight_time_min": 37.534641,
     "hover_efficiency_gW": 12.676866,
-    "motor_power_W": 877.28264,
+    "motor_power_W": 886.272787,
     "motor_temp_est_C": 25.0,
-    "pack_current_A": 18.20185,
+    "pack_current_A": 18.387504,
     "thrust_per_motor_N": 14.388808,
     "thrust_total_N": 115.110465,
     "tilt_required_deg": 11.461459,
-    "total_power_W": 899.48264,
-    "v_load_V": 49.4171
+    "total_power_W": 908.472787,
+    "v_load_V": 49.407075
   },
   "mc/x8_12s_coaxial/forward@5.0": {
     "disk_loading_N_m2": 57.500839,
     "esc_loss_W": 0.0,
     "figure_of_merit": 0.617185,
-    "flight_time_min": 44.848749,
+    "flight_time_min": 43.851122,
     "hover_efficiency_gW": 12.676866,
-    "motor_power_W": 738.115523,
+    "motor_power_W": 755.412939,
     "motor_temp_est_C": 25.0,
-    "pack_current_A": 15.337673,
+    "pack_current_A": 15.692678,
     "thrust_per_motor_N": 14.103601,
     "thrust_total_N": 112.828805,
     "tilt_required_deg": 0.896287,
-    "total_power_W": 760.315523,
-    "v_load_V": 49.571766
+    "total_power_W": 777.612939,
+    "v_load_V": 49.552595
   },
   "mc/x8_12s_coaxial/hover@0.0": {
     "disk_loading_N_m2": 57.500839,
@@ -406,9 +406,9 @@
     "v_load_V": 49.383762
   },
   "mc/x8_12s_coaxial/optimal": {
-    "best_endurance_min": 53.2531,
+    "best_endurance_min": 52.4875,
     "best_endurance_speed": 10.5,
-    "best_range_km": 41.9033,
+    "best_range_km": 41.4526,
     "best_range_speed": 16.0
   }
 }
