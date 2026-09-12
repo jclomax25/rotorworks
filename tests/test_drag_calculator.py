@@ -455,3 +455,75 @@ def test_reference_iris_bcoef_is_in_the_expected_band(dc):
 #   difference of the overlapping lobes rather than the enclosed area, and
 #   nothing detects it. A user who crosses their own trace gets a wrong
 #   number with no warning. Worth fixing before it matters.
+
+
+# ======================================================================
+# SELF-INTERSECTION DETECTION
+# ======================================================================
+
+def test_simple_outlines_are_not_flagged(dc):
+    """Ordinary traces must pass, including concave airframe silhouettes."""
+    assert not dc.polygon_self_intersects([(0, 0), (10, 0), (10, 10), (0, 10)])
+    assert not dc.polygon_self_intersects([(0, 0), (10, 0), (5, 8)])
+    # L-shape: concave, but never crosses itself.
+    assert not dc.polygon_self_intersects(
+        [(0, 0), (10, 0), (10, 5), (5, 5), (5, 10), (0, 10)])
+    # A many-sided convex outline, like a carefully traced body.
+    circle = [(100 * math.cos(2 * math.pi * i / 24),
+               100 * math.sin(2 * math.pi * i / 24)) for i in range(24)]
+    assert not dc.polygon_self_intersects(circle)
+
+
+def test_crossed_outlines_are_caught(dc):
+    """
+    The cases that matter: a bowtie from clicking two corners in the wrong
+    order, a figure-eight from tracing booms out of sequence, and a trace that
+    doubles back along an edge it already walked.
+    """
+    assert dc.polygon_self_intersects([(0, 0), (10, 10), (10, 0), (0, 10)])
+    assert dc.polygon_self_intersects(
+        [(0, 0), (4, 4), (8, 0), (8, 4), (4, 0), (0, 4)])
+    assert dc.polygon_self_intersects([(0, 0), (10, 0), (5, 0), (5, 5)])
+
+
+def test_a_bowtie_reports_zero_area_which_is_why_this_check_exists(dc):
+    """
+    The motivating case. A bowtie's two lobes have equal and opposite signed
+    area, so the shoelace sum is exactly 0.0 — a clean-looking number with no
+    hint that anything went wrong. Without the check it would flow straight
+    into BCOEF and then into the simulator.
+    """
+    bowtie = [(0, 0), (10, 10), (10, 0), (0, 10)]
+    assert dc.polygon_area_px2(bowtie) == pytest.approx(0.0)
+    assert dc.polygon_self_intersects(bowtie), \
+        "the one shape whose wrong answer looks most reasonable must be caught"
+
+
+def test_shapes_too_small_to_cross_are_not_flagged(dc):
+    """A triangle cannot self-intersect, and neither can a partial trace."""
+    for pts in ([], [(0, 0)], [(0, 0), (1, 1)], [(0, 0), (1, 0), (0, 1)]):
+        assert not dc.polygon_self_intersects(pts)
+
+
+def test_adjacent_edges_are_not_treated_as_crossings(dc):
+    """
+    Consecutive edges share a vertex by construction, and the closing edge
+    shares one with the first. Counting either as an intersection would flag
+    every valid polygon ever traced.
+    """
+    for n in (4, 5, 8, 16):
+        regular = [(math.cos(2 * math.pi * i / n), math.sin(2 * math.pi * i / n))
+                   for i in range(n)]
+        assert not dc.polygon_self_intersects(regular), \
+            f"a regular {n}-gon was wrongly flagged"
+
+
+def test_detection_is_independent_of_winding_and_start_vertex(dc):
+    """Crossing is a property of the shape, not of how it was clicked."""
+    bowtie = [(0, 0), (10, 10), (10, 0), (0, 10)]
+    assert dc.polygon_self_intersects(list(reversed(bowtie)))
+    assert dc.polygon_self_intersects(bowtie[2:] + bowtie[:2])
+
+    square = [(0, 0), (10, 0), (10, 10), (0, 10)]
+    assert not dc.polygon_self_intersects(list(reversed(square)))
+    assert not dc.polygon_self_intersects(square[2:] + square[:2])

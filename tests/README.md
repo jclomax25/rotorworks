@@ -1,6 +1,6 @@
 # Test suite
 
-483 tests covering the shared core, physics, the CLI, the GUI, the batch
+489 tests covering the shared core, physics, the CLI, the GUI, the batch
 driver, the VTOL simulator, and a full config/mission coverage matrix.
 
 Almost every test here corresponds to a bug that was actually shipped. The
@@ -50,7 +50,7 @@ safe to run.
 | `test_cli.py` | 67 | ~3 min | Real subprocess runs: every argument path, every example mission, edge cases, malformed input |
 | `test_gui.py` | 46 | ~4 min | Real Tk window: hover events, mode toggle, config load, missions, exports, diagram, sensitivity, comparison |
 | `test_matrix.py` | 83 | ~4 min | Every config and mission x GUI and CLI x with and without a propeller table |
-| `test_drag_calculator.py` | 25 | ~1 s | Shoelace geometry, pixel scaling, ISA density, ArduPilot BCOEF and MCOEF |
+| `test_drag_calculator.py` | 31 | ~1 s | Shoelace geometry, self-intersection detection, pixel scaling, ISA density, ArduPilot BCOEF and MCOEF |
 | `test_batch.py` | 20 | ~2.5 min | Sweeps, sizing, mode enforcement, GUI-config translation, GUI↔CLI consistency |
 
 ### Marks

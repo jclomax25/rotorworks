@@ -20,6 +20,104 @@ rails**, **status limit checks**, and **plots** including mission time-series.
 
 ---
 
+## Setup
+
+### 1. Clone
+
+```bash
+git clone <your-repo-url> rotorworks
+cd rotorworks
+```
+
+### 2. Create a virtual environment
+
+A venv keeps these dependencies out of your system Python, which matters here
+because matplotlib and numpy are easy to break globally.
+
+**Linux / macOS**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+**Windows (PowerShell)**
+
+```powershell
+py -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+If PowerShell blocks the activate script, either use `cmd` with
+`.venv\Scripts\activate.bat`, or allow it for this session:
+`Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned`.
+
+Your prompt should now start with `(.venv)`. Everything below assumes it is
+active; re-run the activate line in each new terminal.
+
+### 3. Install dependencies
+
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 4. tkinter — the one thing pip cannot install
+
+The GUIs use tkinter, which ships **with Python itself** rather than from PyPI.
+`pip install tkinter` does not work and is not a typo you have made.
+
+| Platform | What to do |
+|---|---|
+| **Windows** | Included in the python.org installer. If missing, re-run it and tick *tcl/tk and IDLE*. |
+| **macOS** | Included in the python.org build. Homebrew Python needs `brew install python-tk`. |
+| **Debian / Ubuntu** | `sudo apt install python3-tk` |
+| **Fedora / RHEL** | `sudo dnf install python3-tkinter` |
+| **Arch** | `sudo pacman -S tk` |
+
+Check it:
+
+```bash
+python -c "import tkinter; print('tkinter OK')"
+```
+
+The CLI and the batch driver work without tkinter; only the GUIs need it.
+
+### 5. Verify the install
+
+```bash
+python multicopter-power-sim-gui.py --gui
+```
+
+Or without a display, straight from an example config:
+
+```bash
+python rotorworks-batch.py sweep --sim multicopter \
+    --gui-config examples/configs/multicopter_450_survey_4S.json \
+    --sweep-var speed --values 10
+```
+
+A line ending `rc=0` with a flight time means everything is wired up.
+
+### 6. Run the tests (optional)
+
+```bash
+pip install pytest
+pytest -m "not slow"        # physics only, ~10 seconds
+pytest                      # everything, ~15 minutes
+```
+
+On a headless machine the GUI tests need a virtual display — `xvfb-run -a
+pytest` on Linux. Without one they skip themselves rather than fail.
+
+### Keeping files together
+
+`rotorworks_core.py` must sit **in the same directory** as the simulators;
+they import it by path, not from the installed packages. Moving a simulator
+somewhere else without it will fail at startup.
+
+---
+
 ## Contents
 
 - [Requirements](#requirements)

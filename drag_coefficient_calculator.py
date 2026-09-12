@@ -351,6 +351,12 @@ class ViewCanvas(ttk.Frame):
         self._st_area.configure(text=area)
 
     def _area_str(self) -> str:
+        # A crossed trace still produces a number — for a bowtie it is
+        # exactly 0.0 — so the warning has to sit next to the value.
+        if self._polygon_closed and len(self._vertices) >= 4 \
+                and polygon_self_intersects(self._vertices):
+            return "!! outline crosses itself — area unreliable"
+
         """Format the current polygon area for display."""
         a = self.get_area_m2()
         if a is None:
@@ -699,6 +705,18 @@ class ViewCanvas(ttk.Frame):
     # ------------------------------------------------------------------
     # PUBLIC API
     # ------------------------------------------------------------------
+    def self_intersects(self) -> bool:
+        """
+        Has this trace crossed itself?
+
+        Reported rather than corrected: only the user knows what the outline
+        was meant to be, so the tool says the measurement is unreliable and
+        leaves the fix to them.
+        """
+        if not self._polygon_closed or len(self._vertices) < 4:
+            return False
+        return polygon_self_intersects(self._vertices)
+
     def get_area_m2(self) -> Optional[float]:
         """
         Return the measured polygon area in m².
@@ -917,6 +935,28 @@ class BodyDragTab(ttk.Frame):
             messagebox.showwarning("Incomplete data",
                 "Cannot calculate — please complete:\n"
                 + "\n".join(f"  • {m}" for m in missing))
+            return
+
+        # A crossed outline still yields a number, and the shoelace formula
+        # gives no hint that it is wrong — a bowtie comes out as exactly
+        # 0.0 m². Refuse rather than hand back a plausible figure, because
+        # every result downstream (BCOEF, parasite area, the simulator's drag)
+        # inherits the error silently.
+        crossed = [name for name, view in (("Front", self.front),
+                                           ("Side", self.side),
+                                           ("Top", self.top))
+                   if view is not None and view.self_intersects()]
+        if crossed:
+            messagebox.showerror(
+                "Outline crosses itself",
+                "The traced outline crosses itself on: "
+                + ", ".join(crossed) + ".\n\n"
+                "The area formula assumes a simple outline. Given a crossed "
+                "one it returns the difference between the overlapping lobes "
+                "rather than the enclosed area — for a figure-eight that is "
+                "exactly zero — and nothing about the number looks wrong.\n\n"
+                "Re-trace the affected view, clicking the outline in order "
+                "around its edge without doubling back.")
             return
 
         # --- Compute ---
