@@ -25,7 +25,7 @@ rails**, **status limit checks**, and **plots** including mission time-series.
 ### 1. Clone
 
 ```bash
-git clone git@github.com:jclomax25/rotorworks.git
+git clone https://github.com/jclomax25/rotorworks.git
 cd rotorworks
 ```
 
