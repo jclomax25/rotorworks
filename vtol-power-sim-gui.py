@@ -59,7 +59,7 @@ except ImportError as _exc:      # pragma: no cover - install/deploy problem
         f"folder as this script.\nOriginal error: {_exc}"
     )
 
-SIM_VERSION = "0.9.0"
+SIM_VERSION = "1.1.0"
 SIM_BUILD_NOTE = "VTOL simulator - lift+cruise, tiltrotor, tiltwing, tailsitter"
 
 G0 = core.G0
@@ -1111,16 +1111,34 @@ class VTOLMission:
 def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
                      wind_mps: float = 0.0, wind_direction_deg: float = 0.0,
                      max_accel_mps2: float = 0.0, max_decel_mps2: float = 0.0,
-                     regen_eff: float = 0.0, transient_dt_s: float = 0.25) -> Tuple[List[tuple], Dict[str, float]]:
+                     regen_eff: float = 0.0,
+                     transient_dt_s: float = 0.25) -> Tuple[List[tuple], Dict[str, float]]:
     """
-    Fly the mission phase by phase, draining the pack.
+    Fly the mission by integrating it in time, as the multicopter and
+    fixed-wing do.
 
-    Transitions are integrated across their speed range rather than charged at
-    a single point, because power varies steeply through them — that is the
-    whole reason the transition matters to a VTOL's energy budget.
+    Every phase runs through ONE loop that steps `transient_dt_s` at a time
+    and, at each step, ramps the speed toward the phase's target within the
+    acceleration limit, moves the altitude toward the phase's target at the
+    commanded climb or descent rate, charges the power for the speed and
+    climb actually flown, and adds the kinetic cost of any speed change.
+
+    The phase-level model this replaces evaluated each phase at a single
+    operating point and layered special cases on top — sub-steps for
+    transitions, a lead-in for cruise legs, a separate branch for hovering in
+    wind. Those cases could and did disagree with each other: a transition
+    paid for accelerating while a cruise leg did not, and a leg that could
+    not reach its speed overshot its own distance. Stepping everything
+    through one loop removes the category rather than adding more cases.
+
+    What this buys beyond tidiness: pack voltage sags WITHIN a leg as the
+    state of charge falls, so a long cruise ends drawing more current than it
+    began, and a leg terminates exactly when its distance is covered rather
+    than when an averaged speed says it should.
     """
     _require_implemented(cfg)
 
+    dt = max(float(transient_dt_s or 0.25), 0.01)
     usable_Wh = cfg.battery.usable_Wh
     reserve_Wh = usable_Wh * mission.reserve_percent / 100.0
     remaining_Wh = usable_Wh
@@ -1129,12 +1147,7 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
     totals = {"time_s": 0.0, "distance_m": 0.0, "energy_Wh": 0.0,
               "hover_Wh": 0.0, "transition_Wh": 0.0, "cruise_Wh": 0.0}
 
-    # A time series for Mission Plots and the altitude trace, plus the worst
-    # value every check reaches (for Status) and the last instant flown (for
-    # Metrics). Kept inside `totals` so the (results, totals) return shape
-    # every existing caller relies on does not change.
     vnom = max(cfg.battery.vnom_pack, 1e-9)
-    # Wind changes GROUND progress, not the air the aircraft flies through.
     wind_mps = max(float(wind_mps or 0.0), 0.0)
     series: Dict[str, list] = {k: [] for k in (
         "t_s", "phase", "kind", "airspeed_mps", "altitude_m", "distance_km",
@@ -1157,7 +1170,8 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
         series["c_rate"].append(current / max(cfg.battery.capacity_Ah, 1e-9))
         series["energy_remaining_Wh"].append(remaining_Wh)
         series["tilt_deg"].append(float((detail or {}).get("tilt_deg", 0.0)))
-        series["lift_share_wing"].append(float((detail or {}).get("lift_share_wing", 0.0)))
+        series["lift_share_wing"].append(
+            float((detail or {}).get("lift_share_wing", 0.0)))
         if power > worst["total_power_W"]:
             worst["total_power_W"] = power
             worst["peak_phase"] = name
@@ -1166,187 +1180,175 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
                               current / max(cfg.battery.capacity_Ah, 1e-9))
         worst["remaining_Wh"] = min(worst["remaining_Wh"], remaining_Wh)
 
+    depleted = False
     for phase in mission.phases:
-        alt_start = state["alt"]
-        # Reset per phase: only cruise legs run a transient lead-in, but the
-        # status line below is common to every phase.
-        overshoot_m = 0.0
         kind = phase.kind
+        alt_start = state["alt"]
+        alt_target = float(phase.altitude_m)
+
+        # --- what this phase is asking for ----------------------------
         if kind in ("hover", "climb", "descend"):
-            climb = phase.climb_rate_mps if kind == "climb" else 0.0
-            # Holding station in wind is not free: the aircraft must fly at
-            # the wind speed through the air to stay over one spot, so it
-            # carries that drag the whole time.
-            point = (power_at_airspeed(cfg, wind_mps) if wind_mps > 0.1
-                     else hover_power_W(cfg, climb_rate_mps=climb))
-            if wind_mps > 0.1 and climb > 0:
-                point = dict(point)
-                point["total_power_W"] += (cfg.weight_N * climb
-                                           / max(cfg.esc_efficiency, 1e-9))
-            duration = float(phase.duration_s or 0.0)
-            distance = 0.0
-            bucket = "hover_Wh"
-
+            # Holding station in wind means flying at the wind speed through
+            # the air — which is why a VTOL hovers more cheaply into a breeze.
+            target_v = wind_mps
         elif kind == "transition":
-            # Integrate from hover to the transition speed (or the reverse),
-            # which is where the power peak lives.
-            duration = float(phase.duration_s or mission.transition_time_s)
-            v_end = phase.airspeed_mps or transition_speed_mps(cfg)
-            steps = 20
-            energy_Ws = 0.0
-            distance = 0.0
-            # Integrate from the speed the aircraft is ACTUALLY at, not from
-            # zero. Both transitions used to sweep 0 -> v_end, so the landing
-            # transition was modelled as another acceleration and the kinetic
-            # cost was charged twice per round trip instead of once out and
-            # released on the way back.
-            v_start = state["v"]
-            for i in range(steps):
-                frac = (i + 0.5) / steps
-                v = v_start + (v_end - v_start) * frac
-                sub = power_at_airspeed(cfg, v)
-                dt = duration / steps
+            target_v = float(phase.airspeed_mps or transition_speed_mps(cfg))
+        else:
+            target_v = float(phase.airspeed_mps or cfg.cruise_speed_mps)
 
-                # The transition is not a quasi-static sweep through speeds:
-                # the aircraft is ACCELERATING from hover to flying speed,
-                # and that kinetic energy has to come from the pack. It was
-                # missing here while the cruise legs already paid it.
-                #
-                # It is not small. A 6 kg VTOL reaching 13.3 m/s needs 534 J,
-                # which over an 8 s transition is 67 W against a transition
-                # power around 300 W — a fifth of the bill.
-                #
-                # Decelerating back to hover releases it, scaled by regen_eff
-                # (zero by default, the honest figure for a fixed-pitch prop),
-                # which kinetic_power_term_W handles by sign.
-                v_prev = v_start + (v_end - v_start) * (i / steps)
-                v_next = v_start + (v_end - v_start) * ((i + 1) / steps)
-                # kinetic_power_term_W returns MECHANICAL power, so it pays
-                # the ESC like any other shaft power on its way from the pack.
-                kinetic = core.kinetic_power_term_W(
-                    cfg.all_up_weight_g, v_prev, v_next, dt, regen_eff=regen_eff)
-                p = max(sub["total_power_W"]
-                        + kinetic / max(cfg.esc_efficiency, 1e-9), 0.0)
-                energy_Ws += p * dt
-                distance += v * dt
-                state["t"] += dt
-                state["dist"] += v * dt
-                remaining_Wh -= p * dt / 3600.0
-                _record(phase.name, kind, v,
-                        alt_start + (phase.altitude_m - alt_start) * frac, p, sub)
-            # Undo the running totals: the common bookkeeping below applies
-            # the phase as a whole, and must not count it twice.
-            state["t"] -= duration
-            state["dist"] -= distance
-            remaining_Wh += energy_Ws / 3600.0
-            state["v"] = v_end
-            point = {"total_power_W": energy_Ws / max(duration, 1e-9)}
-            bucket = "transition_Wh"
+        climb_rate = float(phase.climb_rate_mps or 0.0) if kind == "climb" else 0.0
+        if kind == "descend" and alt_target < alt_start:
+            # Descent rate is implied by the phase duration when not given.
+            span = float(phase.duration_s or 0.0)
+            climb_rate = -((alt_start - alt_target) / span) if span > 0 else 0.0
 
-        else:                                   # cruise
-            v = phase.airspeed_mps or cfg.cruise_speed_mps
-            transient_m = 0.0
+        head, cross = core.wind_components_mps(
+            wind_mps, wind_direction_deg, phase.course_deg)
 
-            # Transient lead-in: the aircraft does not step from the previous
-            # leg's speed to this one. Accelerating costs power on top of
-            # steady drag, and that energy is real — a survey flown as short
-            # legs with a speed change at each end pays it many times over.
-            # Left at zero (the default) the leg behaves exactly as before.
-            if max_accel_mps2 > 0 and abs(v - state["v"]) > 1e-6:
-                # Decelerating is limited the same way unless told otherwise;
-                # a VTOL can pitch up harder than it can accelerate, but
-                # assuming so without data would flatter the model.
-                max_decel = max_decel_mps2 or max_accel_mps2
-                v_now = state["v"]
-                # Ground covered while getting up to speed counts TOWARD the
-                # leg, not on top of it. A 400 m leg that spends 120 m
-                # accelerating has 280 m left to fly, and forgetting that
-                # inflates both the distance and the energy.
-                transient_m = 0.0
-                guard = 0
-                while abs(v - v_now) > 1e-6 and guard < 2000:
-                    guard += 1
-                    # ramp_speed(current, target, dt, max_accel, max_decel)
-                    # and it returns (next_speed, acceleration).
-                    v_next, _accel = core.ramp_speed(
-                        v_now, v, transient_dt_s, max_accel_mps2, max_decel)
-                    sub = power_at_airspeed(cfg, max(v_next, 0.0))
-                    kinetic = core.kinetic_power_term_W(
-                        cfg.all_up_weight_g, v_now, v_next, transient_dt_s,
-                        regen_eff=regen_eff)
-                    p_now = max(sub["total_power_W"] + kinetic, 0.0)
-                    energy_Wh_transient = p_now * transient_dt_s / 3600.0
-                    remaining_Wh -= energy_Wh_transient
-                    totals["energy_Wh"] += energy_Wh_transient
-                    totals["cruise_Wh"] += energy_Wh_transient
-                    totals["time_s"] += transient_dt_s
-                    step_m = 0.5 * (v_now + v_next) * transient_dt_s
-                    transient_m += step_m
-                    totals["distance_m"] += step_m
-                    state["t"] += transient_dt_s
-                    state["dist"] += step_m
-                    _record(phase.name, "transient", v_next,
-                            alt_start, p_now, sub)
-                    v_now = v_next
-                state["v"] = v_now
+        distance_goal = (float(phase.distance_m)
+                         if (kind not in ("hover", "climb", "descend")
+                             and phase.distance_m is not None) else None)
+        if kind == "transition":
+            duration_goal = float(phase.duration_s or mission.transition_time_s)
+        elif distance_goal is None:
+            duration_goal = float(phase.duration_s or 0.0)
+        else:
+            duration_goal = None
 
-            point = power_at_airspeed(cfg, v)
-            # Power follows AIRSPEED; progress follows GROUNDSPEED. A leg
-            # measured over the ground therefore takes longer into a headwind
-            # and costs more energy for exactly the same track — which is the
-            # whole reason wind matters to a mission.
-            head, cross = core.wind_components_mps(
-                wind_mps, wind_direction_deg, phase.course_deg)
-            ground = max(core.groundspeed_along_track_mps(v, head, cross), 0.1)
-            point["headwind_mps"] = head
-            point["crosswind_mps"] = cross
-            point["groundspeed_mps"] = ground
-            if phase.distance_m is not None:
-                # Whatever the lead-in already covered comes off the leg. If
-                # it covered MORE than the leg is long, the aircraft could
-                # not reach its commanded speed inside that leg and has
-                # overshot — a real limit worth seeing rather than clamping
-                # away, so it is flagged in the phase status.
-                if transient_m > float(phase.distance_m) + 1e-9:
-                    overshoot_m = transient_m - float(phase.distance_m)
-                distance = max(float(phase.distance_m) - transient_m, 0.0)
-                duration = distance / ground
-            else:
-                duration = float(phase.duration_s or 0.0)
-                distance = ground * duration
-            bucket = "cruise_Wh"
+        max_decel = max_decel_mps2 or max_accel_mps2
+        # With no limit set, a phase reaches its speed at once — the old
+        # behaviour, and still the default.
+        accel_limit = max_accel_mps2 if max_accel_mps2 > 0 else 1e9
+        decel_limit = max_decel if max_decel > 0 else 1e9
 
-        if kind != "transition":
-            _record(phase.name, kind, float(point.get("airspeed_mps", 0.0)),
-                    alt_start, point["total_power_W"], point)
+        # --- step it ---------------------------------------------------
+        phase_t = 0.0
+        phase_m = 0.0
+        phase_Wh = 0.0
+        steps = 0
+        max_steps = 2_000_000
+        bucket = ("hover_Wh" if kind in ("hover", "climb", "descend")
+                  else "transition_Wh" if kind == "transition" else "cruise_Wh")
 
-        energy_Wh = point["total_power_W"] * duration / 3600.0
-        remaining_Wh -= energy_Wh
-        state["t"] += duration
-        state["dist"] += distance
-        state["alt"] = float(phase.altitude_m)
-        state["v"] = float(point.get("airspeed_mps", 0.0))
-        _record(phase.name, kind, state["v"], state["alt"],
-                point["total_power_W"], point)
-        totals["time_s"] += duration
-        totals["distance_m"] += distance
-        totals["energy_Wh"] += energy_Wh
-        totals[bucket] += energy_Wh
+        while steps < max_steps:
+            steps += 1
+            v_prev = state["v"]
+
+            # The last step of a phase is TRUNCATED so the leg ends exactly
+            # on its goal. Without this a distance leg overshoots by up to
+            # one step's worth of ground — 5001.5 m for a 5000 m leg — which
+            # is small per leg and compounds across a survey.
+            step_dt = dt
+            if duration_goal is not None:
+                step_dt = min(step_dt, max(duration_goal - phase_t, 0.0))
+            if distance_goal is not None:
+                v_peek, _a = core.ramp_speed(v_prev, target_v, step_dt,
+                                             accel_limit, decel_limit)
+                ground_peek = max(core.groundspeed_along_track_mps(
+                    v_peek, head, cross), 0.0)
+                if ground_peek > 1e-9:
+                    remaining_m = max(distance_goal - phase_m, 0.0)
+                    step_dt = min(step_dt, remaining_m / ground_peek)
+            if step_dt <= 1e-12:
+                break
+
+            v_next, _accel = core.ramp_speed(v_prev, target_v, step_dt,
+                                             accel_limit, decel_limit)
+
+            point = power_at_airspeed(cfg, max(v_next, 0.0))
+            power = float(point["total_power_W"])
+
+            # Climbing lifts the aircraft AND whatever download the rotors
+            # are still pushing onto it; descending gives nothing back,
+            # because a propeller is a poor brake and pretending otherwise
+            # would flatter the endurance.
+            if climb_rate > 0:
+                thrust = cfg.weight_N * (1.0 + hover_download_fraction(cfg))
+                power += thrust * climb_rate / max(cfg.esc_efficiency, 1e-9)
+
+            # The kinetic cost of the speed change, as mechanical power
+            # through the ESC. Decelerating releases it, scaled by regen_eff.
+            kinetic = core.kinetic_power_term_W(
+                cfg.all_up_weight_g, v_prev, v_next, step_dt, regen_eff=regen_eff)
+            power = max(power + kinetic / max(cfg.esc_efficiency, 1e-9), 0.0)
+
+            # Pack loss, charged against the CELLS rather than only shown in
+            # the Power Budget. This is what time-stepping buys: the terminal
+            # power above is what the aircraft needs, but the cells also have
+            # to cover their own I^2 R, and the current that causes it rises
+            # as the pack empties and its voltage falls.
+            soc = min(max(remaining_Wh / max(usable_Wh, 1e-9), 0.0), 1.0)
+            cell_v = (float(np.interp(soc, cfg.battery.soc_bp,
+                                      cfg.battery.ocv_cell_bp))
+                      if cfg.battery.soc_bp else cfg.battery.vnom_cell)
+            pack_v = max(cell_v * cfg.battery.series_cells, 1e-6)
+            pack_I = power / pack_v
+            r_scale = (float(np.interp(soc, cfg.battery.soc_bp,
+                                       cfg.battery.r_scale_bp))
+                       if getattr(cfg.battery, "r_scale_bp", None) else 1.0)
+            power += pack_I * pack_I * cfg.battery.pack_resistance * r_scale
+
+            ground = max(core.groundspeed_along_track_mps(v_next, head, cross), 0.0)
+            step_m = ground * step_dt
+            if distance_goal is not None:
+                # The truncated step is sized from a PEEK at the speed, and
+                # the speed actually reached differs by a hair, so the last
+                # step can still run a few millimetres past the mark. Clamp
+                # it: a leg must cover the distance it was asked for, not
+                # that plus rounding.
+                step_m = min(step_m, max(distance_goal - phase_m, 0.0))
+            step_Wh = power * step_dt / 3600.0
+
+            # Altitude moves at the commanded rate, stopping at the target.
+            if climb_rate > 0:
+                state["alt"] = min(state["alt"] + climb_rate * step_dt, alt_target)
+            elif climb_rate < 0:
+                state["alt"] = max(state["alt"] + climb_rate * step_dt, alt_target)
+
+            state["v"] = v_next
+            state["t"] += step_dt
+            state["dist"] += step_m
+            remaining_Wh -= step_Wh
+            phase_t += step_dt
+            phase_m += step_m
+            phase_Wh += step_Wh
+            _record(phase.name, kind, v_next, state["alt"], power, point)
+
+            if remaining_Wh < 0:
+                depleted = True
+                break
+            if distance_goal is not None:
+                if phase_m >= distance_goal - 1e-9:
+                    break
+            elif duration_goal is not None and phase_t >= duration_goal - 1e-9:
+                break
+            elif duration_goal is None and distance_goal is None:
+                break
+
+        # A phase ends on its own terms, so the altitude lands on target even
+        # if the commanded rate would not quite have got there.
+        state["alt"] = alt_target
+
+        totals["time_s"] += phase_t
+        totals["distance_m"] += phase_m
+        totals["energy_Wh"] += phase_Wh
+        totals[bucket] += phase_Wh
 
         status = "OK"
         if remaining_Wh < 0:
             status = "BATTERY DEPLETED"
         elif remaining_Wh < reserve_Wh:
             status = "RESERVE VIOLATION"
+        # A leg can now END before reaching its commanded speed, rather than
+        # overshooting its own distance to get there. Saying so is the point:
+        # the pattern is not flyable at that acceleration limit.
+        if abs(state["v"] - target_v) > 0.5 and not depleted:
+            status = (f"{status} — could not reach {target_v:.0f} m/s within "
+                      f"this leg (ended at {state['v']:.0f} m/s)")
 
-        if overshoot_m > 0:
-
-            status = f"{status} — could not reach {v:.0f} m/s within this leg; overshot by {overshoot_m:.0f} m"
-
-        results.append((phase.name, duration / 60.0, distance / 1000.0,
-                        point["total_power_W"], energy_Wh, status))
-
-        if remaining_Wh < 0:
+        results.append((phase.name, phase_t / 60.0, phase_m / 1000.0,
+                        phase_Wh * 3600.0 / max(phase_t, 1e-9), phase_Wh, status))
+        if depleted:
             break
 
     totals["remaining_Wh"] = remaining_Wh
@@ -1354,8 +1356,6 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
     totals["series"] = series
     worst["reserve_margin_Wh"] = worst["remaining_Wh"] - reserve_Wh
     totals["worst"] = worst
-    # The last instant flown, as full metrics, so the Metrics tab can show a
-    # real operating point rather than the worst-case composite.
     try:
         totals["last"] = compute_metrics(cfg, state["v"])
     except Exception:

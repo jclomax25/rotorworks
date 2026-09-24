@@ -1359,18 +1359,30 @@ def _legs_mission(vtol, tmp_path):
     return vtol.VTOLMission.from_json(str(path))
 
 
-def test_transients_cost_time_and_energy(vtol, tmp_path, aircraft):
+def test_transients_change_the_flight_without_changing_the_track(vtol, tmp_path, aircraft):
     """
-    Accelerating costs power on top of steady drag, and a mission of short
-    legs pays it at every speed change. Ignoring it makes a survey look
-    cheaper than it flies.
+    An acceleration limit makes the flight take LONGER over the same ground.
+
+    This test used to assert it also costs more energy. Time-stepping showed
+    that is not generally true, and the old model only made it look so by
+    charging a lead-in ON TOP of a full-speed leg. Once the ramp is part of
+    the leg, the aircraft spends that time at a lower speed — and a VTOL's
+    power rises steeply with speed, 138 W at 14 m/s against 430 W at 24 —
+    so flying slower for part of the leg can more than repay the kinetic
+    cost. On this pattern it does: 17.26 Wh becomes 16.90 Wh.
+
+    So the honest invariants are the track and the time, not the energy.
     """
     mission = _legs_mission(vtol, tmp_path)
     _r, instant = vtol.simulate_mission(aircraft, mission)
     _r, ramped = vtol.simulate_mission(aircraft, mission, max_accel_mps2=1.5)
 
-    assert ramped["time_s"] > instant["time_s"]
-    assert ramped["energy_Wh"] > instant["energy_Wh"]
+    assert ramped["time_s"] > instant["time_s"], \
+        "an acceleration limit must make the flight take longer"
+    assert ramped["distance_m"] == pytest.approx(instant["distance_m"], rel=1e-6), \
+        "the ground track must not change with the acceleration limit"
+    assert ramped["energy_Wh"] != pytest.approx(instant["energy_Wh"], rel=1e-6), \
+        "the transient had no effect on energy at all"
 
 
 def test_gentler_acceleration_costs_more_than_brisk(vtol, tmp_path, aircraft):
@@ -1424,15 +1436,26 @@ def test_transient_distance_counts_toward_the_leg(vtol, tmp_path, aircraft):
 def test_a_leg_too_short_to_reach_its_speed_is_flagged(vtol, tmp_path, aircraft):
     """
     At 1 m/s^2 an aircraft cannot slow from 24 to 14 m/s inside 60 m — it
-    needs about 190. The model reports the overshoot instead of quietly
-    clamping it, because an unflyable pattern is worth knowing about.
+    needs about 190.
+
+    Under the phase-level model the leg overshot its own distance to reach
+    the speed, and the status said so. Time-stepping fixed the cause: a leg
+    now ENDS when its distance is covered, so the aircraft simply arrives
+    still going too fast. That is the real behaviour, and the status reports
+    the speed it actually ended at.
     """
     mission = _legs_mission(vtol, tmp_path)
-    results, _totals = vtol.simulate_mission(aircraft, mission, max_accel_mps2=1.0)
-    flagged = [row[0] for row in results if "overshot" in str(row[-1])]
+    results, totals = vtol.simulate_mission(aircraft, mission, max_accel_mps2=1.0)
+
+    flagged = [row[0] for row in results if "could not reach" in str(row[-1])]
     assert flagged, "no leg flagged despite an impossible deceleration"
     assert all(name.startswith("Turn") for name in flagged), \
         f"the wrong legs were flagged: {flagged}"
+
+    # And the distance is now honest: the legs sum to what was asked for,
+    # rather than growing because a lead-in ran past the end of its leg.
+    asked_m = sum(p.distance_m or 0.0 for p in mission.phases)
+    assert totals["distance_m"] == pytest.approx(asked_m, rel=1e-6)
 
 
 def test_a_measured_soc_curve_outranks_the_chemistry_preset(vtol):
@@ -1524,10 +1547,15 @@ def test_the_transition_pays_for_its_acceleration(vtol, tmp_path, aircraft):
     assert quick > slow, \
         "a faster transition must draw more power — the kinetic term is missing"
 
-    # The gap should be roughly the kinetic energy spread over the two times.
+    # The gap is roughly the kinetic energy spread over the two times. The
+    # tolerance is wide because the pack's own I^2 R loss is charged per step
+    # and scales with the square of the current, so the quicker transition
+    # pays more than its share of that too — the gap is bounded below by the
+    # kinetic term, not equal to it.
     kinetic_J = 0.5 * (aircraft.all_up_weight_g / 1000.0) * 22.0 ** 2
     expected_gap = (kinetic_J / 8.0 - kinetic_J / 20.0) / aircraft.esc_efficiency
-    assert quick - slow == pytest.approx(expected_gap, rel=0.25)
+    assert quick - slow > expected_gap * 0.75
+    assert quick - slow < expected_gap * 2.0
 
 
 def test_a_landing_transition_is_not_charged_as_an_acceleration(vtol, tmp_path, aircraft):
@@ -1565,3 +1593,142 @@ def test_regen_applies_to_the_decelerating_transition_only(vtol, tmp_path, aircr
     assert out_regen[3] == pytest.approx(out_plain[3], rel=1e-9), \
         "regen changed the accelerating transition, where there is nothing to recover"
     assert back_regen[3] < back_plain[3], "regen did not reduce the deceleration"
+
+
+# ======================================================================
+# REAL AIRCRAFT — validated against published specifications
+# ======================================================================
+#
+# These two configs describe aircraft that exist and whose manufacturers
+# publish endurance figures, so the model can be checked against something
+# it did not choose. That is worth more than any number of self-consistent
+# examples: an invented aircraft can only confirm that the code is
+# self-consistent, never that it is right.
+#
+# Airframe-level specs (span, MTOW, payload, battery chemistry and
+# configuration, cruise speed, endurance) are published. Wing area, drag and
+# motor electrical parameters are NOT, and are marked as inferred in each
+# file. CD0 in particular is back-solved from the published endurance — so
+# these tests pin the CALIBRATION, and will fail if a physics change moves
+# the model away from the real aircraft.
+
+REAL_VTOLS = [
+    ("vtol_trinity_f90_lift_cruise.json", "lift+cruise", 90, 17.0),
+    ("vtol_wingtraone_gen2_tailsitter.json", "tailsitter", 59, 16.0),
+]
+
+
+def _load_vtol_config(vtol, filename, **overrides):
+    import json
+    path = os.path.join(ROOT, "examples", "configs", filename)
+    payload = json.load(open(path))
+    g = dict(payload["vars"])
+    g.update({k: str(x) for k, x in overrides.items()})
+
+    def f(key, default=0.0):
+        raw = str(g.get(key, "")).strip()
+        return float(raw) if raw else default
+
+    battery = vtol.VTOLBattery(
+        chemistry=g["chem"], cell_capacity_mAh=f("cell_cap"),
+        series_cells=int(f("series")), parallel_cells=int(f("parallel")),
+        cell_weight_g=f("cell_wt"), voltage_min=f("vmin"),
+        voltage_nominal=f("vnom"), voltage_max=f("vmax"),
+        resistance_cell_mOhm=f("rcell"), usable_percent=f("usable"),
+        discharge_c_cont=f("c_cont") or None, discharge_c_max=f("c_max") or None)
+    return vtol.VTOLConfig(
+        config_type=payload["config_type"], aircraft_weight_g=f("weight"),
+        payload_mass_g=f("payload"), wing_span_m=f("span"),
+        wing_area_m2=f("area"), CD0=f("cd0"), oswald=f("oswald"),
+        CL_max=f("clmax"), CL_cruise_max=f("clcruise"),
+        num_lift_rotors=int(f("n_lift")), lift_prop_diameter_in=f("lift_d"),
+        lift_prop_pitch_in=f("lift_p"), lift_motor_kv=f("lift_kv"),
+        lift_motor_resistance=f("lift_rm"), lift_motor_weight_g=f("lift_wt"),
+        lift_figure_of_merit=f("fom"), num_cruise_motors=int(f("n_cruise")),
+        cruise_prop_diameter_in=f("cruise_d"), cruise_prop_pitch_in=f("cruise_p"),
+        cruise_motor_kv=f("cruise_kv"), cruise_motor_resistance=f("cruise_rm"),
+        cruise_motor_weight_g=f("cruise_wt"),
+        cruise_prop_efficiency=f("cruise_eff"),
+        stopped_rotor_drag_area_m2=f("stopped_area") or None,
+        battery=battery, avionics_power_W=f("avionics"),
+        esc_efficiency=f("esc_eff"), cruise_speed_mps=f("cruise_v"),
+        reference_altitude_m=f("alt"))
+
+
+def _flight_time_to_reserve(vtol, cfg, cruise_v, tmp_path):
+    """Total flight time on a climb/transition/cruise/land profile."""
+    import json
+    path = tmp_path / "profile.json"
+    path.write_text(json.dumps({"reserve_percent": 15, "phases": [
+        {"name": "Climb", "kind": "climb", "duration": 45,
+         "climb_rate_mps": 2.5, "altitude": 110},
+        {"name": "Transition", "kind": "transition", "duration": 10,
+         "speed": cruise_v, "altitude": 110},
+        {"name": "Survey", "kind": "cruise", "duration": 10000,
+         "speed": cruise_v, "altitude": 110},
+        {"name": "Transition back", "kind": "transition", "duration": 10,
+         "speed": 0, "altitude": 110},
+        {"name": "Land", "kind": "descend", "duration": 45, "altitude": 0}]}))
+    _r, totals = vtol.simulate_mission(cfg, vtol.VTOLMission.from_json(str(path)))
+    series = totals["series"]
+    for i, left in enumerate(series["energy_remaining_Wh"]):
+        if left <= totals["reserve_Wh"]:
+            return series["t_s"][i] / 60.0
+    return totals["time_s"] / 60.0
+
+
+@pytest.mark.parametrize("filename,config_type,published_min,cruise_v", REAL_VTOLS)
+def test_real_aircraft_reproduce_published_endurance(
+        vtol, tmp_path, filename, config_type, published_min, cruise_v):
+    """
+    The model must land within 10% of what the manufacturer publishes, flying
+    a realistic profile down to a 15% reserve.
+
+    A wide band on purpose: the published figure is a marketing-grade number
+    for an unspecified payload and profile, so agreeing to the minute would
+    be luck rather than accuracy. What this catches is a physics change that
+    moves the model away from real aircraft by a lot.
+    """
+    cfg = _load_vtol_config(vtol, filename)
+    assert cfg.config_type == config_type
+
+    flown = _flight_time_to_reserve(vtol, cfg, cruise_v, tmp_path)
+    assert flown == pytest.approx(published_min, rel=0.10), (
+        f"{filename}: model flies {flown:.1f} min against a published "
+        f"{published_min} min")
+
+
+def test_the_trinity_glide_ratio_agrees_with_its_endurance(vtol):
+    """
+    Quantum-Systems publish BOTH a 90 min endurance and a 14:1 glide ratio.
+    They constrain the same drag, so a CD0 calibrated against one should land
+    near the other — and it does, which is the strongest evidence available
+    that the aerodynamics here are not merely self-consistent.
+
+    L/D_max = 0.5 * sqrt(pi * AR * e / CD0)
+    """
+    cfg = _load_vtol_config(vtol, "vtol_trinity_f90_lift_cruise.json")
+    aspect_ratio = cfg.wing_span_m ** 2 / cfg.wing_area_m2
+    ld_max = 0.5 * math.sqrt(math.pi * aspect_ratio * cfg.oswald / cfg.CD0)
+
+    # Published 14:1. L/D_max is an upper bound reached at the best-glide
+    # speed, so the model sitting a little above a quoted figure is expected;
+    # sitting below it, or far above, would not be.
+    assert 14.0 <= ld_max <= 20.0, f"L/D_max {ld_max:.1f} against a published 14:1"
+
+
+def test_a_tailsitter_is_draggier_than_a_clean_lift_cruise(vtol):
+    """
+    Calibrating both against their published endurance produced CD0 0.0235
+    for the Trinity and 0.033 for the WingtraOne — the tailsitter draggier by
+    40%. That is the right direction and roughly the right size: a tailsitter
+    carries a bluff body, exposed motor pods and landing feet into cruise,
+    where a clean pusher layout does not.
+
+    This is a sanity check on the CALIBRATION, not on the physics. If someone
+    re-tunes these files and the ordering flips, something is wrong with the
+    reasoning rather than the code.
+    """
+    trinity = _load_vtol_config(vtol, "vtol_trinity_f90_lift_cruise.json")
+    wingtra = _load_vtol_config(vtol, "vtol_wingtraone_gen2_tailsitter.json")
+    assert wingtra.CD0 > trinity.CD0 * 1.2

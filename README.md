@@ -1,7 +1,7 @@
 # RotorWorks UAV Power Simulators
 
 **UASforge / dronefoundry**  
-*Simulators v2.42.0*
+*Multicopter and fixed-wing v2.42.0 · VTOL v1.1.0*
 
 A suite of cross-platform UAV powertrain performance tools:
 
@@ -10,13 +10,16 @@ A suite of cross-platform UAV powertrain performance tools:
 | `rotorworks_core.py` | Shared code all simulators import — **must sit beside them** |
 | `multicopter-power-sim-gui.py` | Multicopter performance simulator (GUI + CLI) |
 | `fixedwing-power-sim-gui.py` | Fixed-wing performance simulator (GUI + CLI) |
-| `vtol-power-sim-gui.py` | VTOL simulator, lift+cruise (GUI + CLI) — **new, v0.1.0** |
+| `vtol-power-sim-gui.py` | VTOL simulator — lift+cruise, tiltrotor, tiltwing, tailsitter (GUI + CLI) |
 | `rotorworks-batch.py` | Batch driver: parameter sweeps, sizing studies, scripted runs |
 | `drag_coefficient_calculator.py` | Measures drag coefficients from photographs |
 
-All four support **single-point analysis**; the two simulators also support
-**mission simulation**, configurable **battery / motor / ESC / prop / avionics
-rails**, **status limit checks**, and **plots** including mission time-series.
+All three simulators support **single-point analysis** and **time-stepped
+mission simulation**, configurable **battery / motor / ESC / prop / avionics
+rails / wiring and connectors**, **status limit checks**, **measured
+propeller tables**, **sensitivity sweeps**, **design comparison**, and
+**plots** including mission time-series. They share the same tab layout, so
+moving between them means the same tabs answering the same questions.
 
 ---
 
@@ -124,6 +127,7 @@ somewhere else without it will fail at startup.
 - [Quick start](#quick-start)
 - [Simple vs Advanced mode](#simple-vs-advanced-mode)
 - [Example configs and missions](#example-configs-and-missions)
+- [VTOL simulator](#vtol-simulator)
 - [GUI reference](#gui-reference)
 - [CLI reference](#cli-reference)
 - [Batch driver](#batch-driver-rotorworks-batchpy)
@@ -138,21 +142,25 @@ somewhere else without it will fail at startup.
 ## Project layout
 
 ```
-rotorworks_core.py              shared: SoC model, atmosphere, wind, tooltips
+rotorworks_core.py              shared: SoC model, atmosphere, wind, wiring,
+                                connectors, prop tables, budgets, exports
 multicopter-power-sim-gui.py    multicopter simulator (GUI + CLI)
 fixedwing-power-sim-gui.py      fixed-wing simulator (GUI + CLI)
+vtol-power-sim-gui.py           VTOL simulator, four configurations (GUI + CLI)
 rotorworks-batch.py             sweeps, sizing studies, scripted runs
 drag_coefficient_calculator.py  drag coefficients from photographs
-examples/                       9 aircraft configs, 10 missions
-tests/                          219 pytest tests
+examples/                       13 aircraft configs, 15 missions
+tests/                          583 pytest tests
 ```
 
 `rotorworks_core.py` holds the aircraft-agnostic code both simulators depend
 on: the battery state-of-charge model, the standard atmosphere, wind
-resolution, the thermal step, GUI tooltips, and assorted parsing helpers. Two
+resolution, the thermal step, wiring resistance and connector ratings,
+propeller bench tables, the weight and power budgets, the mission ground
+track, CSV and Excel export, GUI tooltips, and assorted parsing helpers. Two
 copies of that code previously drifted apart and caused real bugs — a tooltip
 fix that had to be applied twice, and two atmosphere implementations that
-disagreed about pressure overrides. **Both simulators import it, so it must
+disagreed about pressure overrides. **All three simulators import it, so it must
 sit in the same folder.** They exit with a clear message if it is missing.
 
 What deliberately stays per-simulator: `BatteryConfig` (the two constructors
@@ -202,10 +210,11 @@ On Debian/Ubuntu it is packaged separately — see
 ```bash
 python multicopter-power-sim-gui.py --gui
 python fixedwing-power-sim-gui.py  --gui
+python vtol-power-sim-gui.py       --gui
 python drag_coefficient_calculator.py
 ```
 
-Running either simulator with **no arguments at all** also opens the GUI-less
+Running any simulator with **no arguments at all** also opens the GUI-less
 CLI path and will report which required arguments are missing. Pass `--gui`
 to go straight to the graphical interface.
 
@@ -216,6 +225,10 @@ Fastest way to get a feel for it:
 3. Press **▶ Run Single-Point**.
 4. Read the **Metrics** and **Status** tabs.
 5. Change one number and run again.
+
+For the VTOL, load `examples/configs/vtol_2m4_lift_cruise_survey.json`, then
+change **Configuration** to `tiltrotor` and run again — same airframe, and
+the hover and cruise numbers move in opposite directions.
 
 ### CLI
 
@@ -283,7 +296,7 @@ The batch driver has a matching `--mode simple|advanced` flag; see
 
 ## Example configs and missions
 
-`examples/` ships with 9 aircraft configs and 10 missions. Load a config with
+`examples/` ships with 13 aircraft configs and 15 missions. Load a config with
 **Load Config**, or feed it to the batch driver with `--gui-config`.
 
 ### Configs — multicopter
@@ -305,6 +318,42 @@ The batch driver has a matching `--mode simple|advanced` flag; see
 | `fixedwing_2m_survey_4S.json` | 2 m surveyor, 2600 g + 400 g | Cambered airfoil, cleaner airframe |
 | `fixedwing_3m_endurance_6S_liion.json` | 3 m endurance, 4200 g, 6S4P | CD0 0.019, Oswald 0.92 — the gap vs the trainer *is* the value of a clean airframe |
 
+### Configs — VTOL
+
+| File | Aircraft | Why it is interesting |
+|---|---|---|
+| `vtol_2m4_lift_cruise_survey.json` | 2.4 m lift+cruise, 6 kg | Generic 4+1; a clean starting point to edit |
+| `vtol_trinity_f90_lift_cruise.json` | **Quantum-Systems Trinity F90+** | A real aircraft, validated against its published 90 min endurance |
+| `vtol_wingtraone_gen2_tailsitter.json` | **Wingtra WingtraOne GEN II** | A real tailsitter, validated against its published 59 min endurance |
+
+The last two describe aircraft that exist and whose manufacturers publish
+endurance figures, so the model can be checked against something it did not
+choose. Each file separates what is **published** (span, MTOW, payload,
+battery chemistry and cell configuration, cruise speed, endurance) from what
+is **inferred** (wing area, drag, motor electrical parameters), because
+manufacturers do not publish the latter.
+
+`CD0` is back-solved from the published endurance over a realistic
+climb/transition/cruise/land profile flown to a 15% reserve, and both land
+within 1%:
+
+| Aircraft | Model | Published | CD0 |
+|---|---|---|---|
+| Trinity F90+ | 89.9 min | 90 min | 0.0235 |
+| WingtraOne GEN II | 59.5 min | 59 min | 0.033 |
+
+Two things make this more than curve-fitting. The Trinity needed almost no
+adjustment — a first-principles guess of 0.024 already gave 88.7 min — and
+its calibrated drag implies an L/D_max of 16.7 against a **separately
+published 14:1 glide ratio**, so two independent manufacturer numbers agree
+on the same drag. And the tailsitter comes out 40% draggier than the clean
+pusher layout, which is the right direction and roughly the right size for a
+bluff body, exposed motor pods and landing feet carried into cruise.
+
+Change **Configuration** in the GUI (or `--config_type`) to fly any of these
+airframes as a different type and compare — but note that doing so is a
+thought experiment, not a claim about a real aircraft.
+
 ### Missions
 
 `mc_*` are for the multicopter, `fw_*` for the fixed-wing.
@@ -323,6 +372,114 @@ The batch driver has a matching `--mode simple|advanced` flag; see
 
 ---
 
+## VTOL simulator
+
+`vtol-power-sim-gui.py` models an aircraft that takes off vertically and then
+flies on a wing. It shares `rotorworks_core.py` and the tab layout with the
+other two, so everything above applies; this section covers what is specific
+to it.
+
+### The four configurations
+
+Pick one with the **Configuration** dropdown or `--config_type`.
+
+| Type | How it works | What it costs |
+|---|---|---|
+| **lift+cruise** | Separate systems: rotors that only lift, a propeller that only pushes | Carries stopped rotors through the whole cruise, dragging and doing nothing |
+| **tiltrotor** | The same rotors tilt from vertical to horizontal | Rotors blow onto a flat wing in hover — about a tenth of the weight in download |
+| **tiltwing** | The wing tilts with the rotors | Wing turns edge-on to the wash, so the download nearly vanishes |
+| **tailsitter** | The whole aircraft pitches from vertical to horizontal | Same, but weathervanes broadside in a crosswind |
+
+The three vectored types carry ONE set of rotors that both lifts and pushes.
+Two force balances fix the thrust and where it points at every speed:
+
+```
+vertical:    T·cos(tilt) + L_wing = W·(1 + download)
+horizontal:  T·sin(tilt)          = D
+```
+
+Tilt sweeps 0° in hover to 90° in wing-borne cruise. On the reference
+aircraft the trade comes out as you would expect: the tiltrotor pays most to
+hover (673 W against 602 for the others) and every vectored type cruises
+cheaper than lift+cruise (151 W against 214 at 18 m/s), because lift+cruise
+is dragging four stopped rotors the whole way.
+
+**Tiltwing and tailsitter come out identical in still air, deliberately.** In
+steady flight they genuinely are close. What separates them is dynamics —
+weathervaning, control authority, slipstream lift over a tilting wing — none
+of which a steady power model sees. Quantifying slipstream lift needs a
+coverage factor there is no data to set, so rather than invent one to force
+them apart, both default to the same download and either can be overridden
+with measured data.
+
+### Transition
+
+The transition is where a VTOL's energy budget is decided, so it is modelled
+rather than charged at a single point. As speed builds, the rotors give up
+the lifting and the wing takes it:
+
+| Airspeed | Rotor thrust | Wing lift | Cruise thrust | Power |
+|---|---|---|---|---|
+| 0.0 m/s | 61.2 N | 0.0 N | 0.0 N | 620 W |
+| 6.7 m/s | 45.9 N | 14.7 N | 1.2 N | 302 W |
+| 13.3 m/s | 0.0 N | 58.8 N | 5.6 N | 130 W |
+
+The aircraft is also **accelerating**, and that kinetic energy comes from the
+pack — reaching 22 m/s is about a third of the transition phase. The landing
+transition integrates from the speed the aircraft is actually at, so it is
+not charged for accelerating a second time, and regen (if any) applies there.
+
+### Missions
+
+The mission model is **fully time-stepped**: every phase runs through one
+loop that steps 0.25 s at a time, ramps speed within the acceleration limit,
+moves altitude at the commanded rate, and charges power for what is actually
+flown. Pack I²R is billed against the cells per step and scaled by state of
+charge, so a long cruise ends drawing more than it began.
+
+Phase kinds: `climb`, `hover`, `descend`, `transition`, `cruise`. A cruise
+leg ends exactly when its distance is covered — if it could not reach its
+commanded speed in that distance, the status says what speed it ended at
+rather than pretending the pattern fits.
+
+### VTOL-specific inputs
+
+| Input | Why |
+|---|---|
+| **Hover download fraction** | Blank uses the type default. Typical published values, not measurements — override with test data |
+| **Lift rotor table (CSV)** | Measured thrust/power replaces the figure-of-merit guess where the table covers the thrust |
+| **Cruise prop table (CSV)** | Same for the pusher; ignored for the vectored types, whose rotors do the cruising |
+| **SoC curve (CSV)** | A measured discharge curve outranks the chemistry preset |
+| **Max acceleration / deceleration** | Blank ignores transients and each leg starts at its commanded speed |
+| **Regen efficiency** | Fraction of braking energy recovered. 0 is the honest default for a fixed-pitch propeller |
+
+Missing tables and curves **raise** rather than falling back silently: a
+table you think is loaded but is not gives estimates wearing measured
+clothes.
+
+### Status checks
+
+Status checks **hover as well as cruise**, because hover is the heaviest
+steady load a VTOL carries and the case that sizes the battery, the motors
+and the connectors — connector and C-rate checks therefore run at hover
+current. It also reports the transition/stall margin, the wing's lift share
+at the cruise speed (which catches a cruise speed set *below* the transition
+speed, where the rotors are still lifting), rotor tilt for the vectored
+types, and whether the efficiency in use is measured or estimated.
+
+### What is not modelled
+
+- **Tiltwing slipstream lift** and **tailsitter weathervaning**, as above.
+- **Control authority and attitude dynamics** through the transition. The
+  model says what a transition costs, not whether it is flyable.
+- **Rotor spin-down time** — stopped rotors are assumed stopped.
+- Boom positions in the Airframe Diagram are a plausible arrangement, not a
+  claim about a specific airframe. Only span, wing area and propeller
+  diameters are real inputs, so it is for checking proportions and
+  clearances, not a layout to build from.
+
+---
+
 ## GUI reference
 
 ### Input tabs
@@ -335,6 +492,7 @@ The batch driver has a matching `--mode simple|advanced` flag; see
 | **ESC** | Voltage rating (**in S cells, not volts**), continuous/max current, resistance |
 | **Avionics** | Voltage rails: V, A, converter efficiency |
 | **Prop** | Diameter, pitch, blades, limits, optional CSV test table |
+| **Wiring** | Wire run length and gauge, connector ratings for battery / ESC / motor |
 | **Mission / Env** | Speed, wind, altitude, temperature, reserves, or a mission JSON |
 
 ### Output tabs
@@ -343,12 +501,20 @@ The batch driver has a matching `--mode simple|advanced` flag; see
 |---|---|
 | **Metrics** | Full single-point summary, grouped into sections (see below) |
 | **Status** | Colour-coded limit checks: green OK, yellow warn, red violation |
-| **Weight Budget** | Component mass table plus stacked-bar and pie charts |
+| **Weight Budget** | Component mass table plus a stacked-bar chart |
+| **Power Budget** | Where every watt goes: delivered, losses, and the total from the cells |
 | **Airframe Diagram** | To-scale plan view; propeller overlap and tip clearance |
+| **Mission Diagram** | Ground track with numbered waypoints and yaw arrows, plus the altitude profile |
 | **Sensitivity** | Ranks inputs by influence on flight time, range or power |
 | **Compare** | Deltas against a pinned baseline configuration |
-| **Plots** | Performance curves vs speed |
+| **Fixed Speed Plots** | Performance curves vs speed |
 | **Mission Plots** | Time-series for a mission run, multi-unit y-axes |
+
+After a **mission** run, **Status** shows the WORST value each check reached
+anywhere in the flight and **Metrics** shows the LAST instant flown; both say
+which. The Power Budget and Fixed Speed Plots clear with a note, because a
+mission has no single operating point. **Sensitivity** clears whenever a new
+run makes it stale.
 
 **Metrics** sections: Battery, Motor @ Operating Point, Total Drive & Power,
 Propeller & Rotor, Flight Performance, Propulsion Efficiency, Thermal
@@ -378,7 +544,7 @@ UI scale is under **View → UI Scale** (150–200% helps on high-DPI displays).
 
 ## CLI reference
 
-Both simulators run headless with no `--gui`. Key arguments:
+All three simulators run headless with no `--gui`. Key arguments:
 
 ### Shared
 
@@ -452,9 +618,45 @@ be omitted — the corresponding check is skipped rather than the run failing.
 
 ---
 
+### VTOL-specific
+
+| Argument | Units / values | Notes |
+|---|---|---|
+| `--config_type` | lift+cruise, tiltrotor, tiltwing, tailsitter | Which VTOL layout to fly |
+| `--num_lift_rotors`, `--lift_prop_diameter` | count, inches | The lifting rotors |
+| `--lift_figure_of_merit` | 0.2–0.9 | Ignored where a bench table covers the thrust |
+| `--num_cruise_motors`, `--cruise_prop_diameter` | count, inches | Ignored for the vectored types |
+| `--cruise_prop_efficiency` | 0–0.95 | Also the cruise end of the vectored efficiency blend |
+| `--stopped_rotor_drag_area` | m² | Lift+cruise only: what the stopped rotors drag |
+| `--hover_download` | fraction of weight | Overrides the per-type default |
+| `--lift_prop_table`, `--cruise_prop_table` | CSV path | Measured thrust/power |
+| `--soc_curve` | CSV path | Measured pack discharge curve |
+| `--wind`, `--wind_direction` | m/s, degrees FROM | Wind for a mission |
+| `--max_accel`, `--max_decel` | m/s² | 0 ignores transients |
+| `--regen_eff` | 0–1 | Braking energy recovered; 0 is the honest default |
+| `--wire_length`, `--wire_awg`, `--wire_ohm_per_m` | m, AWG, Ω/m | Main battery lead |
+| `--connector_batt_cont` and friends | amps | Connector ratings, checked at hover |
+| `--battery_c_cont`, `--battery_c_max` | C | Pack discharge ratings |
+
+```bash
+# Same airframe, four ways
+for t in lift+cruise tiltrotor tiltwing tailsitter; do
+  python vtol-power-sim-gui.py --config_type "$t"
+done
+
+# A survey mission into a 6 m/s headwind, with measured rotors
+python vtol-power-sim-gui.py \
+  --mission examples/missions/vtol_01_lift_cruise_survey.json \
+  --battery_parallel 3 --wind 6 \
+  --lift_prop_table tests/data/motor_prop_table.csv
+```
+
+---
+
 ## Batch driver (`rotorworks-batch.py`)
 
 Three subcommands, all of which accept `--gui-config` and `--mode`.
+`--sim` takes `multicopter`, `fixedwing` or `vtol`.
 
 ### Sweep — one-variable sensitivity
 
@@ -587,6 +789,29 @@ numerically identical. Verified against ArduPilot's own IRIS example
 Ordered phases, each with a name, a speed, and **either** a duration (seconds)
 **or** a distance (metres).
 
+The VTOL uses the same file with one addition: each phase carries a `kind` —
+`climb`, `hover`, `descend`, `transition` or `cruise` — because a VTOL's
+phases are not all the same sort of flying. A `transition` phase is
+integrated across its speed range and charged for the acceleration; a
+`cruise` phase ends exactly when its distance is covered. `course_deg` is
+used for wind resolution and to draw the ground track.
+
+```json
+{
+  "reserve_percent": 20,
+  "transition_time_s": 12,
+  "phases": [
+    {"name": "Climb",      "kind": "climb",      "duration": 30,
+     "climb_rate_mps": 2.0, "altitude": 80},
+    {"name": "Transition", "kind": "transition", "duration": 12,
+     "speed": 22.0, "altitude": 80},
+    {"name": "Survey leg", "kind": "cruise",     "distance": 2000,
+     "speed": 22.0, "altitude": 80, "course_deg": 90},
+    {"name": "Land",       "kind": "descend",    "duration": 30, "altitude": 0}
+  ]
+}
+```
+
 ```json
 {
   "reserve_percent": 20,
@@ -681,6 +906,30 @@ Notes:
 ---
 
 ## Modeling notes and assumptions
+
+### VTOL
+
+- **Vectored types** (tiltrotor, tiltwing, tailsitter) resolve one rotor
+  thrust into a lifting and a pushing component:
+  `T = sqrt(D² + (W·(1+download) − L_wing)²)`, pointed at
+  `tilt = atan2(D, W·(1+download) − L_wing)`. Rotor efficiency blends from
+  the hover figure of merit to the propeller efficiency with the tilt, so a
+  rotor is judged as a rotor when lifting and as a propeller when pushing.
+- **Download** — the rotor wash striking structure below — scales with the
+  rotors' share of the weight, so it is full in hover and gone once the wing
+  carries the aircraft. That keeps hover and cruise the two ends of one
+  continuous curve rather than two branches that disagree where they meet.
+  Per-type figures are typical published values, not measurements.
+- **Lift+cruise** carries its stopped rotors as drag through the cruise,
+  phased in over the transition rather than switched on at a threshold.
+- **Transitions** are integrated across their speed range and charged for the
+  kinetic energy of accelerating; the landing transition integrates from the
+  speed actually being flown, so it is not billed for accelerating twice.
+- **Missions are time-stepped** at 0.25 s. Pack I²R is charged against the
+  cells per step and scaled by state of charge.
+- Motor losses are folded into the ESC efficiency and rotor losses into the
+  figure of merit, so there is no separate motor copper-loss line in the
+  VTOL's Power Budget.
 
 ### Multicopter
 
@@ -786,6 +1035,61 @@ Version** — this release is **VTOL simulator v0.1.0** (new file, versioned sep
   transition physics differs enough that a fallback would be confidently wrong.
 - The Glauert forward-flight inflow solver moved from the multicopter into
   `rotorworks_core`, since the VTOL lift rotors need the same physics.
+
+**VTOL v1.0.0** — fully time-stepped mission model
+The VTOL now integrates its missions in time, as the multicopter and
+fixed-wing do. Every phase runs through ONE loop that steps 0.25 s at a
+time, ramps speed toward the target within the acceleration limit, moves
+altitude at the commanded rate, and charges power for the speed and climb
+actually flown.
+- **Special cases removed, not added to.** The phase-level model evaluated
+  each phase at a single point with exceptions layered on: sub-steps for
+  transitions, a lead-in for cruise legs, a separate branch for hovering in
+  wind. Those disagreed with each other — a transition paid for accelerating
+  while a cruise leg did not. One loop removes the category.
+- **Legs land exactly on their goal.** The final step is truncated and
+  clamped, so a 5000 m leg covers 5000 m rather than 5001.5, and a survey's
+  legs sum to what was asked for.
+- **A leg can now END before reaching its speed** instead of overshooting its
+  own distance to get there. The status reports the speed it actually ended
+  at. That is the real behaviour of an unflyable pattern.
+- **Pack I2R is charged against the cells, per step, scaled by state of
+  charge.** It was previously shown in the Power Budget but never billed. On
+  an 18 km cruise the draw now climbs from 349 W to 364 W as the pack empties
+  and its resistance rises — 3441 series points where the old model had
+  about ten.
+- **A test premise turned out to be wrong, and the physics is the
+  interesting part.** "Transients cost energy" is not generally true: once
+  the ramp is PART of the leg rather than charged on top of it, the aircraft
+  spends that time at a lower speed, and a VTOL's power rises steeply with
+  speed — 138 W at 14 m/s against 430 W at 24. On a four-leg pattern
+  ramping at 1.5 m/s2 costs 16.90 Wh against 17.26 Wh flown instantly, while
+  taking longer. The honest invariants are the track and the time.
+
+**VTOL v0.10.0** — the transition pays for its own acceleration
+Checking whether the transition was fully characterised turned up two faults.
+- **The thrust hand-over was already right.** Across the transition the
+  rotors give up the lifting and the wing takes it, continuously: on the
+  reference aircraft rotor thrust runs 61.2 N -> 0 while wing lift runs
+  0 -> 58.8 N, with a cruise thrust appearing to beat drag. That part needed
+  no change.
+- **The acceleration was missing.** The transition integrated power across a
+  sweep of SPEEDS with no kinetic term, as though the aircraft arrived at
+  each speed for free. It does not: reaching 22 m/s costs 1452 J, which is
+  **31% of the whole transition phase** and was simply absent. The cruise
+  legs had paid it since v0.9.0; the transition had not.
+  It is charged as mechanical power through the ESC, like any other shaft
+  power, rather than added straight to the pack draw.
+- **Both directions used to sweep 0 -> v_end**, so the landing transition was
+  modelled as another acceleration and the kinetic cost was charged TWICE per
+  round trip instead of once out and released on the way back. Transitions
+  now integrate from the speed the aircraft is actually at: outbound
+  411 W / 1.371 Wh against 216 W / 0.719 Wh inbound, and regen applies only
+  to the deceleration, where there is something to recover.
+- **Four new tests**, including one that checks the power gap between an 8 s
+  and a 20 s transition matches the kinetic energy spread over those times —
+  so the term cannot silently drift.
+- **VTOL tests: 96 -> 100.**
 
 **VTOL v0.9.0** — transients and the measured SoC curve
 The last two items. The VTOL now has everything the other two simulators do.
@@ -2114,26 +2418,28 @@ fine. Open the file and check the values are numeric.
 
 ## Testing
 
-A pytest suite lives in `tests/` — 300 tests covering physics, the shared
-core, the CLI, the GUI, and the batch driver. See `tests/README.md`.
+A pytest suite lives in `tests/` — 587 tests covering physics, the shared
+core, the CLI, the GUI, the batch driver, and the drag calculator. See
+`tests/README.md`.
 
 ```bash
 pip install pytest
-pytest                        # everything, ~7 minutes
-pytest -m "not slow"          # physics only, ~3 seconds
+pytest                        # everything, ~20 minutes
+pytest -m "not slow"          # physics only, ~90 seconds
 xvfb-run -a pytest            # headless machines (GUI tests need a display)
 ```
 
 | Suite | Tests | Covers |
 |---|---|---|
 | `test_golden.py` | 1 | 348 stored numeric outputs; fails if any value drifts |
-| `test_core.py` | 76 | The shared core, plus checks that both simulators really delegate to it |
-| `test_physics.py` | 97 | Battery topology, atmosphere, rotor inflow, prop efficiency, SoC, drag, landing, drag calculator |
-| `test_cli.py` | 64 | Subprocess runs of every argument path and example mission, plus edge cases and malformed input |
-| `test_gui.py` | 44 | Real Tk window: hover events, mode toggle, config load, missions, exports |
+| `test_core.py` | 94 | The shared core, plus checks that both simulators really delegate to it |
+| `test_physics.py` | 130 | Battery topology, atmosphere, rotor inflow, prop efficiency, SoC, drag, landing, drag calculator |
+| `test_cli.py` | 70 | Subprocess runs of every argument path and example mission, plus edge cases and malformed input |
+| `test_gui.py` | 46 | Real Tk window: hover events, mode toggle, config load, missions, exports |
 | `test_batch.py` | 20 | Sweeps, sizing, mode enforcement, and GUI↔CLI consistency |
-| `test_matrix.py` | 67 | Every config and mission, GUI **and** CLI, with **and** without a propeller table |
-| `test_vtol.py` | 27 | VTOL physics, transition hand-over, config gating, mission energy split |
+| `test_matrix.py` | 94 | Every config and mission, GUI **and** CLI, with **and** without a propeller table — VTOL included |
+| `test_vtol.py` | 104 | All four VTOL types: vectored-thrust force balance, tilt, download, transition acceleration, time-stepped missions, wind, bench tables, and the GUI tabs |
+| `test_drag_calculator.py` | 31 | Shoelace geometry, self-intersection detection, pixel scaling, ISA density, ArduPilot BCOEF and MCOEF |
 
 Almost every test corresponds to a bug that was shipped at some point; the
 docstrings name the symptom. Two are worth knowing about: the tooltip test

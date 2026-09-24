@@ -1,6 +1,6 @@
 # Test suite
 
-579 tests covering the shared core, physics, the CLI, the GUI, the batch
+587 tests covering the shared core, physics, the CLI, the GUI, the batch
 driver, the VTOL simulator, and a full config/mission coverage matrix.
 
 Almost every test here corresponds to a bug that was actually shipped. The
@@ -46,7 +46,7 @@ safe to run.
 | `test_golden.py` | 1 | ~2 s | 348 stored numeric outputs across both simulators |
 | `test_core.py` | 94 | ~1 s | `rotorworks_core`: SoC, wind, inflow, sensitivity, comparison, propeller coefficients, power budget, airframe geometry |
 | `test_physics.py` | 130 | ~5 s | Battery topology, atmosphere, rotor inflow, prop efficiency, drag, turns, translation direction, thresholds, figure leaks |
-| `test_vtol.py` | 96 | ~3 s | All four VTOL types: vectored-thrust force balance, tilt, download, continuity, missions, and the ported GUI tabs |
+| `test_vtol.py` | 104 | ~3 s | All four VTOL types: vectored-thrust force balance, tilt, download, continuity, missions, and the ported GUI tabs |
 | `test_cli.py` | 67 | ~3 min | Real subprocess runs: every argument path, every example mission, edge cases, malformed input |
 | `test_gui.py` | 46 | ~4 min | Real Tk window: hover events, mode toggle, config load, missions, exports, diagram, sensitivity, comparison |
 | `test_matrix.py` | 94 | ~4 min | Every config and mission x GUI and CLI x with and without a propeller table |
