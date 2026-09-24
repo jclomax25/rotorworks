@@ -38,6 +38,7 @@ tk installed, matching how the simulators themselves behave.
 from __future__ import annotations
 
 import math
+import re
 import os
 from typing import List, Optional, Tuple
 
@@ -74,6 +75,7 @@ __all__ = [
     # propeller coefficients
     "estimate_prop_thrust_coefficient", "estimate_prop_power_coefficient",
     "rpm_from_thrust", "derive_prop_coefficients_from_table",
+    "load_prop_table", "table_power_for_thrust", "measured_static_efficiency",
     # mission ground track
     "mission_ground_track", "make_mission_diagram_figure",
     # turning flight
@@ -82,6 +84,11 @@ __all__ = [
     "translation_drag_area", "pitch_roll_from_tilt", "tilt_from_pitch_roll",
     # per-rotor load sharing
     "rotor_thrust_distribution", "rotor_load_spread",
+    # wiring and connectors
+    "AWG_OHM_PER_M", "CONNECTOR_RATINGS", "wire_resistance_ohm",
+    "wire_loss_W", "wire_voltage_drop_V", "connector_defaults",
+    # exports
+    "export_csv", "export_excel",
     # power budget
     "build_power_budget",
     # figures
@@ -964,6 +971,124 @@ def estimate_prop_power_coefficient(c_t: float,
     return (ct ** 1.5) / math.sqrt(2.0) / fm
 
 
+def load_prop_table(path: str):
+    """
+    Load a motor/propeller bench table.
+
+    Accepts the two layouts these tools meet in practice: a plain CSV whose
+    header row is the first line, and an eCalc-style export where the header
+    sits a few rows down under a title block. Column names are matched loosely
+    so "Thrust (g)", "thrust_g" and "Thrust" all land on `Thrust_g`.
+
+    Returns a DataFrame sorted by thrust with at least `Thrust_g` and
+    `Power_W`, or raises ValueError saying which column is missing. Blank
+    cells become NaN and are dropped rather than silently read as zero — a
+    zero-power row would make the propeller look infinitely efficient.
+
+    The multicopter and fixed-wing each carry an older loader of their own.
+    This one exists so the VTOL does not become a third copy.
+    """
+    import pandas as pd
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+
+    ALIASES = {
+        "thrust_g": "Thrust_g", "thrust (g)": "Thrust_g", "thrust": "Thrust_g",
+        "thrust_grams": "Thrust_g",
+        "power_w": "Power_W", "power (w)": "Power_W", "power": "Power_W",
+        "electrical power (w)": "Power_W",
+        "rpm": "RPM", "prop rpm": "RPM", "motor rpm": "RPM",
+        "current_a": "Current_A", "current (a)": "Current_A", "current": "Current_A",
+        "voltage_v": "Voltage_V", "voltage (v)": "Voltage_V", "volts": "Voltage_V",
+        "throttle": "Throttle", "throttle (%)": "Throttle",
+    }
+
+    def normalise(frame):
+        renamed = {}
+        for column in frame.columns:
+            key = str(column).strip().lower()
+            if key in ALIASES:
+                renamed[column] = ALIASES[key]
+        return frame.rename(columns=renamed)
+
+    frame = normalise(pd.read_csv(path))
+    if "Thrust_g" not in frame.columns:
+        # eCalc-style: find the row that actually looks like a header.
+        raw = pd.read_csv(path, header=None, dtype=str)
+        for i in range(min(len(raw), 25)):
+            candidate = [str(c).strip().lower() for c in raw.iloc[i].tolist()]
+            if any(c in ALIASES and ALIASES[c] == "Thrust_g" for c in candidate):
+                frame = normalise(pd.read_csv(path, header=i))
+                break
+
+    for required in ("Thrust_g", "Power_W"):
+        if required not in frame.columns:
+            raise ValueError(
+                f"{os.path.basename(path)} has no {required} column. "
+                f"Found: {', '.join(str(c) for c in frame.columns)}")
+
+    for column in frame.columns:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame = frame.dropna(subset=["Thrust_g", "Power_W"])
+    frame = frame[(frame["Thrust_g"] > 0) & (frame["Power_W"] > 0)]
+    if frame.empty:
+        raise ValueError(f"{os.path.basename(path)} has no usable rows")
+    return frame.sort_values("Thrust_g").reset_index(drop=True)
+
+
+def table_power_for_thrust(df, thrust_N: float) -> Optional[float]:
+    """
+    Electrical power the table reports for a given thrust, interpolated.
+
+    Returns None outside the measured range rather than extrapolating. A
+    bench table says nothing about thrusts it never produced, and inventing
+    a value there is how a measurement turns into a guess wearing its
+    clothes.
+    """
+    if df is None or thrust_N <= 0:
+        return None
+    grams = float(thrust_N) * 1000.0 / G0
+    thrusts = df["Thrust_g"].tolist()
+    powers = df["Power_W"].tolist()
+    if grams < thrusts[0] or grams > thrusts[-1]:
+        return None
+    for i in range(len(thrusts) - 1):
+        lo, hi = thrusts[i], thrusts[i + 1]
+        if lo <= grams <= hi:
+            if hi - lo < 1e-12:
+                return float(powers[i])
+            frac = (grams - lo) / (hi - lo)
+            return float(powers[i] + frac * (powers[i + 1] - powers[i]))
+    return float(powers[-1])
+
+
+def measured_static_efficiency(df, thrust_N: float, rho: float,
+                               disc_area_m2: float) -> Optional[float]:
+    """
+    Combined motor-and-propeller efficiency measured by the table, at this
+    thrust:
+
+        eta = P_ideal_static / P_table   where  P_ideal_static = T * sqrt(T / 2*rho*A)
+
+    This is the one thing a static bench table gives reliably. The power
+    itself is only valid at zero airspeed, but the EFFICIENCY can be carried
+    into forward flight and applied to the correct ideal power there — a
+    measured number instead of a guessed one.
+
+    Returns None outside the measured range, and clamps to 15-90%: a real
+    motor-and-propeller combination sits inside that, and a value outside it
+    means the table or the disc area is wrong rather than the propeller being
+    remarkable.
+    """
+    power = table_power_for_thrust(df, thrust_N)
+    if power is None or power <= 0:
+        return None
+    v_hover = math.sqrt(max(float(thrust_N), 0.0) /
+                        max(2.0 * rho * disc_area_m2, 1e-9))
+    ideal = float(thrust_N) * v_hover
+    return min(max(ideal / power, 0.15), 0.90)
+
+
 def derive_prop_coefficients_from_table(df, diameter_in: float,
                                         rho: float = 1.225) -> Optional[dict]:
     """
@@ -1389,6 +1514,108 @@ def make_mission_diagram_figure(phases: List[dict], figsize=(12, 5.5)):
 
 
 # ============================================================
+# WIRING AND CONNECTORS
+# ============================================================
+
+# Resistance of solid copper at 20 C, ohms per metre of ONE conductor.
+# Standard AWG figures; silicone-insulated stranded wire runs a few percent
+# higher because the strands are not perfectly parallel.
+AWG_OHM_PER_M: Dict[int, float] = {
+    8: 0.002061, 10: 0.003277, 12: 0.005211, 14: 0.008286,
+    16: 0.013172, 18: 0.020950, 20: 0.033292, 22: 0.052939,
+    24: 0.084197, 26: 0.133900, 28: 0.212900,
+}
+
+# Typical manufacturer ratings, amps (continuous, burst).
+#
+# These are DEFAULTS to start from, not specifications. Burst figures in
+# particular vary widely between makers and with how long "burst" means, so
+# every one of them is editable and the status check uses whatever the user
+# entered rather than these.
+CONNECTOR_RATINGS: Dict[str, Tuple[float, float]] = {
+    "XT30":          (30.0, 45.0),
+    "XT60":          (60.0, 90.0),
+    "XT90":          (90.0, 135.0),
+    "AS150":         (150.0, 225.0),
+    "EC3":           (60.0, 90.0),
+    "EC5":           (120.0, 180.0),
+    "Deans/T-plug":  (60.0, 90.0),
+    "Bullet 3.5 mm": (50.0, 75.0),
+    "Bullet 4 mm":   (70.0, 105.0),
+    "Bullet 5.5 mm": (120.0, 180.0),
+    "Bullet 6 mm":   (140.0, 210.0),
+    "Bullet 8 mm":   (200.0, 300.0),
+}
+
+
+def wire_resistance_ohm(length_m: float,
+                        awg: Optional[int] = None,
+                        ohm_per_m: Optional[float] = None,
+                        both_conductors: bool = True) -> float:
+    """
+    Resistance of a wire run.
+
+    `length_m` is the ONE-WAY run — the distance from source to load. Current
+    has to come back, so by default the resistance counts both conductors and
+    the figure returned is for `2 * length_m` of wire. That doubling is the
+    single easiest thing to forget, and forgetting it halves every loss the
+    model reports.
+
+    Give either an `awg` (looked up for copper at 20 C) or an explicit
+    `ohm_per_m`. An explicit value wins, because it is the one a user can read
+    off their own spool.
+
+    Returns 0.0 when there is nothing to compute, so an unfilled input costs
+    nothing rather than raising.
+    """
+    length = max(float(length_m or 0.0), 0.0)
+    if length <= 0:
+        return 0.0
+
+    if ohm_per_m is not None and float(ohm_per_m) > 0:
+        per_m = float(ohm_per_m)
+    elif awg is not None and int(awg) in AWG_OHM_PER_M:
+        per_m = AWG_OHM_PER_M[int(awg)]
+    else:
+        return 0.0
+
+    conductors = 2.0 if both_conductors else 1.0
+    return per_m * length * conductors
+
+
+def wire_loss_W(current_A: float, resistance_ohm: float) -> float:
+    """Ohmic loss in a wire run: I^2 * R, dissipated as heat."""
+    return max(float(current_A), 0.0) ** 2 * max(float(resistance_ohm), 0.0)
+
+
+def wire_voltage_drop_V(current_A: float, resistance_ohm: float) -> float:
+    """
+    Voltage lost along the run: I * R.
+
+    This matters beyond the wasted watts. The ESC and motor see the pack
+    voltage MINUS this drop, so a long thin battery lead lowers the voltage
+    actually available for thrust — and on a low-cell-count pack that can be a
+    measurable fraction of the headroom.
+    """
+    return max(float(current_A), 0.0) * max(float(resistance_ohm), 0.0)
+
+
+def connector_defaults(name: Optional[str]) -> Optional[Tuple[float, float]]:
+    """Typical (continuous, burst) amps for a named connector, or None."""
+    if not name:
+        return None
+    key = str(name).strip()
+    if key in CONNECTOR_RATINGS:
+        return CONNECTOR_RATINGS[key]
+    # Tolerate case and spacing differences in saved configs.
+    folded = key.lower().replace(" ", "")
+    for known, ratings in CONNECTOR_RATINGS.items():
+        if known.lower().replace(" ", "") == folded:
+            return ratings
+    return None
+
+
+# ============================================================
 # POWER BUDGET
 # ============================================================
 
@@ -1397,6 +1624,7 @@ def build_power_budget(total_in_W: float,
                        motor_copper_W: float,
                        battery_i2r_W: float,
                        esc_loss_W: float,
+                       wire_loss_W: float = 0.0,
                        peripheral_W: float = 0.0,
                        peripheral_V: Optional[float] = None,
                        peripheral_A: Optional[float] = None,
@@ -1476,6 +1704,11 @@ def build_power_budget(total_in_W: float,
     # ---- lost ---------------------------------------------------------
     add("Motor copper loss (I2Rm)", motor_copper_W, "lost")
     add("ESC losses", esc_loss_W, "lost")
+    if wire_loss_W > 0:
+        # Its own row rather than folded into "ESC losses": wiring is the one
+        # loss a user can halve with a screwdriver and a thicker cable, so it
+        # is worth seeing separately.
+        add("Main wire run (I2R)", wire_loss_W, "lost")
     add("Battery internal loss (I2R)", battery_i2r_W, "lost")
 
     delivered_W = sum(r["watts"] for r in rows if r["kind"] == "delivered")
@@ -1499,6 +1732,64 @@ def build_power_budget(total_in_W: float,
                  "pct": 100.0, "kind": "total",
                  "voltage": "Battery", "current": None})
     return rows
+
+
+# ============================================================
+# EXPORTS
+# ============================================================
+
+def export_csv(path: str, sections: List[Tuple[str, List[str], List[list]]]) -> None:
+    """
+    Write several titled tables into one CSV.
+
+    A spreadsheet holds one grid, so multiple tables are stacked with a
+    bracketed heading and a blank line between them — the same shape the
+    multicopter and fixed-wing have always produced, so downstream scripts
+    that already read those files can read these too.
+
+    `sections` is (title, headers, rows).
+    """
+    import csv
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        for i, (title, headers, rows) in enumerate(sections):
+            if i:
+                writer.writerow([])
+            writer.writerow([f"[{title}]"])
+            if headers:
+                writer.writerow(headers)
+            for row in rows:
+                writer.writerow(list(row))
+
+
+def export_excel(path: str, sections: List[Tuple[str, List[str], List[list]]]) -> None:
+    """
+    Write each table to its own worksheet, headers bolded.
+
+    Unlike the CSV, a workbook can hold real tables side by side, so nothing
+    is stacked and nothing has to be parsed back apart.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill
+
+    workbook = Workbook()
+    workbook.remove(workbook.active)
+    for title, headers, rows in sections:
+        # Excel sheet names cannot exceed 31 characters or contain []:*?/\
+        safe = re.sub(r"[\[\]:*?/\\]", "-", str(title))[:31] or "Sheet"
+        sheet = workbook.create_sheet(safe)
+        if headers:
+            sheet.append(list(headers))
+            for cell in sheet[1]:
+                cell.font = Font(bold=True, color="FFFFFF")
+                cell.fill = PatternFill("solid", fgColor="1F3864")
+        for row in rows:
+            sheet.append(list(row))
+        for column in sheet.columns:
+            width = max((len(str(c.value)) for c in column if c.value is not None),
+                        default=8)
+            sheet.column_dimensions[column[0].column_letter].width = min(width + 2, 48)
+    workbook.save(path)
 
 
 # ============================================================

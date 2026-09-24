@@ -1,7 +1,7 @@
 # RotorWorks UAV Power Simulators
 
 **UASforge / dronefoundry**  
-*Simulators v2.41.0*
+*Simulators v2.42.0*
 
 A suite of cross-platform UAV powertrain performance tools:
 
@@ -25,7 +25,7 @@ rails**, **status limit checks**, and **plots** including mission time-series.
 ### 1. Clone
 
 ```bash
-git clone https://github.com/jclomax25/rotorworks.git
+git clone <your-repo-url> rotorworks
 cd rotorworks
 ```
 
@@ -786,6 +786,225 @@ Version** — this release is **VTOL simulator v0.1.0** (new file, versioned sep
   transition physics differs enough that a fallback would be confidently wrong.
 - The Glauert forward-flight inflow solver moved from the multicopter into
   `rotorworks_core`, since the VTOL lift rotors need the same physics.
+
+**VTOL v0.9.0** — transients and the measured SoC curve
+The last two items. The VTOL now has everything the other two simulators do.
+- **Measured SoC curve (CSV).** I said last release this needed the mission
+  loop rebuilt. That was wrong: `configure_battery_soc_model` already took a
+  `curve_csv` and the VTOL was passing `None`. It needed wiring, not
+  rebuilding. A measured curve outranks the chemistry preset, so the sag near
+  the end of the pack comes from your cells — 3.63 V/cell at 10% SoC against
+  the preset's 3.50.
+- **Transients**: acceleration and deceleration limits with optional regen.
+  Accelerating costs power on top of steady drag, and a survey flown as short
+  legs with a speed change at each end pays it repeatedly — on a 4-leg
+  pattern, 19.15 Wh becomes 23.81 Wh at 1 m/s². Regen recovers a little
+  (23.24 Wh at 30%); the default recovers nothing, which is honest for a
+  fixed-pitch propeller. Left blank, every number is bit-for-bit what it was.
+- **Two faults caught while building it.** The lead-in first added its
+  distance ON TOP of the leg, so a 400 m leg flew 400 m *after* accelerating
+  and the mission grew from 2.76 to 5.14 km. And a leg too short to reach its
+  speed — 60 m to slow from 24 to 14 m/s at 1 m/s², which needs about 190 —
+  now reports the overshoot in its phase status rather than quietly clamping,
+  because an unflyable pattern is worth knowing about.
+- **A missing SoC curve now raises.** The core resolver falls back to the
+  chemistry preset when a curve cannot be read, which would give preset
+  numbers wearing measured clothes. It fails loudly instead, as the
+  propeller tables already did.
+- **VTOL tests: 88 -> 96.**
+
+**VTOL v0.8.0** — hover download applied properly to lift+cruise
+Clearing the debt left in v0.7.0, where the download was removed rather than
+fixed because applying it to hover alone put a step at zero airspeed.
+- **Download now scales with the rotors' share of the weight** through the
+  lift+cruise transition, exactly as the vectored model already did. It
+  exists because rotor wash strikes structure below, and there is less wash
+  to strike with the less the rotors are lifting — so it fades as the wing
+  takes over. Hover (share 1, full download) and wing-borne cruise (share 0,
+  none) become the two ends of one continuous curve instead of two branches
+  that disagree where they meet.
+- **Verified continuous**: 619.7963 W at V=0 and at V=1e-9, identical, and
+  the worst sampled step falls from 6.50% at 0.25 m/s to 0.84% at 0.031 m/s —
+  the proportional shrink that distinguishes a steep slope from a jump.
+- Lift+cruise hover power rises from 585 W to 620 W on the reference
+  aircraft. That is the correction, not a regression: the previous figure
+  omitted a real force.
+- **Four tests updated, and two of them were the thing that was wrong.**
+  Hover thrust is weight x (1 + download), not weight. And climb work uses
+  the FULL hover thrust: I first wrote weight x rate, reasoning that download
+  is a thrust penalty rather than extra mass, but download is a real downward
+  force on the structure and a climbing aircraft moves up against it, so that
+  force does work too. The model was right both times.
+
+**VTOL v0.7.0** — Simple/Advanced, CLI parity, and a download that was never applied
+This closes the port: the VTOL now has every feature the other two simulators
+have, apart from transients and the SoC curve CSV, which its phase-level
+mission model cannot use without being rebuilt first.
+- **Simple / Advanced input toggle.** Simple shows 35 of the 65 inputs — the
+  weight, wing, pack, rotor and propeller sizes and the environment. It hides
+  figure-of-merit tuning, stopped-rotor drag area, bench tables, connector
+  ratings and the download override, all of which have sensible defaults and
+  exist to be refined later. A view setting only: hidden fields keep their
+  values, and a test asserts the computed answer is identical in both modes.
+- **CLI parity, 42 -> 59 arguments.** The wiring, connector, rating, prop-mass
+  and download inputs were GUI-only, so a config saved from the GUI described
+  an aircraft the CLI could not express.
+- **Found while testing the new CLI flag: the hover download was never
+  applied to lift+cruise.** `HOVER_DOWNLOAD_FRACTION` listed 0.04 for it from
+  the start, and only the vectored types ever used it, so the entry read as
+  modelled when it was not and `--hover_download` was silently a no-op there.
+  Applying it turned out to break something real: lift+cruise computes hover
+  and transition in separate branches, so a download on one alone puts a STEP
+  at zero airspeed — 1.04x weight at V=0 against 1.00x just above it. The
+  continuity test caught it in the same run.
+  Doing it properly means scaling download by rotor lift share across the
+  lift+cruise transition, as the vectored model already does. Until then the
+  entry is REMOVED rather than left listing a number that is never applied,
+  and the help text, the CLI flag and a test all say the flag applies to the
+  vectored types only.
+- **VTOL tests: 85 -> 88.**
+
+**VTOL v0.6.0** — exports, menu bar and Airframe Diagram
+- **Menu bar**: File / View / Help, matching the other two simulators. File
+  carries Load and Save Config plus the three exports; View has Window Scale;
+  Help has About / Version.
+- **Export CSV, Export Excel and Generate PDF Report.** The VTOL could not
+  produce a deliverable at all before. The exporters are shared in
+  `rotorworks_core.py` — CSV stacks titled tables in the layout the other
+  simulators already produce, so existing scripts read it unchanged; Excel
+  gives each table its own sheet.
+- **Exports are built by reading the tables on screen**, so a file cannot
+  disagree with what the user is looking at — there is only one source. They
+  also follow the run type: a single point exports the Power Budget and a
+  speed sweep, a mission exports its phase table and omits both, because a
+  mission has no single operating point and exporting one would export a
+  number the screen deliberately refuses to show.
+- **Airframe Diagram tab**, a plan view to scale drawn from the entered
+  numbers, nose up. Lift+cruise draws booms fore and aft of the wing with a
+  separate nose propeller; the vectored types mount their rotors along the
+  wing and draw no cruise propeller, because they have none. It reports the
+  tip-to-tip gap between adjacent discs and says so in red when they overlap.
+  Only span, wing area and propeller diameters are real inputs — boom
+  positions are a reasonable arrangement, not a claim about a specific
+  airframe, so it is for checking proportions and clearances rather than a
+  layout to build from.
+  Unlike the budgets and mission plots, the diagram survives both run types:
+  it describes the aircraft, not a flight.
+- **VTOL tests: 77 -> 85.**
+
+**VTOL v0.5.0** — measured propeller tables, wind, batch and matrix coverage
+The three gaps that mattered most, in the order they change answers.
+- **Measured propeller tables.** The VTOL ran entirely on figure-of-merit and
+  propeller-efficiency GUESSES. It now loads a thrust/power bench CSV for the
+  lift rotors and the cruise prop and uses the efficiency the hardware
+  actually achieved. On a 16 kg quad-rotor VTOL the shipped 22 in table gives
+  a figure of merit of 0.628 against the 0.650 estimate — 3.5% more hover
+  power than assumed.
+  Outside the thrust range the table covers, the estimate is used again and
+  Status says which is in force, because a bench test says nothing about
+  thrusts it never produced. A bad path raises immediately: a table you
+  think is loaded but is not is worse than no table.
+  The loader, power lookup and efficiency derivation live in
+  `rotorworks_core.py` so the VTOL is not a third copy.
+- **Wind.** The VTOL had none — not one line. Power follows AIRSPEED but
+  progress follows GROUNDSPEED, so a leg measured over the ground takes
+  longer into a headwind: on the survey mission a 5 m/s headwind costs +23%
+  energy over the identical 24.2 km track, and the same wind behind saves
+  21%. Wind reaches the GUI, the CLI (`--wind`, `--wind_direction`) and the
+  sensitivity re-fly.
+  A test asserting that station-keeping in wind costs MORE turned out to be
+  wrong — the model was right. Holding station into 8 m/s costs 203 W against
+  585 W hovering, because the wing is already carrying much of the weight.
+  That is translational lift, and the test now asserts it.
+- **Batch driver and coverage matrix.** `rotorworks-batch.py` accepts
+  `--sim vtol`, with its own GUI-key-to-CLI map and output parsing — a sweep
+  that runs but reports `nan` looks like it worked, so the matrix test checks
+  for that specifically. The matrix gained 11 VTOL cases: every configuration
+  with and without a table, every mission calm and windy, and a batch sweep.
+- **VTOL tests: 68 -> 77; matrix: 83 -> 94.**
+
+**VTOL v0.4.0** — the multicopter and fixed-wing feature set, ported
+The VTOL tool had two display tabs against the other simulators' ten. It now
+has the same set, answering the same questions the same way.
+- **Seven new display tabs**: Status, Mission Plots, Weight Budget, Power
+  Budget, Mission Diagram, Sensitivity and Compare, plus a **Wiring** input
+  tab. "Plots" is renamed **Fixed Speed Plots** to match.
+- **Status is VTOL-shaped.** It checks hover as well as cruise, because hover
+  is the heaviest steady load a VTOL carries and the case that sizes the
+  battery, the motors and the connectors. It also checks the transition/stall
+  margin, the wing's lift share at the cruise speed (flagging a cruise speed
+  set below the transition speed), and rotor tilt for the vectored types.
+- **A mission now produces a time series**, so Mission Plots, the altitude
+  trace and worst-case Status all have data. Status shows the WORST value
+  each check reached; Metrics shows the LAST instant flown; both say which.
+- **Optional detail inputs**, all blank by default: battery C-ratings, lift
+  and cruise motor power ratings, component masses, a hover download
+  override, and a main wire run with connector ratings. Wiring loss is solved
+  with the pack current and appears as its own Power Budget row.
+- **Every fault this project shipped elsewhere is now a test here**: that an
+  input actually reaches the model (the multicopter's wiring never did), that
+  Compare moves between two mission runs (the fixed-wing refreshed it before
+  storing the result), that a mission clears what only a single point can
+  answer, and that Sensitivity clears when it goes stale.
+- **VTOL tests: 27 -> 68.**
+
+**VTOL v0.3.0** — tiltrotor, tiltwing and tailsitter
+All four configurations now run. The three new ones previously raised
+`NotImplementedError` on purpose, rather than fall back to lift+cruise physics
+that would have been confidently wrong.
+- **Vectored thrust.** Lift+cruise carries two propulsion systems — rotors
+  that only lift, a propeller that only pushes. The other three carry ONE set
+  of rotors that does both by pointing its thrust. Two force balances fix the
+  thrust and its direction at every speed:
+  `T·cos(tilt) + L_wing = W·(1+download)` and `T·sin(tilt) = D`.
+  Tilt sweeps from 0 deg in hover to 90 deg in wing-borne cruise.
+- **Hover download** separates them from each other. A tiltrotor's rotors
+  blow onto a wing lying flat beneath them, costing about a tenth of the
+  weight (the V-22 runs 10-12%); a tiltwing and a tailsitter turn the wing
+  edge-on to the wash and escape most of it. The per-type figures are typical
+  published values and every one can be overridden with measured data.
+- **The central trade shows up correctly.** Tiltrotor pays the most to hover
+  (673 W against 602 for the others on the reference aircraft), and every
+  vectored type beats lift+cruise in cruise (151 W against 214 at 18 m/s)
+  because lift+cruise carries stopped rotors dragging through the whole leg.
+- **Tiltwing and tailsitter are identical in still air, deliberately.** In
+  steady flight they genuinely are close. What separates them is dynamics —
+  a tailsitter weathervanes broadside in a crosswind, a tiltwing keeps its
+  fuselage level, a tiltwing's wing gets slipstream lift in transition — none
+  of which a steady power model sees. Quantifying slipstream lift needs a
+  coverage factor there is no data to set, so both default to the same
+  download rather than being forced apart by an invented coefficient.
+- **28 new VTOL tests (27 -> 55)**, including force balance on both axes at
+  every speed, monotonic tilt, download vanishing once the wing takes over,
+  and a mission flown by every type. Continuity is tested by halving the
+  sample step and requiring the worst change to shrink proportionally — which
+  distinguishes a steep slope from a genuine jump, something a fixed
+  threshold cannot do.
+
+**v2.42.0** — wiring losses and connector ratings
+- **New Wiring tab** in both simulators, all inputs optional. Left blank the
+  model behaves exactly as before.
+- **Wire run**: one-way length plus either an AWG gauge or a measured Ω/m.
+  Length is one-way but current has to come back, so the resistance counts
+  BOTH conductors — forgetting the return path halves every loss and is the
+  easiest way to make wiring look harmless.
+  The loss is solved INSIDE the power fixed-point loop, because more loss
+  draws more current which costs more loss. The ESC and motor also see the
+  pack voltage minus `I·R`, so a long thin lead costs thrust as well as watts.
+- **Wire loss gets its own Power Budget row**, not folded into ESC losses: it
+  is the one loss a user can halve with a thicker cable, so it has to be
+  visible to be actionable. On a 450 quad with 2 m of 16 AWG it is 3.6 W,
+  2.6% of the total.
+- **Connector ratings** for the battery, ESC and motor links. Twelve types
+  (XT30/60/90, AS150, EC3/EC5, Deans, bullets 3.5-8 mm) pre-fill typical
+  continuous and burst figures, both editable — burst ratings vary too much
+  between manufacturers to hardcode.
+- **Status checks each connector against the current through IT**, which is
+  not the same number in each position: the battery connector carries the
+  whole pack current, an ESC connector one motor's share, and the motor
+  connector phase current (about 1.15x the DC current). Green under the
+  continuous rating, amber between, red above the burst — the same dual-limit
+  treatment as the battery C-rate rows.
 
 **v2.41.0** — Mission Diagram tab
 - **New Mission Diagram tab** in both simulators, drawn after a mission run.

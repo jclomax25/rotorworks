@@ -365,3 +365,83 @@ def test_gui_results_change_when_a_table_is_loaded(request, which, table):
 
     assert plain and tabled, "no run output captured"
     assert plain != tabled, "loading a table changed nothing in the output"
+
+
+# ======================================================================
+# VTOL COVERAGE
+# ======================================================================
+# The matrix exists because two bugs shipped through the same hole: they
+# appeared only in particular combinations of config, interface and table
+# state, and no single test covered the product. The VTOL had no equivalent
+# net at all until now.
+
+VTOL_SCRIPT = "vtol-power-sim-gui.py"
+VTOL_TYPES = ["lift+cruise", "tiltrotor", "tiltwing", "tailsitter"]
+VTOL_MISSIONS = sorted(glob.glob(os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "examples", "missions", "vtol_*.json")))
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("config_type", VTOL_TYPES)
+@pytest.mark.parametrize("with_table", [False, True], ids=["no-table", "with-table"])
+def test_vtol_every_type_and_table_state(paths, config_type, with_table):
+    """
+    Every configuration, with and without a measured propeller table. The
+    table state is exactly the axis that hid a multicopter crash for two
+    releases, so it is covered from the start here.
+    """
+    args = [sys.executable, os.path.join(paths["root"], VTOL_SCRIPT),
+            "--config_type", config_type]
+    if with_table:
+        args += ["--lift_prop_table",
+                 os.path.join(paths["root"], "tests", "data", "motor_prop_table.csv"),
+                 "--aircraft_weight" if False else "--weight", "16000",
+                 "--lift_prop_diameter", "22"]
+    result = subprocess.run(args, capture_output=True, text=True,
+                            timeout=300, cwd=paths["root"])
+    output = result.stdout + result.stderr
+    assert "Traceback" not in output, output[-400:]
+    assert result.returncode == 0, output[-400:]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("mission", VTOL_MISSIONS,
+                         ids=[os.path.basename(m) for m in VTOL_MISSIONS])
+@pytest.mark.parametrize("wind", [0.0, 7.0], ids=["still", "windy"])
+def test_vtol_every_mission_still_and_windy(paths, mission, wind):
+    """
+    Each example mission, flown calm and into wind. Wind changes the duration
+    of every distance-based leg, so it exercises a different path through the
+    mission loop than the still-air case.
+    """
+    result = subprocess.run(
+        [sys.executable, os.path.join(paths["root"], VTOL_SCRIPT),
+         "--mission", mission, "--battery_parallel", "3",
+         "--wind", str(wind)],
+        capture_output=True, text=True, timeout=300, cwd=paths["root"])
+    output = result.stdout + result.stderr
+    assert "Traceback" not in output, output[-400:]
+    assert result.returncode == 0, output[-400:]
+    assert "TOTAL" in output
+
+
+@pytest.mark.slow
+def test_vtol_runs_through_the_batch_driver(paths, tmp_path):
+    """
+    The batch driver accepted only the multicopter and fixed-wing. A VTOL
+    config saved from the GUI uses short field names, so the driver needs its
+    own map to the CLI — and a sweep that returns `nan` looks like it worked.
+    """
+    result = subprocess.run(
+        [sys.executable, os.path.join(paths["root"], "rotorworks-batch.py"),
+         "sweep", "--sim", "vtol", "--gui-config",
+         os.path.join("examples", "configs", "vtol_2m4_lift_cruise_survey.json"),
+         "--sweep-var", "cruise_speed", "--values", "18,24",
+         "--output-dir", str(tmp_path)],
+        capture_output=True, text=True, timeout=300, cwd=paths["root"])
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output[-400:]
+    assert "rc=0" in output, output[-400:]
+    assert "time=nan" not in output, \
+        "the sweep ran but no metrics were parsed from the VTOL's output"

@@ -41,6 +41,7 @@ except Exception:
 SIM_SCRIPT_DEFAULTS = {
     "fixedwing": "fixedwing-power-sim-gui.py",
     "multicopter": "multicopter-power-sim-gui.py",
+    "vtol": "vtol-power-sim-gui.py",
 }
 
 FLOAT_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
@@ -195,6 +196,17 @@ def parse_metrics(sim: str, stdout: str) -> Dict[str, Any]:
         cap_str(r"Reserve Status\s*:\s*([A-Z]+)", "reserve_status")
         cap_str(r"Thermal.*\[\s*([A-Z]+)\s*\]", "thermal_status")
     else:
+        # The VTOL reports endurance and range under its own headings, and
+        # has two of each — hover and cruise. Cruise is the one comparable to
+        # the other simulators' single figure, so that is what the sweep
+        # summary uses; hover is kept alongside because for a VTOL it is
+        # often the binding number.
+        cap_float(r"Cruise endurance\s*:\s*([-+]?\d*\.?\d+)\s*min", "flight_time_min")
+        cap_float(r"Cruise range\s*:\s*([-+]?\d*\.?\d+)\s*km", "flight_range_km")
+        cap_float(r"Hover endurance\s*:\s*([-+]?\d*\.?\d+)\s*min", "hover_endurance_min")
+        cap_float(r"Hover power\s*:\s*([-+]?\d*\.?\d+)\s*W", "hover_power_W")
+        cap_float(r"Cruise power\s*:\s*([-+]?\d*\.?\d+)\s*W", "cruise_power_W")
+        cap_float(r"Transition speed\s*:\s*([-+]?\d*\.?\d+)\s*m/s", "transition_speed_mps")
         cap_float(r"Estimated flight time.*:\s*([-+]?\d*\.?\d+)\s*min", "flight_time_min")
         cap_float(r"Estimated flight distance.*:\s*([-+]?\d*\.?\d+)\s*km", "flight_range_km")
         cap_float(r"Best endurance speed.*:\s*([-+]?\d*\.?\d+)\s*m/s", "best_endurance_speed_mps")
@@ -697,6 +709,33 @@ GUI_TO_CLI_MULTICOPTER = {
     "inflow_mu_bp": "inflow_mu_bp", "inflow_eff_bp": "inflow_eff_bp",
 }
 
+# The VTOL saves its config with short field keys, so the batch driver needs
+# its own map from those to the CLI's argument names — the same job the two
+# maps below do for the other simulators.
+GUI_TO_CLI_VTOL = {
+    "weight": "weight", "payload": "payload_mass_g",
+    "span": "wing_span", "area": "wing_area", "oswald": "oswald",
+    "n_lift": "num_lift_rotors", "lift_d": "lift_prop_diameter",
+    "lift_p": "lift_prop_pitch", "lift_kv": "lift_motor_kv",
+    "lift_rm": "lift_motor_resistance", "lift_wt": "lift_motor_weight",
+    "fom": "lift_figure_of_merit",
+    "n_cruise": "num_cruise_motors", "cruise_d": "cruise_prop_diameter",
+    "cruise_p": "cruise_prop_pitch", "cruise_kv": "cruise_motor_kv",
+    "cruise_rm": "cruise_motor_resistance", "cruise_wt": "cruise_motor_weight",
+    "cruise_eff": "cruise_prop_efficiency",
+    "stopped_area": "stopped_rotor_drag_area",
+    "chem": "battery_chemistry", "cell_cap": "battery_cell_capacity",
+    "series": "battery_series_cells", "parallel": "battery_parallel_cells",
+    "cell_wt": "battery_cell_weight_g", "vmin": "battery_voltage_min",
+    "vnom": "battery_voltage_nominal", "vmax": "battery_voltage_max",
+    "rcell": "battery_resistance_cell", "usable": "battery_usable_percent",
+    "avionics": "avionics_power", "esc_eff": "esc_efficiency",
+    "cruise_v": "cruise_speed", "alt": "altitude", "temp": "temperature",
+    "lift_table": "lift_prop_table", "cruise_table": "cruise_prop_table",
+    "wind": "wind", "wind_dir": "wind_direction",
+}
+
+
 GUI_TO_CLI_FIXEDWING = {
     "weight": "weight", "payload_mass_g": "payload_mass_g",
     "num_motors": "num_motors", "cruise_speed": "cruise_speed",
@@ -792,7 +831,8 @@ def load_gui_config(path: Optional[str], sim: str) -> Dict[str, Any]:
             "For a plain CLI-argument file use --base-args-file instead."
         )
 
-    mapping = GUI_TO_CLI_MULTICOPTER if sim == "multicopter" else GUI_TO_CLI_FIXEDWING
+    mapping = {"multicopter": GUI_TO_CLI_MULTICOPTER,
+               "vtol": GUI_TO_CLI_VTOL}.get(sim, GUI_TO_CLI_FIXEDWING)
     out: Dict[str, Any] = {}
     for gui_key, raw in (data.get("vars") or {}).items():
         cli_key = mapping.get(gui_key)
@@ -1132,7 +1172,7 @@ def make_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp: argparse.ArgumentParser) -> None:
-        sp.add_argument("--sim", choices=["fixedwing", "multicopter"], required=True)
+        sp.add_argument("--sim", choices=["fixedwing", "multicopter", "vtol"], required=True)
         sp.add_argument("--sim-script", default=None, help="Optional path to simulator script.")
         sp.add_argument("--base-args-file", default=None, help="JSON file with base CLI args object.")
         sp.add_argument(
