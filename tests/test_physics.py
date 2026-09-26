@@ -8,9 +8,12 @@ rather than just "test_foo failed".
 
 from __future__ import annotations
 
+import os
 import math
 
 import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 # ======================================================================
@@ -1784,3 +1787,241 @@ def test_peripheral_current_is_not_ignored_when_rails_exist(mc, mc_quad):
 
     assert with_periph > without, \
         "peripheral current was ignored because rails were defined"
+
+
+# ======================================================================
+# REAL AIRCRAFT — validated against published specifications
+# ======================================================================
+#
+# Two aircraft whose manufacturers publish enough to check the model against
+# something it did not choose. The VTOL suite has the same idea; these cover
+# the multicopter and fixed-wing sides.
+
+def test_dji_m300_hover_endurance_matches_the_published_figure(mc):
+    """
+    DJI publishes 55 minutes of hover for a Matrice 300 RTK at 6.3 kg with
+    two TB60 packs and no camera. This is the strongest validation in the
+    project: the battery energy is published, so NOTHING is tuned. The only
+    judgement call is usable capacity, left at the conventional 80%.
+
+    The pack energy is worth checking on its own — 11870 mAh at a 12S LiPo
+    nominal should come out at DJI's stated 548 Wh for the pair, and if it
+    does not, the battery model disagrees with DJI's arithmetic before any
+    aerodynamics are involved.
+    """
+    import json
+    path = os.path.join(ROOT, "examples", "configs",
+                        "multicopter_dji_m300_rtk.json")
+    cfg_vars = json.load(open(path))["vars"]
+
+    def f(key, default=0.0):
+        raw = str(cfg_vars.get(key, "")).strip()
+        return float(raw) if raw else default
+
+    battery = mc.BatteryConfig(
+        chemistry=cfg_vars["batt_chem"], operating_voltage_min=f("batt_vmin"),
+        operating_voltage_nominal=f("batt_vnom"), operating_voltage_max=f("batt_vmax"),
+        unit_mode="pack", pack_capacity_mAh=f("batt_pack_capacity"),
+        pack_weight_g=f("batt_pack_weight"), series_units=1, parallel_units=1,
+        cells_series_per_unit=12, discharge_percent=f("batt_dischg_pct"),
+        resistance_cell_mOhm=f("batt_r"), discharge_c_cont=f("batt_c_cont"))
+
+    pack_Wh = battery.pack_capacity_mAh / 1000.0 * battery.vnom_pack
+    assert pack_Wh == pytest.approx(548.0, rel=0.02), (
+        f"pack energy {pack_Wh:.0f} Wh against DJI's 2 x 274 = 548 Wh")
+
+    drone = mc.DroneConfig(
+        num_motors=4, battery=battery,
+        motor=mc.MotorConfig(kv=f("motor_kv"), idle_current=f("motor_i0"),
+                             idle_voltage=f("motor_v0"), rated_voltage=12,
+                             resistance=f("motor_r"), max_current=f("motor_imax"),
+                             max_power=f("motor_pmax"), weight_g=f("motor_weight")),
+        propeller=mc.PropellerConfig(diameter_in=21, pitch_in=10, max_rpm=0,
+                                     max_thrust_g=5500, blades=2, weight_g=95),
+        drone_weight_g=f("weight"), profile_drag_coefficient=None,
+        profile_area=None, parasite_drag_coefficient=None, parasite_area=None,
+        frontal_area=None, cruise_speed=15, periph_current=0,
+        motor_configuration="flat",
+        body_length_m=f("body_length_m"), body_width_m=f("body_width_m"),
+        body_height_m=f("body_height_m"), arm_length_m=f("arm_length_m"),
+        arm_width_m=f("arm_width_m"))
+    drone.air_density = mc.compute_air_density(0, 20)
+    drone.derive_drag_from_geometry_if_missing()
+
+    hover_W = mc.compute_operating_metrics(drone, 0.0, "hover")["total_power_W"]
+    usable_Wh = pack_Wh * f("batt_dischg_pct") / 100.0
+    endurance_min = usable_Wh / hover_W * 60.0
+
+    assert endurance_min == pytest.approx(55.0, rel=0.10), (
+        f"model hovers {endurance_min:.1f} min against DJI's published 55")
+
+
+def test_ebee_x_endurance_and_range_agree_with_one_battery_choice(fw):
+    """
+    senseFly publishes 90 min AND 95 km for the eBee X's endurance battery,
+    but not the battery capacity. Capacity is therefore fitted — to the
+    ENDURANCE only.
+
+    The check is what happens to the range, which was not fitted: it should
+    land on 95 km by itself. One free parameter satisfying two published
+    numbers is real evidence, if weaker than the M300's where nothing at all
+    is tuned.
+    """
+    import json
+    path = os.path.join(ROOT, "examples", "configs",
+                        "fixedwing_ebee_x_mapping.json")
+    cfg_vars = json.load(open(path))["vars"]
+
+    def f(key, default=0.0):
+        raw = str(cfg_vars.get(key, "")).strip()
+        return float(raw) if raw else default
+
+    battery = fw.BatteryConfig(
+        chemistry=cfg_vars["batt_chem"], operating_voltage_min=f("batt_vmin"),
+        operating_voltage_nominal=f("batt_vnom"), operating_voltage_max=f("batt_vmax"),
+        unit_mode="pack", pack_capacity_mAh=f("batt_pack_cap"),
+        pack_weight_g=f("batt_pack_wt"), series_units=1, parallel_units=1,
+        cells_series_per_unit=4, discharge_percent=f("batt_dischg_pct"),
+        resistance_cell_mOhm=f("batt_r"), discharge_c_cont=f("batt_c_cont"))
+    airframe = fw.AirframeConfig(
+        wing_span_m=f("wing_span"), wing_area_m2=f("wing_area"), CD0=f("CD0"),
+        oswald=f("oswald"), CL_max=f("CL_max"), prop_efficiency=f("prop_eff"),
+        num_motors=1)
+    cfg = fw.FixedWingConfig(
+        aircraft_weight_g=f("weight") + f("payload_mass_g"), airframe=airframe,
+        battery=battery,
+        motor=fw.MotorConfig(kv=f("motor_kv"), idle_current=f("motor_i0"),
+                             idle_voltage=f("motor_v0"), rated_voltage=4,
+                             resistance=f("motor_r"), max_current=f("motor_imax"),
+                             max_power=f("motor_pmax"), weight_g=f("motor_wt")),
+        propeller=fw.PropellerConfig(diameter_in=f("prop_d"), pitch_in=f("prop_pitch"),
+                                     blades=2, weight_g=f("prop_wt")),
+        cruise_speed_mps=f("cruise_speed"), air_density=1.225,
+        reference_altitude_m=0)
+
+    metrics = fw.compute_metrics(cfg, 17.6)
+    assert metrics["flight_time_min"] == pytest.approx(90.0, rel=0.05), \
+        f"endurance {metrics['flight_time_min']:.1f} min against a published 90"
+    assert metrics["flight_range_km"] == pytest.approx(95.0, rel=0.05), \
+        f"range {metrics['flight_range_km']:.1f} km against a published 95"
+
+    # Cruise must sit above stall, and senseFly's published band starts at 11.
+    assert metrics["stall_speed_mps"] < 11.0, \
+        f"stall {metrics['stall_speed_mps']:.1f} m/s is above the published cruise band"
+
+
+def _load_dji_config(mc, filename):
+    """Build a DroneConfig from one of the shipped DJI example files."""
+    import json
+    path = os.path.join(ROOT, "examples", "configs", filename)
+    g = json.load(open(path))["vars"]
+
+    def f(key, default=0.0):
+        raw = str(g.get(key, "")).strip()
+        return float(raw) if raw else default
+
+    battery = mc.BatteryConfig(
+        chemistry=g["batt_chem"], operating_voltage_min=f("batt_vmin"),
+        operating_voltage_nominal=f("batt_vnom"), operating_voltage_max=f("batt_vmax"),
+        unit_mode="pack", pack_capacity_mAh=f("batt_pack_capacity"),
+        pack_weight_g=f("batt_pack_weight"), series_units=1, parallel_units=1,
+        cells_series_per_unit=int(f("batt_cells_series")),
+        discharge_percent=f("batt_dischg_pct"), resistance_cell_mOhm=f("batt_r"),
+        discharge_c_cont=f("batt_c_cont"))
+    drone = mc.DroneConfig(
+        num_motors=4, battery=battery,
+        motor=mc.MotorConfig(kv=f("motor_kv"), idle_current=f("motor_i0"),
+                             idle_voltage=f("motor_v0"), rated_voltage=12,
+                             resistance=f("motor_r"), max_current=f("motor_imax"),
+                             max_power=f("motor_pmax"), weight_g=f("motor_weight")),
+        propeller=mc.PropellerConfig(diameter_in=f("prop_d"), pitch_in=f("prop_pitch"),
+                                     max_rpm=0, max_thrust_g=f("prop_max_thrust"),
+                                     blades=2, weight_g=f("prop_weight")),
+        drone_weight_g=f("weight"), profile_drag_coefficient=None, profile_area=None,
+        parasite_drag_coefficient=None, parasite_area=None, frontal_area=None,
+        cruise_speed=f("speed"), periph_current=0, motor_configuration="flat",
+        body_length_m=f("body_length_m"), body_width_m=f("body_width_m"),
+        body_height_m=f("body_height_m"), arm_length_m=f("arm_length_m"),
+        arm_width_m=f("arm_width_m"))
+    drone.air_density = mc.compute_air_density(0, 20)
+    drone.derive_drag_from_geometry_if_missing()
+    usable_Wh = (battery.pack_capacity_mAh / 1000.0 * battery.vnom_pack
+                 * f("batt_dischg_pct") / 100.0)
+    return drone, usable_Wh
+
+
+def _hover_endurance_min(mc, drone, usable_Wh):
+    power = mc.compute_operating_metrics(drone, 0.0, "hover")["total_power_W"]
+    return usable_Wh / power * 60.0
+
+
+def test_m350_is_shorter_legged_than_the_m300_by_the_right_margin(mc):
+    """
+    The M350 and M300 share an airframe. The M350 is heavier (6.47 vs 6.3 kg)
+    on LESS energy (526 vs 548 Wh), so it must hover for less time — and by
+    roughly the ratio those two numbers imply.
+
+    This is a sensitivity check, which is worth more than another absolute
+    one: a model can be right about one aircraft by luck, but not about the
+    DIFFERENCE between two that DJI documents separately.
+    """
+    m300, m300_Wh = _load_dji_config(mc, "multicopter_dji_m300_rtk.json")
+    m350, m350_Wh = _load_dji_config(mc, "multicopter_dji_m350_rtk.json")
+
+    m300_min = _hover_endurance_min(mc, m300, m300_Wh)
+    m350_min = _hover_endurance_min(mc, m350, m350_Wh)
+
+    assert m350_min < m300_min, "the heavier aircraft on less energy lasted longer"
+    # Energy is 4% down and weight 2.7% up, so expect roughly 5-8% less.
+    assert 0.88 < m350_min / m300_min < 0.98, (
+        f"M350 is {m350_min / m300_min:.3f} of the M300 — outside what the "
+        "weight and energy difference can explain")
+    assert m350_min == pytest.approx(55.0, rel=0.10), (
+        f"M350 hovers {m350_min:.1f} min against a published 55 (measured by "
+        "DJI at ~8 m/s, so this is the conservative comparison)")
+
+
+def test_the_m30_documents_where_this_model_stops_being_accurate(mc):
+    """
+    KNOWN LIMITATION, pinned deliberately.
+
+    The M30 is half the M300's weight on 16 in rotors instead of 21. The
+    model predicts 47 min of hover against DJI's published 36 — it is 31%
+    OPTIMISTIC, and this test asserts that gap rather than hiding it.
+
+    Overall hover efficiency, ideal momentum power over electrical power:
+
+        M300, 21 in rotors: model 69.4%, real 69.2%   essentially exact
+        M30,  16 in rotors: model 74.8%, real 57.3%   far too kind
+
+    The model gets the large aircraft almost exactly right, then carries the
+    same efficiency down to half the size. It has NO size dependence in its
+    efficiency chain and real hardware plainly does — roughly 12 points lost
+    scaling down, from lower propeller Reynolds number and from smaller
+    motors and ESCs.
+
+    Not fixed deliberately: two aircraft is not a scaling law, and fitting
+    one to two points would be inventing a coefficient. If someone does fix
+    it with real bench data, this test fails — and it should, because the
+    right response is to update the expectation here rather than to discover
+    the change by accident somewhere else.
+    """
+    m30, usable_Wh = _load_dji_config(mc, "multicopter_dji_m30.json")
+    predicted = _hover_endurance_min(mc, m30, usable_Wh)
+    published = 36.0
+
+    assert predicted > published, "the known optimism has reversed"
+    assert 1.20 < predicted / published < 1.45, (
+        f"the M30 gap is now {predicted / published:.2f}x, not the documented "
+        "~1.31x — if the figure-of-merit scaling was fixed, update this test")
+
+    # The model's reported figure of merit is a DERIVED diagnostic, not an
+    # input: it is ideal induced power over the model's own induced power.
+    # It reading higher for the smaller rotor is a symptom of the missing
+    # size dependence, not its cause. Pinned so a fix is noticed.
+    m300, _ = _load_dji_config(mc, "multicopter_dji_m300_rtk.json")
+    fom_small = mc.compute_operating_metrics(m30, 0.0, "hover")["figure_of_merit"]
+    fom_large = mc.compute_operating_metrics(m300, 0.0, "hover")["figure_of_merit"]
+    assert fom_small > fom_large, (
+        "the small-rotor figure of merit is no longer above the large-rotor "
+        "one — the scaling may have been corrected, so revisit the M30 gap")

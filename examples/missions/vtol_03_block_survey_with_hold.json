@@ -1,0 +1,88 @@
+{
+  "_comment": "Photogrammetric block survey with a hold on station, sized for a WingtraOne GEN II class aircraft (16 m/s cruise, ~59 min).\n\nThe block is flown at 120 m AGL with roughly 200 m line spacing; the 20 km of survey line here covers about 400 ha, which is the coverage this class is sold on. Lines alternate heading by 180 degrees as a real lawnmower pattern does, so in wind half of them are into it.\n\nThe hold partway through is the thing a fixed-wing cannot do: stopping to look at something. It is expensive \u2014 950 W in still air against about 130 W in cruise \u2014 but it gets dramatically cheaper in wind, down to 190 W at 12 m/s, because holding station means flying at the wind speed through the air and the wing starts carrying the weight. That is translational lift, and it is why hovering into a breeze is easier than in dead calm.",
+  "reserve_percent": 20,
+  "transition_time_s": 10,
+  "phases": [
+    {
+      "name": "Vertical climb",
+      "kind": "climb",
+      "duration": 40,
+      "climb_rate_mps": 2.5,
+      "altitude": 100
+    },
+    {
+      "name": "Transition out",
+      "kind": "transition",
+      "duration": 10,
+      "speed": 16.0,
+      "altitude": 100
+    },
+    {
+      "name": "Transit to block",
+      "kind": "cruise",
+      "distance": 2000,
+      "speed": 16.0,
+      "altitude": 120,
+      "course_deg": 0
+    },
+    {
+      "name": "Survey lines north",
+      "kind": "cruise",
+      "distance": 5000,
+      "speed": 14.0,
+      "altitude": 120,
+      "course_deg": 0
+    },
+    {
+      "name": "Survey lines south",
+      "kind": "cruise",
+      "distance": 5000,
+      "speed": 14.0,
+      "altitude": 120,
+      "course_deg": 180
+    },
+    {
+      "name": "Hold on station",
+      "kind": "hover",
+      "duration": 90,
+      "altitude": 120
+    },
+    {
+      "name": "Survey lines north 2",
+      "kind": "cruise",
+      "distance": 5000,
+      "speed": 14.0,
+      "altitude": 120,
+      "course_deg": 0
+    },
+    {
+      "name": "Survey lines south 2",
+      "kind": "cruise",
+      "distance": 5000,
+      "speed": 14.0,
+      "altitude": 120,
+      "course_deg": 180
+    },
+    {
+      "name": "Return transit",
+      "kind": "cruise",
+      "distance": 2000,
+      "speed": 16.0,
+      "altitude": 120,
+      "course_deg": 180
+    },
+    {
+      "name": "Transition back",
+      "kind": "transition",
+      "duration": 12,
+      "speed": 0.0,
+      "altitude": 60
+    },
+    {
+      "name": "Vertical descent",
+      "kind": "descend",
+      "duration": 30,
+      "altitude": 0
+    }
+  ]
+}

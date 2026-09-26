@@ -1,0 +1,58 @@
+{
+  "_comment": "Transmission-line corridor inspection, sized for a Trinity F90+ class aircraft (17 m/s cruise, ~90 min).\n\nUtilities fly corridors as a long out-and-back rather than a block: the asset is linear, so the flight plan is too. 120 m AGL is the BVLOS ceiling in most of Europe and the US. The outbound imaging run is flown at 14 m/s because ground-sample distance and motion blur set the speed when you are photographing something; the return is a straight transit at 17 m/s with nothing to shoot.\n\nRun it with wind to see why that asymmetry matters. Outbound and return are reciprocal headings, so intuition says the wind should roughly cancel. It does not: an 8 m/s crosswind-on-the-nose takes the SLOW imaging leg from 31 to 72 minutes while the faster return only saves 8, and the whole flight goes from 62 to 97 minutes. A headwind hurts most on the leg you are already flying slowly. The mission still completes on this aircraft, but with the reserve margin down from 54 Wh to 21 Wh.",
+  "reserve_percent": 20,
+  "transition_time_s": 12,
+  "phases": [
+    {
+      "name": "Vertical climb",
+      "kind": "climb",
+      "duration": 30,
+      "climb_rate_mps": 2.5,
+      "altitude": 70
+    },
+    {
+      "name": "Transition out",
+      "kind": "transition",
+      "duration": 12,
+      "speed": 17.0,
+      "altitude": 70
+    },
+    {
+      "name": "Transit to corridor",
+      "kind": "cruise",
+      "distance": 3500,
+      "speed": 17.0,
+      "altitude": 120,
+      "course_deg": 45
+    },
+    {
+      "name": "Corridor imaging run",
+      "kind": "cruise",
+      "distance": 26000,
+      "speed": 14.0,
+      "altitude": 120,
+      "course_deg": 90
+    },
+    {
+      "name": "Return transit",
+      "kind": "cruise",
+      "distance": 27000,
+      "speed": 17.0,
+      "altitude": 120,
+      "course_deg": 265
+    },
+    {
+      "name": "Transition back",
+      "kind": "transition",
+      "duration": 15,
+      "speed": 0.0,
+      "altitude": 70
+    },
+    {
+      "name": "Vertical descent",
+      "kind": "descend",
+      "duration": 35,
+      "altitude": 0
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 # RotorWorks UAV Power Simulators
 
 **UASforge / dronefoundry**  
-*Multicopter and fixed-wing v2.42.0 · VTOL v1.1.0*
+*Multicopter and fixed-wing v2.42.0 · VTOL v1.2.0*
 
 A suite of cross-platform UAV powertrain performance tools:
 
@@ -128,6 +128,7 @@ somewhere else without it will fail at startup.
 - [Simple vs Advanced mode](#simple-vs-advanced-mode)
 - [Example configs and missions](#example-configs-and-missions)
 - [VTOL simulator](#vtol-simulator)
+- [Accuracy: what the validated aircraft show](#accuracy-what-the-validated-aircraft-show)
 - [GUI reference](#gui-reference)
 - [CLI reference](#cli-reference)
 - [Batch driver](#batch-driver-rotorworks-batchpy)
@@ -149,7 +150,7 @@ fixedwing-power-sim-gui.py      fixed-wing simulator (GUI + CLI)
 vtol-power-sim-gui.py           VTOL simulator, four configurations (GUI + CLI)
 rotorworks-batch.py             sweeps, sizing studies, scripted runs
 drag_coefficient_calculator.py  drag coefficients from photographs
-examples/                       13 aircraft configs, 15 missions
+examples/                       17 aircraft configs, 18 missions
 tests/                          583 pytest tests
 ```
 
@@ -180,7 +181,6 @@ pip install -r requirements.txt
 
 ```txt
 numpy>=1.21
-scipy>=1.8
 pandas>=1.4
 matplotlib>=3.6
 Pillow>=9.0
@@ -192,7 +192,7 @@ What each is needed for:
 
 | Package | Needed for |
 |---|---|
-| numpy, scipy, pandas, matplotlib | Core simulation and plotting (required) |
+| numpy, pandas, matplotlib | Core simulation and plotting (required) |
 | `Pillow` | Photo loading in the drag calculator only |
 | `openpyxl` | **Export Excel** button only |
 | `reportlab` | **Generate Report** (PDF) button only |
@@ -296,7 +296,7 @@ The batch driver has a matching `--mode simple|advanced` flag; see
 
 ## Example configs and missions
 
-`examples/` ships with 13 aircraft configs and 15 missions. Load a config with
+`examples/` ships with 17 aircraft configs and 18 missions. Load a config with
 **Load Config**, or feed it to the batch driver with `--gui-config`.
 
 ### Configs — multicopter
@@ -317,6 +317,69 @@ The batch driver has a matching `--mode simple|advanced` flag; see
 | `fixedwing_900mm_fpv_wing_4S.json` | 900 mm flying wing, 980 g | Low aspect ratio, fast cruise |
 | `fixedwing_2m_survey_4S.json` | 2 m surveyor, 2600 g + 400 g | Cambered airfoil, cleaner airframe |
 | `fixedwing_3m_endurance_6S_liion.json` | 3 m endurance, 4200 g, 6S4P | CD0 0.019, Oswald 0.92 — the gap vs the trainer *is* the value of a clean airframe |
+
+### Real aircraft, validated against published data
+
+Five configs describe aircraft that exist and whose manufacturers publish
+enough to check the model against something it did not choose.
+
+| File | Aircraft | Published check | Model | Published |
+|---|---|---|---|---|
+| `multicopter_dji_m300_rtk.json` | DJI Matrice 300 RTK | Hover, 6.3 kg no payload | **55.2 min** | 55 min |
+| `multicopter_dji_m350_rtk.json` | DJI Matrice 350 RTK | Hover, 6.47 kg | **52.1 min** | 55 min |
+| `multicopter_dji_m30.json` | DJI Matrice 30 | Hover, 3.77 kg | **47.0 min** | 36 min ⚠ |
+| `fixedwing_ebee_x_mapping.json` | senseFly eBee X | Endurance / range | **89.8 min / 94.9 km** | 90 min / 95 km |
+| `vtol_trinity_f90_lift_cruise.json` | Quantum-Systems Trinity F90+ | Total flight time | **89.9 min** | 90 min |
+| `vtol_wingtraone_gen2_tailsitter.json` | Wingtra WingtraOne GEN II | Total flight time | **59.5 min** | 59 min |
+
+**The M300 is the strongest of these, because nothing is tuned.** DJI
+publishes the battery energy, so the pack comes out at 548 Wh by arithmetic
+and the hover power is whatever the momentum theory says. The only judgement
+call is usable capacity, left at the conventional 80%.
+
+The other three fit exactly one number — `CD0` for the two VTOLs, battery
+capacity for the eBee X — and are then checked against a **second** published
+figure that was not fitted:
+
+- the **eBee X** pack is sized to the 90 min endurance, and its range comes
+  out at 94.9 km against a published 95;
+- the **Trinity** drag is fitted to the 90 min endurance, and the resulting
+  L/D_max of 16.7 sits near its separately published 14:1 glide ratio.
+
+**The M30 misses by 31%, and it is shipped BECAUSE it misses.** It is the
+clearest evidence here of where this model stops being accurate. Comparing
+overall hover efficiency — ideal momentum power over electrical power:
+
+| | Model | Real |
+|---|---|---|
+| M300, 21 in rotors | 69.4% | **69.2%** |
+| M30, 16 in rotors | 74.8% | **57.3%** |
+
+The model gets the large aircraft almost exactly right and then carries that
+same efficiency down to half the size, where it does not hold. **It has no
+size dependence in its efficiency chain and real hardware plainly does** —
+about 12 points lost scaling down, from lower propeller Reynolds number and
+from smaller motors and ESCs being less efficient.
+
+**This is not fixed, deliberately.** Two aircraft is not a scaling law, and
+fitting one to two points would be inventing a coefficient — the mistake that
+made the propeller thrust fit 2x wrong earlier in this project. Correcting it
+needs bench data across a range of rotor sizes.
+
+**Practical consequence: trust this model least on small rotors.** Below about
+16 in, load a measured propeller table and the estimate is bypassed entirely.
+A test pins the gap deliberately, so a future fix fails loudly rather than
+being discovered by accident.
+
+The M300 and M350 together are a **sensitivity** check, which is worth more
+than another absolute one: the M350 is heavier (6.47 vs 6.3 kg) on less energy
+(526 vs 548 Wh), and the model puts it 5.6% shorter-legged, which is what
+those two numbers imply. A model can be right about one aircraft by luck, but
+not about the difference between two documented separately.
+
+Each file separates `_published` from `_inferred`, and `_calibration` says
+exactly what was fitted and to what — including, for the M30, that nothing was
+fitted and it still misses. Read those before trusting a number.
 
 ### Configs — VTOL
 
@@ -349,6 +412,31 @@ published 14:1 glide ratio**, so two independent manufacturer numbers agree
 on the same drag. And the tailsitter comes out 40% draggier than the clean
 pusher layout, which is the right direction and roughly the right size for a
 bluff body, exposed motor pods and landing feet carried into cruise.
+
+### VTOL missions
+
+Four, each a real operational profile rather than a shape chosen to exercise
+the code. All were checked to complete on the aircraft they are sized for,
+with reserve to spare.
+
+| File | Profile | What it shows |
+|---|---|---|
+| `vtol_01_lift_cruise_survey.json` | Generic area survey | The energy split across hover, transition and cruise |
+| `vtol_02_corridor_powerline.json` | Transmission-line corridor, out and back | Why reciprocal headings do **not** cancel in wind |
+| `vtol_03_block_survey_with_hold.json` | 400 ha photogrammetric block with a hold | Translational lift: the hold gets cheaper in wind |
+| `vtol_04_delivery_hover_drop.json` | Delivery with a low winch drop | What hovering mid-mission actually costs |
+
+The corridor one is worth running with wind. Outbound and return are
+reciprocal, so intuition says the wind should roughly cancel — it does not.
+An 8 m/s headwind takes the slow 14 m/s imaging leg from 31 to 72 minutes
+while the faster return saves only 8, and the flight goes from 62 to 97
+minutes. **A headwind hurts most on the leg you are already flying slowly**,
+which is the leg you cannot speed up without ruining the imagery.
+
+The delivery one puts numbers on the VTOL's central trade: the winch hover
+costs 1043 W against 115 W in cruise — **nine times** — and the vertical
+climbs are dearer still at about 1230 W, because climbing adds the work of
+raising the aircraft on top of holding it up.
 
 Change **Configuration** in the GUI (or `--config_type`) to fly any of these
 airframes as a different type and compare — but note that doing so is a
@@ -477,6 +565,29 @@ types, and whether the efficiency in use is measured or estimated.
   claim about a specific airframe. Only span, wing area and propeller
   diameters are real inputs, so it is for checking proportions and
   clearances, not a layout to build from.
+- **Wing–nacelle interference**, and there is a measured number for how much
+  that costs. NASA flight-tested the GL-10 "Greased Lightning" tiltwing — a
+  3.17 m, 28 kg distributed-propulsion aircraft with eight motors on the
+  wing — and published the result in NASA/TM-2017-219794:
+
+  | | L/D max |
+  |---|---|
+  | NASA conceptual design tools predicted | 16 |
+  | **Measured in flight test** | **7.2** |
+
+  This model is in the same class of tool and predicts 16–17 for that
+  geometry, so it would repeat the same 2.2× error. The TM attributes the gap
+  to "the complexity of wing and nacelle interactions" — exactly what a
+  lifting-line model with a flat-plate CD0 cannot see.
+
+  The practical consequence: on an aircraft with **many nacelles spread
+  across the wing**, expect this model to be optimistic about cruise, and
+  calibrate `CD0` against measured endurance rather than trusting a
+  first-principles estimate. The two shipped real-aircraft examples both have
+  two or three clean nacelles, which is why their first-principles drag was
+  close to right. Reaching the GL-10's measured 7.2 would need a `CD0` of
+  0.165 — 5.5× a clean-airframe value, and not a number that means anything
+  physically.
 
 ---
 
@@ -902,6 +1013,47 @@ Notes:
 - Power interpolation is **thrust-based**.
 - A `Throttle` column overrides the analytic throttle estimate in
   single-point mode.
+
+---
+
+## Accuracy: what the validated aircraft show
+
+Four aircraft have been checked against published manufacturer figures using
+**first-principles inputs only** — no drag or efficiency fitted. Ordered by
+how optimistic the untuned model turned out to be:
+
+| Aircraft | Simulator | Size | Model / real |
+|---|---|---|---|
+| Trinity F90+ | VTOL | 2.39 m span | **0.99** |
+| DJI Matrice 300 RTK | multicopter | 21 in rotors | **1.00** |
+| Wingtra WingtraOne GEN II | VTOL | 1.25 m span | **1.13** |
+| DJI Matrice 30 | multicopter | 16 in rotors | **1.31** |
+
+**The two large aircraft are essentially exact; the two smaller ones are
+optimistic, by more the smaller they get.** That holds across two independent
+simulators with different physics, which is what makes it worth stating: it
+is unlikely to be a coincidence of one code path.
+
+The probable cause is that nothing in these models depends on scale. A
+propeller's figure of merit falls with Reynolds number, and small motors and
+ESCs are less efficient than large ones — none of which is represented. The
+models were built and checked against large-aircraft data, and that is where
+they are trustworthy.
+
+**How to use this.** For aircraft in the 5 kg and up, 20 in rotor or 2 m span
+class, expect the untuned model to be close. Below that, expect it to flatter
+your design by 10-30%, and either:
+
+- load a **measured propeller table** (Propeller tab, or `--lift_prop_table`
+  / `--prop_table`), which bypasses the efficiency estimate entirely; or
+- **calibrate `CD0` or the figure of merit** against a measured endurance,
+  as the WingtraOne and eBee X configs do — each says in its `_calibration`
+  block exactly what was fitted.
+
+**This is not corrected in code, deliberately.** Four aircraft is a pattern,
+not a scaling law, and fitting one would be inventing a coefficient. It is
+documented instead, and the M30 gap is pinned by a test so that a future fix
+with real bench data fails loudly rather than passing unnoticed.
 
 ---
 
@@ -2418,7 +2570,7 @@ fine. Open the file and check the values are numeric.
 
 ## Testing
 
-A pytest suite lives in `tests/` — 587 tests covering physics, the shared
+A pytest suite lives in `tests/` — 616 tests covering physics, the shared
 core, the CLI, the GUI, the batch driver, and the drag calculator. See
 `tests/README.md`.
 
@@ -2432,12 +2584,12 @@ xvfb-run -a pytest            # headless machines (GUI tests need a display)
 | Suite | Tests | Covers |
 |---|---|---|
 | `test_golden.py` | 1 | 348 stored numeric outputs; fails if any value drifts |
-| `test_core.py` | 94 | The shared core, plus checks that both simulators really delegate to it |
-| `test_physics.py` | 130 | Battery topology, atmosphere, rotor inflow, prop efficiency, SoC, drag, landing, drag calculator |
+| `test_core.py` | 100 | The shared core, plus checks that both simulators really delegate to it |
+| `test_physics.py` | 136 | Battery topology, atmosphere, rotor inflow, prop efficiency, SoC, drag, landing, drag calculator |
 | `test_cli.py` | 70 | Subprocess runs of every argument path and example mission, plus edge cases and malformed input |
 | `test_gui.py` | 46 | Real Tk window: hover events, mode toggle, config load, missions, exports |
 | `test_batch.py` | 20 | Sweeps, sizing, mode enforcement, and GUI↔CLI consistency |
-| `test_matrix.py` | 94 | Every config and mission, GUI **and** CLI, with **and** without a propeller table — VTOL included |
+| `test_matrix.py` | 108 | Every config and mission, GUI **and** CLI, with **and** without a propeller table — VTOL included |
 | `test_vtol.py` | 104 | All four VTOL types: vectored-thrust force balance, tilt, download, transition acceleration, time-stepped missions, wind, bench tables, and the GUI tabs |
 | `test_drag_calculator.py` | 31 | Shoelace geometry, self-intersection detection, pixel scaling, ISA density, ArduPilot BCOEF and MCOEF |
 

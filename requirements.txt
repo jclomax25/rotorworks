@@ -1,6 +1,5 @@
 # Core simulation and plotting (required)
 numpy>=1.21
-scipy>=1.8
 pandas>=1.4
 matplotlib>=3.6
 
