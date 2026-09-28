@@ -44,21 +44,33 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 @pytest.fixture(scope="module")
 def dc():
     """The drag calculator module, loaded without needing a display."""
-    for name in ("tkinter", "tkinter.ttk", "tkinter.messagebox",
-                 "tkinter.filedialog", "tkinter.simpledialog", "tkinter.font"):
-        sys.modules.setdefault(name, types.ModuleType(name))
-    # ttk.Frame and tk.Tk are subclassed at import time, so they must be
-    # classes rather than bare module attributes.
-    ttk = sys.modules["tkinter.ttk"]
-    tk = sys.modules["tkinter"]
-    for mod, attrs in ((ttk, ("Frame", "Notebook", "Label", "Button", "Entry",
-                              "Combobox", "Treeview", "Scrollbar", "LabelFrame",
-                              "Radiobutton", "Checkbutton", "Style", "Separator")),
-                       (tk, ("Tk", "Canvas", "Text", "StringVar", "Frame",
-                             "Toplevel", "Menu", "PhotoImage", "TclError"))):
-        for attr in attrs:
-            if not hasattr(mod, attr):
-                setattr(mod, attr, type(attr, (object,), {"__init__": lambda self, *a, **k: None}))
+    # Only stub when there is no real tkinter. Stubbing unconditionally
+    # looked safe because setdefault leaves an imported module alone — but
+    # `import tkinter` does not pull in tkinter.simpledialog, so the
+    # placeholder took that slot and matplotlib's Tk backend later died on
+    # "cannot import name SimpleDialog", erroring every GUI test that ran
+    # afterwards in the same session.
+    try:
+        import tkinter  # noqa: F401
+        import tkinter.simpledialog  # noqa: F401
+        import tkinter.ttk  # noqa: F401
+    except ImportError:
+        for name in ("tkinter", "tkinter.ttk", "tkinter.messagebox",
+                     "tkinter.filedialog", "tkinter.simpledialog",
+                     "tkinter.font"):
+            sys.modules.setdefault(name, types.ModuleType(name))
+        # ttk.Frame and tk.Tk are subclassed at import time, so they must be
+        # classes rather than bare module attributes.
+        ttk = sys.modules["tkinter.ttk"]
+        tk = sys.modules["tkinter"]
+        for mod, attrs in ((ttk, ("Frame", "Notebook", "Label", "Button", "Entry",
+                                  "Combobox", "Treeview", "Scrollbar", "LabelFrame",
+                                  "Radiobutton", "Checkbutton", "Style", "Separator")),
+                           (tk, ("Tk", "Canvas", "Text", "StringVar", "Frame",
+                                 "Toplevel", "Menu", "PhotoImage", "TclError"))):
+            for attr in attrs:
+                if not hasattr(mod, attr):
+                    setattr(mod, attr, type(attr, (object,), {"__init__": lambda self, *a, **k: None}))
 
     path = os.path.join(_ROOT, "drag_coefficient_calculator.py")
     spec = importlib.util.spec_from_file_location("drag_calc", path)
