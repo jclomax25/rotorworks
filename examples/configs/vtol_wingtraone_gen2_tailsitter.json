@@ -37,7 +37,7 @@
     "cruise_kv": "480",
     "cruise_rm": "0.095",
     "cruise_wt": "0",
-    "cruise_eff": "0.70",
+    "cruise_eff": "0.81",
     "stopped_area": "0",
     "chem": "Li-ion",
     "cell_cap": "2500",
@@ -60,5 +60,6 @@
     "wind_dir": "0",
     "mission": ""
   },
-  "_calibration": "CD0 back-solved so the model reproduces the published 59 min flight time over a climb/transition/cruise/land profile flown to a 15% reserve. A first-principles guess of 0.024 gave 66.8 min \u2014 13% optimistic, which is what you would expect from a tailsitter's bluff body, exposed motor pods and landing feet. The higher figure is the honest one."
+  "_calibration": "CD0 back-solved so the model reproduces the published 59 min flight time over a climb/transition/cruise/land profile flown to a 15% reserve. A first-principles guess of 0.024 gave 66.8 min \u2014 13% optimistic, which is what you would expect from a tailsitter's bluff body, exposed motor pods and landing feet. The higher figure is the honest one.",
+  "_motor_model_migration": "cruise_eff is the PROPELLER's efficiency alone. Before v1.11 the VTOL had no motor electrical model and this field was the combined motor-and-propeller figure (0.70); it was converted by dividing out the motor efficiency the Kv/Rm/I0 model now computes at the cruise point (0.869), so the cruise leg costs what it did before and the motor's loss is now itemised rather than hidden. CD0 was NOT re-tuned. With the motor model the profile flies 58.4 min against the published 59."
 }

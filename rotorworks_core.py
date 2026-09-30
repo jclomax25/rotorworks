@@ -40,6 +40,7 @@ from __future__ import annotations
 import math
 import re
 import os
+import sys
 from typing import List, Optional, Tuple
 
 import numpy as np
@@ -95,7 +96,35 @@ __all__ = [
     "make_figure",
     # GUI
     "Tooltip",
+    # console
+    "make_console_safe",
 ]
+
+
+# ============================================================
+# CONSOLE
+# ============================================================
+
+def make_console_safe() -> None:
+    """
+    Never let printing a symbol crash a run.
+
+    The CLIs print units such as mu, Omega, degrees and arrows. On Windows,
+    when output goes to a pipe or a file rather than a terminal, Python
+    encodes it with the ANSI code page (cp1252), which has no mu — so a
+    perfectly good run died with UnicodeEncodeError halfway through its
+    report, and every subprocess test and batch run on Windows failed with
+    it. Linux and macOS use UTF-8 and never saw it.
+
+    Keeping the stream's own encoding and replacing only what it cannot
+    represent means a UTF-8 console is untouched and a cp1252 one shows "?"
+    for the odd symbol instead of a traceback.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass          # not a text stream we can reconfigure; leave it
 
 
 # ============================================================
@@ -1628,7 +1657,8 @@ def build_power_budget(total_in_W: float,
                        peripheral_W: float = 0.0,
                        peripheral_V: Optional[float] = None,
                        peripheral_A: Optional[float] = None,
-                       rails: Optional[List[dict]] = None) -> List[dict]:
+                       rails: Optional[List[dict]] = None,
+                       motor_iron_W: float = 0.0) -> List[dict]:
     """
     Break the pack's electrical output into where every watt ends up.
 
@@ -1703,6 +1733,10 @@ def build_power_budget(total_in_W: float,
 
     # ---- lost ---------------------------------------------------------
     add("Motor copper loss (I2Rm)", motor_copper_W, "lost")
+    if motor_iron_W > 0:
+        # Only the VTOL passes this: the no-load current times back-EMF, the
+        # iron and bearing loss a motor pays even when lightly loaded.
+        add("Motor no-load loss (I0 x V)", motor_iron_W, "lost")
     add("ESC losses", esc_loss_W, "lost")
     if wire_loss_W > 0:
         # Its own row rather than folded into "ESC losses": wiring is the one

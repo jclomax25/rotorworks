@@ -1,7 +1,7 @@
 {
   "schema": "vtol_power_sim_v1",
   "config_type": "lift+cruise",
-  "_comment": "Quantum-Systems Trinity F90+ survey VTOL. Modelled as lift+cruise, which is what it is ENERGETICALLY: its two front rotors tilt for the transition but are switched off and stopped in cruise, and all forward thrust comes from the dedicated rear pusher. Calling it a tiltrotor would put the front rotors to work in cruise, which is not what the aircraft does.",
+  "_comment": "Quantum-Systems Trinity F90+ survey VTOL. Its flight drive is three motors: two front motors on folding propellers and one rear motor on a rigid propeller. All three point up for take-off and landing; in cruise the rear motor tilts forward and provides all the thrust while the two front motors switch off and fold. Modelled as lift+cruise with THREE lift rotors (all three hover) and one cruise motor (the rear one, tilted). The rear motor therefore appears twice in the Weight Budget; the airframe weight is entered directly, so this changes no computed result.",
   "_published": {
     "source": "Quantum-Systems Trinity F90+ system description and datasheet",
     "mtow_kg": 5.0,
@@ -11,7 +11,13 @@
     "cruise_mps": 17.0,
     "endurance_min": "90+ (unlocked), <60 (locked)",
     "glide_ratio": 14.0,
-    "wind_tolerance_cruise_mps": 12.0
+    "wind_tolerance_cruise_mps": 12.0,
+    "flight_drive": "3 motors: 2 front (folding props, off in cruise) + 1 rear (tilts forward for cruise)",
+    "battery_weight_kg": 1.5,
+    "max_range_km": 100,
+    "max_flight_altitude_msl_m": 4500,
+    "wind_tolerance_ground_mps": "9 below 1500 m, 7 at 1500-3000 m, 5 above 3000 m",
+    "operating_temperature_C": "-12 to 50"
   },
   "_inferred": "Wing area, CD0, Oswald, propeller sizes, motor Kv/resistance and component masses are NOT published. Wing area and the drag pair are set so the model reproduces the published 14:1 glide ratio; the rest are ordinary parts for this class. Treat those as engineering estimates, not manufacturer data.",
   "vars": {
@@ -23,7 +29,7 @@
     "oswald": "0.90",
     "clmax": "1.15",
     "clcruise": "0.85",
-    "n_lift": "2",
+    "n_lift": "3",
     "lift_d": "13",
     "lift_p": "6.5",
     "lift_kv": "500",
@@ -36,7 +42,7 @@
     "cruise_kv": "500",
     "cruise_rm": "0.085",
     "cruise_wt": "95",
-    "cruise_eff": "0.72",
+    "cruise_eff": "0.81",
     "stopped_area": "0.0032",
     "chem": "Li-ion",
     "cell_cap": "3000",
@@ -59,5 +65,7 @@
     "wind_dir": "0",
     "mission": ""
   },
-  "_calibration": "CD0 back-solved so the model reproduces the published 90 min total flight time over a climb/transition/cruise/land profile flown to a 15% reserve. It needed almost no adjustment from a first-principles guess (0.024 gave 88.7 min), and the resulting L/D_max of about 16.7 sits close to the published 14:1 glide ratio \u2014 two independent published numbers agreeing on the same drag, which is the useful check."
+  "_calibration": "CD0 back-solved so the model reproduces the published 90 min total flight time over a climb/transition/cruise/land profile flown to a 15% reserve. It needed almost no adjustment from a first-principles guess (0.024 gave 88.7 min), and the resulting L/D_max of about 16.7 sits close to the published 14:1 glide ratio \u2014 two independent published numbers agreeing on the same drag, which is the useful check.",
+  "_motor_model_migration": "cruise_eff is the PROPELLER's efficiency alone. Before v1.11 the VTOL had no motor electrical model and this field was the combined motor-and-propeller figure (0.72); it was converted by dividing out the motor efficiency the Kv/Rm/I0 model now computes at the cruise point (0.886), so the cruise leg costs what it did before and the motor's loss is now itemised rather than hidden. CD0 was NOT re-tuned. See _validation for how the result compares with the published figures.",
+  "_validation": "Checked against published figures only; no motor or propeller data is published. Hovering on all three rotors, the model flies 90.0 min to a 15% reserve against the published 90, and can still hover at the published 4500 m maximum altitude \u2014 at 93% throttle and a thrust-to-weight of 1.03, consistent with the maker cutting VTOL wind tolerance to 5 m/s above 3000 m. An earlier version of this file hovered on the two front rotors only; the motor model then put hover at 90% throttle and 114 C at sea level and made hovering at 4500 m impossible, which contradicts the published ceiling. Sea level hover is now 72% throttle and about 64 C steady-state."
 }

@@ -1,7 +1,8 @@
 # Test suite
 
-715 tests covering the shared core, physics, the CLI, the GUI, the batch
-driver, the VTOL simulator, and a full config/mission coverage matrix.
+752 tests covering the shared core, physics, the CLI, the GUI, the batch
+driver, the VTOL simulator, and a full config/mission coverage matrix. The
+whole suite was last run clean on Windows (752 passed).
 
 Almost every test here corresponds to a bug that was actually shipped. The
 docstrings say which one, so a future failure reads as "the pack capacity
@@ -13,15 +14,19 @@ regression is back" rather than "test_foo failed".
 
 ```bash
 pip install pytest
-pytest                                  # everything (~15 minutes)
+pytest                                  # everything (~30 minutes)
 ```
+
+Run it from the repository root: `pytest.ini` there registers the marks and
+points pytest at `tests/`.
 
 Faster subsets:
 
 ```bash
-pytest -m "not slow"                    # physics only, ~10 seconds
-pytest tests/test_physics.py            # same thing, explicitly
-pytest tests/test_cli.py                # subprocess runs, ~2.5 min
+pytest -m "not slow and not gui"        # no subprocesses, no windows, ~2 min
+pytest tests/test_physics.py            # multicopter/fixed-wing physics, ~5 s
+pytest tests/test_golden.py             # the numeric snapshot, ~3 s
+pytest tests/test_cli.py                # subprocess runs, ~5 min
 pytest -m gui                           # GUI only
 pytest -k battery                       # anything matching "battery"
 ```
@@ -43,13 +48,13 @@ safe to run.
 | File | Tests | Speed | What it covers |
 |---|---|---|---|
 | `conftest.py` | — | — | Loads the simulators by path, provides reference aircraft |
-| `test_golden.py` | 1 | ~2 s | 348 stored numeric outputs across both simulators |
-| `test_core.py` | 100 | ~1 s | `rotorworks_core`: SoC, wind, inflow, sensitivity, comparison, propeller coefficients, power budget, airframe geometry |
+| `test_golden.py` | 1 | ~3 s | 1042 stored numeric outputs across all three simulators |
+| `test_core.py` | 90 | ~1 s | `rotorworks_core`: SoC, wind, inflow, sensitivity, comparison, propeller coefficients, power budget, airframe geometry |
 | `test_physics.py` | 136 | ~5 s | Battery topology, atmosphere, rotor inflow, prop efficiency, drag, turns, translation direction, thresholds, figure leaks |
-| `test_vtol.py` | 203 | ~2 min | All four VTOL types: vectored-thrust force balance, tilt, download, continuity, missions, the ported GUI tabs, window-chrome parity, output-tab presentation, the battery and peripheral-load model, and unit conversions, plot panels, input sections and tab order |
-| `test_cli.py` | 70 | ~3 min | Real subprocess runs: every argument path, every example mission, edge cases, malformed input |
+| `test_vtol.py` | 250 | ~6 min | All four VTOL types: vectored-thrust force balance, tilt, download, continuity, missions, the motor electrical model, the ported GUI tabs, window-chrome parity, output-tab presentation, the battery and peripheral-load model, unit conversions, plot panels, input sections and tab order, and GUI/CLI/batch parity of the config builder |
+| `test_cli.py` | 70 | ~5 min | Real subprocess runs: every argument path, every example mission, edge cases, malformed input |
 | `test_gui.py` | 46 | ~4 min | Real Tk window: hover events, mode toggle, config load, missions, exports, diagram, sensitivity, comparison |
-| `test_matrix.py` | 108 | ~4 min | Every config and mission x GUI and CLI x with and without a propeller table |
+| `test_matrix.py` | 108 | ~8 min | Every config and mission x GUI and CLI x with and without a propeller table; the VTOL through its CLI |
 | `test_drag_calculator.py` | 31 | ~1 s | Shoelace geometry, self-intersection detection, pixel scaling, ISA density, ArduPilot BCOEF and MCOEF |
 | `test_batch.py` | 20 | ~2.5 min | Sweeps, sizing, mode enforcement, GUI-config translation, GUI↔CLI consistency |
 
@@ -58,16 +63,60 @@ safe to run.
 - `slow` — spawns subprocesses; minutes rather than seconds
 - `gui` — builds a real Tk window; needs a display
 
-Both are registered in `pytest.ini`, and `--strict-markers` is on so a typo in
-a mark name is an error rather than a silent no-op.
+Both are registered in `pytest.ini` at the repository root, and
+`--strict-markers` is on so a typo in a mark name is an error rather than a
+silent no-op.
+
+### Test data
+
+`tests/data/` holds the measured inputs the table tests read. They are the
+same files as the examples, copied so the tests do not change when someone
+edits an example:
+
+| File | What it is | Same as |
+|---|---|---|
+| `motor_prop_table.csv` | T-Motor MN6007 II KV160 on a 22x6.6 propeller, eCalc-style export with a title row | `examples/motor-propeller-csv/mc_motor_prop_csv_example.csv` |
+| `fw_motor_prop_table.csv` | AT5220 KV380 on an APC 18x8 | `examples/motor-propeller-csv/fw_motor_prop_csv_example.csv` |
+| `soc_curve_lipo.csv` | A LiPo discharge curve: SoC, OCV per cell, resistance scale | `examples/soc_curve_lipo.csv` |
+
+The two propeller tables are also what the shared core's thrust-coefficient
+estimate is calibrated against, so `test_geometry_estimate_matches_measured_propellers`
+checks the estimate against the data it was fitted to.
+
+These files were missing from the repository until v1.11 — the tests that
+read them were committed and the data was not — so on a fresh clone about 65
+table and curve tests failed with `FileNotFoundError`. If you see that again,
+this folder is what is missing.
+
+### Windows and captured output
+
+The CLI tests run each simulator as a subprocess and capture its output. On
+Windows, captured output is encoded with the ANSI code page (cp1252), which
+cannot represent the μ, Ω, → and similar symbols the reports print, and until
+v1.11 every CLI and batch test failed there with `UnicodeEncodeError`. Every
+simulator now calls `rotorworks_core.make_console_safe()` first, which prints
+`?` for a symbol the console cannot show instead of crashing. Linux and macOS
+use UTF-8 and never saw the problem, which is how it survived: the suite was
+only ever run on them.
 
 ---
 
 ## The golden snapshot
 
-`test_golden.py` stores 348 computed values — power, thrust, endurance, range,
+`test_golden.py` stores 1042 computed values — power, thrust, endurance, range,
 battery arithmetic, atmosphere — from fixed configurations, and fails if any
-of them moves by more than 1 part in 10^9.
+of them moves by more than 1 part in 10^9:
+
+| Cases | Count | Values | What |
+|---|---|---|---|
+| `mc/…`, `fw/…`, battery, atmosphere | 32 | 348 | The original snapshot, unchanged since the shared-core extraction |
+| `vtol/<type>/@<speed>` | 16 | 576 | All four VTOL types at 0, 8, 14 and 22 m/s: power chain, motor model, lift handover, climb, runway, thermal |
+| `vtol/example/<config>` | 3 | 108 | The three example VTOLs at their own cruise speed |
+| `vtol/mission/vtol_01_wind4` | 1 | 10 | A whole time-stepped mission in wind with an acceleration limit |
+
+The VTOL cases were added in v1.11, after its motor model changed every VTOL
+power figure, so the next refactor of that code has the same protection the
+other two simulators have had.
 
 It exists for refactoring. During the shared-core extraction it caught two
 signature mismatches within seconds of them being introduced, and named the
@@ -117,8 +166,8 @@ half the coverage while still reporting green.
 
 ## Adding a test
 
-Use the `mc` / `fw` / `rw` fixtures to get a simulator module, and `mc_quad` /
-`fw_plane` for a ready-built reference aircraft:
+Use the `mc` / `fw` / `vtol` / `rw` fixtures to get a simulator module, and
+`mc_quad` / `fw_plane` for a ready-built reference aircraft:
 
 ```python
 def test_something(fw, fw_plane):
@@ -147,9 +196,9 @@ Worth knowing before you rely on a green run:
   and plot font size, presets) are untested. The VTOL's is not: `test_vtol.py`
   invokes every entry and asserts the figure actually resizes, because that
   menu was ported after the other two and the port needed proving.
-- **The VTOL simulator has no matrix coverage.** `test_vtol.py` covers its
-  physics, config gating, missions, GUI tabs and window chrome, but it is
-  absent from the config/mission coverage matrix in `test_matrix.py`.
+- **The VTOL is in the matrix through its CLI only** — every type with and
+  without a bench table, every mission in still air and in wind, and a batch
+  sweep. Its GUI is covered by `test_vtol.py` rather than by the matrix.
 - **Plot *contents*** — the new mission-plot axes, the drag and thrust
   component panels, and the Power Budget share diagram are confirmed to render
   without error, not to be correct. The one exception is the multicopter power

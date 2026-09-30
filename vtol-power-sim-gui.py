@@ -59,13 +59,19 @@ except ImportError as _exc:      # pragma: no cover - install/deploy problem
         f"folder as this script.\nOriginal error: {_exc}"
     )
 
-SIM_VERSION = "1.10.0"
-SIM_BUILD_NOTE = "VTOL simulator - lift+cruise, tiltrotor, tiltwing, tailsitter; wind-aware fixed-speed sweeps"
+SIM_VERSION = "1.11.0"
+SIM_BUILD_NOTE = "VTOL simulator - lift+cruise, tiltrotor, tiltwing, tailsitter; motor electrical model; multicopter and fixed-wing outputs"
 
 G0 = core.G0
 
 CONFIG_TYPES = ["lift+cruise", "tiltrotor", "tiltwing", "tailsitter"]
 IMPLEMENTED_CONFIG_TYPES = {"lift+cruise", "tiltrotor", "tiltwing", "tailsitter"}
+
+# Rotor inflow efficiency against advance ratio, the multicopter's defaults.
+# Off unless enabled: the forward-flight induced-velocity solver already
+# carries translational lift, and this map is an empirical correction on top.
+DEFAULT_INFLOW_MU_BP = [0.0, 0.08, 0.16, 0.24, 0.32, 0.40, 0.50]
+DEFAULT_INFLOW_EFF_BP = [1.00, 1.04, 1.08, 1.06, 1.00, 0.94, 0.88]
 
 
 # ============================================================
@@ -108,8 +114,13 @@ class VTOLBattery:
                  # --- explicit discharge curve -----------------------
                  soc_bp: Optional[List[float]] = None,
                  ocv_cell_bp: Optional[List[float]] = None,
-                 r_scale_bp: Optional[List[float]] = None):
+                 r_scale_bp: Optional[List[float]] = None,
+                 # --- thermal limits, checked on Status --------------
+                 max_time_s: Optional[float] = None,
+                 temp_limit_C: float = 55.0):
         self.chemistry = chemistry
+        self.max_time_s = (None if max_time_s in (None, "") else float(max_time_s))
+        self.temp_limit_C = float(temp_limit_C or 55.0)
 
         # "cell": one unit IS one cell, and series/parallel count cells.
         # "pack": one unit is a finished pack of cells_series_per_unit cells
@@ -337,7 +348,83 @@ class VTOLConfig:
                  cruise_prop_weight_g: float = 0.0,
                  avionics_mass_g: float = 0.0,
                  lift_prop_table_csv: Optional[str] = None,
-                 cruise_prop_table_csv: Optional[str] = None):
+                 cruise_prop_table_csv: Optional[str] = None,
+                 # --- motor electrical detail (both rotor groups) --------
+                 lift_motor_i0_A: float = 0.5,
+                 lift_motor_v0_V: Optional[float] = None,
+                 cruise_motor_i0_A: float = 0.5,
+                 cruise_motor_v0_V: Optional[float] = None,
+                 lift_motor_max_time_s: Optional[float] = None,
+                 cruise_motor_max_time_s: Optional[float] = None,
+                 lift_motor_temp_limit_C: float = 100.0,
+                 cruise_motor_temp_limit_C: float = 100.0,
+                 lift_motor_v_unit: str = "S",
+                 lift_motor_rating_min: Optional[float] = None,
+                 lift_motor_rating_max: Optional[float] = None,
+                 cruise_motor_v_unit: str = "S",
+                 cruise_motor_rating_min: Optional[float] = None,
+                 cruise_motor_rating_max: Optional[float] = None,
+                 lift_motor_pole_count: int = 14,
+                 cruise_motor_pole_count: int = 14,
+                 lift_motor_size: str = "",
+                 cruise_motor_size: str = "",
+                 # --- propeller detail -----------------------------------
+                 lift_prop_blades: int = 2,
+                 cruise_prop_blades: int = 2,
+                 lift_prop_max_rpm: Optional[float] = None,
+                 cruise_prop_max_rpm: Optional[float] = None,
+                 lift_prop_tconst: Optional[float] = None,
+                 lift_prop_pconst: Optional[float] = None,
+                 cruise_prop_tconst: Optional[float] = None,
+                 cruise_prop_pconst: Optional[float] = None,
+                 cruise_prop_max_thrust_g: float = 0.0,
+                 cruise_prop_eff_model: str = "constant",
+                 # --- ESC detail -----------------------------------------
+                 esc_cont_current_A: Optional[float] = None,
+                 esc_idle_current_A: float = 0.0,
+                 esc_max_time_s: Optional[float] = None,
+                 esc_temp_limit_C: float = 90.0,
+                 esc_v_unit: str = "S",
+                 esc_rating_min: Optional[float] = None,
+                 esc_rating_max: Optional[float] = None,
+                 # --- lift-rotor layout ----------------------------------
+                 lift_rotor_layout: str = "flat",
+                 coaxial_spacing_m: Optional[float] = None,
+                 inflow_map_enabled: bool = False,
+                 inflow_mu_bp: Optional[List[float]] = None,
+                 inflow_eff_bp: Optional[List[float]] = None,
+                 # --- extra airframe drag beyond the wing's CD0 ----------
+                 drag_model_mode: str = "auto",
+                 parasite_drag_cd: Optional[float] = None,
+                 parasite_area_m2: Optional[float] = None,
+                 profile_drag_cd: Optional[float] = None,
+                 profile_area_m2: Optional[float] = None,
+                 body_length_m: Optional[float] = None,
+                 body_width_m: Optional[float] = None,
+                 body_height_m: Optional[float] = None,
+                 arm_length_m: Optional[float] = None,
+                 arm_width_m: Optional[float] = None,
+                 drag_cg_offset_m: float = 0.0,
+                 # --- hover attitude limits ------------------------------
+                 max_tilt_deg: float = 25.0,
+                 max_pitch_deg: Optional[float] = None,
+                 max_roll_deg: Optional[float] = None,
+                 # --- runway, climb and turn -----------------------------
+                 mu_roll: float = 0.04,
+                 mu_brake: float = 0.30,
+                 CL_takeoff: float = 0.80,
+                 cruise_altitude_m: Optional[float] = None,
+                 # --- run settings the single-point figures read ---------
+                 bank_deg: float = 0.0,
+                 climb_rate_mps: float = 0.0,
+                 descent_rate_mps: float = 0.0,
+                 reserve_percent: Optional[float] = None,
+                 transient_dt_s: Optional[float] = None,
+                 min_climb_mps: Optional[float] = None,
+                 field_takeoff_m: Optional[float] = None,
+                 field_landing_m: Optional[float] = None,
+                 ambient_temp_C: Optional[float] = None,
+                 pressure_Pa: Optional[float] = None):
         self.config_type = str(config_type).strip().lower()
         self.aircraft_weight_g = float(aircraft_weight_g)
         self.payload_mass_g = max(float(payload_mass_g), 0.0)
@@ -422,6 +509,112 @@ class VTOLConfig:
                                 if self.lift_prop_table_csv else None)
         self.cruise_prop_table = (core.load_prop_table(self.cruise_prop_table_csv)
                                   if self.cruise_prop_table_csv else None)
+
+        def _opt(x):
+            return None if x in (None, "") else float(x)
+
+        # Motor electrical detail. Kv, Rm and I0 drive the motor model below;
+        # the ratings, limits and size are checked on Status or shown on
+        # Metrics. Blank ratings mean "not specified", never an invented limit.
+        self.lift_motor_i0_A = max(float(lift_motor_i0_A or 0.0), 0.0)
+        self.cruise_motor_i0_A = max(float(cruise_motor_i0_A or 0.0), 0.0)
+        self.lift_motor_v0_V = _opt(lift_motor_v0_V)
+        self.cruise_motor_v0_V = _opt(cruise_motor_v0_V)
+        self.lift_motor_max_time_s = _opt(lift_motor_max_time_s)
+        self.cruise_motor_max_time_s = _opt(cruise_motor_max_time_s)
+        self.lift_motor_temp_limit_C = float(lift_motor_temp_limit_C or 100.0)
+        self.cruise_motor_temp_limit_C = float(cruise_motor_temp_limit_C or 100.0)
+        self.lift_motor_v_unit = str(lift_motor_v_unit or "S").strip().upper()[:1] or "S"
+        self.cruise_motor_v_unit = str(cruise_motor_v_unit or "S").strip().upper()[:1] or "S"
+        self.lift_motor_rating_min = _opt(lift_motor_rating_min)
+        self.lift_motor_rating_max = _opt(lift_motor_rating_max)
+        self.cruise_motor_rating_min = _opt(cruise_motor_rating_min)
+        self.cruise_motor_rating_max = _opt(cruise_motor_rating_max)
+        self.lift_motor_pole_count = max(int(lift_motor_pole_count or 14), 2)
+        self.cruise_motor_pole_count = max(int(cruise_motor_pole_count or 14), 2)
+        self.lift_motor_size = str(lift_motor_size or "")
+        self.cruise_motor_size = str(cruise_motor_size or "")
+
+        self.lift_prop_blades = max(int(lift_prop_blades or 2), 1)
+        self.cruise_prop_blades = max(int(cruise_prop_blades or 2), 1)
+        self.lift_prop_max_rpm = _opt(lift_prop_max_rpm)
+        self.cruise_prop_max_rpm = _opt(cruise_prop_max_rpm)
+        self.lift_prop_tconst = _opt(lift_prop_tconst)
+        self.lift_prop_pconst = _opt(lift_prop_pconst)
+        self.cruise_prop_tconst = _opt(cruise_prop_tconst)
+        self.cruise_prop_pconst = _opt(cruise_prop_pconst)
+        self.cruise_prop_max_thrust_g = max(float(cruise_prop_max_thrust_g or 0.0), 0.0)
+        model = str(cruise_prop_eff_model or "constant").strip().lower()
+        self.cruise_prop_eff_model = "curve" if model == "curve" else "constant"
+
+        # ESC detail. The efficiency above is the ESC's switching loss; its
+        # resistance and idle current add on top when entered.
+        self.esc_cont_current_A = _opt(esc_cont_current_A)
+        self.esc_idle_current_A = max(float(esc_idle_current_A or 0.0), 0.0)
+        self.esc_max_time_s = _opt(esc_max_time_s)
+        self.esc_temp_limit_C = float(esc_temp_limit_C or 90.0)
+        self.esc_v_unit = str(esc_v_unit or "S").strip().upper()[:1] or "S"
+        self.esc_rating_min = _opt(esc_rating_min)
+        self.esc_rating_max = _opt(esc_rating_max)
+
+        layout = str(lift_rotor_layout or "flat").strip().lower()
+        self.lift_rotor_layout = "coaxial" if layout.startswith("coax") else "flat"
+        self.coaxial_spacing_m = _opt(coaxial_spacing_m)
+        self.inflow_map_enabled = bool(inflow_map_enabled)
+        self.inflow_mu_bp = list(inflow_mu_bp or DEFAULT_INFLOW_MU_BP)
+        self.inflow_eff_bp = list(inflow_eff_bp or DEFAULT_INFLOW_EFF_BP)
+        if len(self.inflow_mu_bp) != len(self.inflow_eff_bp) or len(self.inflow_mu_bp) < 2:
+            self.inflow_mu_bp = list(DEFAULT_INFLOW_MU_BP)
+            self.inflow_eff_bp = list(DEFAULT_INFLOW_EFF_BP)
+
+        mode = str(drag_model_mode or "auto").strip().lower()
+        self.drag_model_mode = mode if mode in ("auto", "manual", "geometry") else "auto"
+        self.parasite_drag_cd = _opt(parasite_drag_cd)
+        self.parasite_area_m2 = _opt(parasite_area_m2)
+        self.profile_drag_cd = _opt(profile_drag_cd)
+        self.profile_area_m2 = _opt(profile_area_m2)
+        self.body_length_m = _opt(body_length_m)
+        self.body_width_m = _opt(body_width_m)
+        self.body_height_m = _opt(body_height_m)
+        self.arm_length_m = _opt(arm_length_m)
+        self.arm_width_m = _opt(arm_width_m)
+        self.drag_cg_offset_m = float(drag_cg_offset_m or 0.0)
+
+        self.max_tilt_deg = min(max(float(max_tilt_deg or 25.0), 1.0), 85.0)
+        self.max_pitch_deg = _opt(max_pitch_deg)
+        self.max_roll_deg = _opt(max_roll_deg)
+
+        self.mu_roll = max(float(mu_roll if mu_roll is not None else 0.04), 0.0)
+        self.mu_brake = max(float(mu_brake if mu_brake is not None else 0.30), 0.0)
+        self.CL_takeoff = max(float(CL_takeoff or 0.8), 1e-3)
+        self.cruise_altitude_m = (None if cruise_altitude_m in (None, "")
+                                  else max(float(cruise_altitude_m), 0.0))
+
+        # Carried on the aircraft rather than passed alongside it, so that
+        # Sensitivity and Compare — which re-run a copy of the config — see
+        # exactly the settings the original run used.
+        self.bank_deg = min(max(float(bank_deg or 0.0), 0.0), 80.0)
+        climb, descent = max(float(climb_rate_mps or 0.0), 0.0), max(float(descent_rate_mps or 0.0), 0.0)
+        # Climbing and descending at once is contradictory; the multicopter
+        # keeps the climb, and so does this.
+        self.climb_rate_mps = climb
+        self.descent_rate_mps = 0.0 if climb > 0 else descent
+        self.reserve_percent = _opt(reserve_percent)
+        self.transient_dt_s = _opt(transient_dt_s)
+        self.min_climb_mps = _opt(min_climb_mps)
+        self.field_takeoff_m = _opt(field_takeoff_m)
+        self.field_landing_m = _opt(field_landing_m)
+        # Density is what the physics uses; these are kept for display and
+        # for the thermal estimates, which need an ambient to rise from.
+        self._ambient_temp_C = _opt(ambient_temp_C)
+        self.pressure_Pa = _opt(pressure_Pa)
+
+    @property
+    def ambient_temp_C(self) -> float:
+        """Entered temperature, else the standard atmosphere's at the field."""
+        if self._ambient_temp_C is not None:
+            return self._ambient_temp_C
+        return 15.0 - core.LAPSE_K_PER_M * self.reference_altitude_m
 
     # ---- derived ----------------------------------------------------
 
@@ -527,6 +720,73 @@ def stopped_rotor_drag_N(cfg: VTOLConfig, airspeed_mps: float) -> float:
     return 0.5 * cfg.air_density * v * v * cfg.stopped_rotor_drag_area_m2
 
 
+def extra_drag_areas(cfg: VTOLConfig) -> Dict[str, object]:
+    """
+    Drag of the airframe BEYOND the wing's CD0, as Cd x area, in m^2.
+
+    The multicopter's inputs, carried over: a parasite term (the frontal
+    silhouette, met in forward flight) and a profile term (the side
+    silhouette, met when hovering level in a wind). Entered as Cd and area,
+    or derived from a box body and square-tube booms.
+
+    Everything blank gives zero, so CD0 remains the whole-aircraft drag it
+    has always been. Use these when CD0 describes the wing alone and the
+    fuselage, booms or payload pod are to be added separately.
+
+    manual:   use the entered Cd and area only
+    geometry: derive from the body and boom dimensions
+    auto:     entered Cd and area if any, else geometry if given, else none
+    """
+    manual_front = ((cfg.parasite_drag_cd or 0.0) * (cfg.parasite_area_m2 or 0.0))
+    manual_side = ((cfg.profile_drag_cd or 0.0) * (cfg.profile_area_m2 or 0.0))
+    have_manual = any(x for x in (cfg.parasite_drag_cd, cfg.parasite_area_m2,
+                                  cfg.profile_drag_cd, cfg.profile_area_m2))
+    have_geometry = bool(cfg.body_width_m and cfg.body_height_m)
+    mode = cfg.drag_model_mode
+    if mode == "manual" or (mode == "auto" and have_manual):
+        return {"frontal_CdA": manual_front, "side_CdA": manual_side,
+                "source": "entered"}
+    if not have_geometry or mode == "manual":
+        return {"frontal_CdA": 0.0, "side_CdA": 0.0, "source": "none"}
+
+    CD_BOX, CD_BOOM = 1.05, 1.10          # the multicopter's constants
+    w, h = float(cfg.body_width_m), float(cfg.body_height_m)
+    length = float(cfg.body_length_m or 0.0)
+    tube = float(cfg.arm_width_m or 0.02)
+    boom_len = float(cfg.arm_length_m or 0.0)
+    n_booms = max(cfg.num_lift_rotors // (2 if cfg.lift_rotor_layout == "coaxial" else 1), 1)
+    if uses_vectored_thrust(cfg):
+        # Nacelle pylons on the wing: the multicopter's 70% projection.
+        boom_front = n_booms * tube * boom_len * 0.7
+    else:
+        # A lift+cruise's booms run fore and aft, so they meet the airflow
+        # end-on in cruise and broadside only from the side.
+        boom_front = n_booms * tube * tube
+    boom_side = n_booms * tube * boom_len
+    return {"frontal_CdA": CD_BOX * w * h + CD_BOOM * boom_front,
+            "side_CdA": CD_BOX * length * h + CD_BOOM * boom_side,
+            "source": "geometry"}
+
+
+def body_drag_N(cfg: VTOLConfig, airspeed_mps: float) -> float:
+    """Forward-flight drag of the fuselage and booms beyond CD0. Zero by default."""
+    v = max(float(airspeed_mps), 0.0)
+    return 0.5 * cfg.air_density * v * v * float(extra_drag_areas(cfg)["frontal_CdA"])
+
+
+def hover_wind_drag_N(cfg: VTOLConfig, wind_mps: float) -> float:
+    """
+    Drag on the airframe hovering level in a wind, from the side silhouette.
+
+    Falls back to the frontal term when only that was given, since a
+    hovering aircraft can meet the wind from any side.
+    """
+    areas = extra_drag_areas(cfg)
+    cda = float(areas["side_CdA"] or areas["frontal_CdA"])
+    v = max(float(wind_mps), 0.0)
+    return 0.5 * cfg.air_density * v * v * cda
+
+
 # ============================================================
 # ROTOR AND PROPELLER POWER
 # ============================================================
@@ -566,13 +826,252 @@ def measured_cruise_efficiency(cfg: VTOLConfig, thrust_per_motor_N: float,
     return min(max(eta / max(cfg.esc_efficiency, 1e-9), 0.2), 0.95)
 
 
-def rotor_power_W(cfg: VTOLConfig, thrust_N: float, airspeed_mps: float = 0.0) -> float:
+# ============================================================
+# MOTOR ELECTRICAL MODEL
+# ============================================================
+#
+# Shaft power becomes electrical power through the motor, and the motor has
+# losses of its own that neither the figure of merit (a rotor number) nor
+# the propeller efficiency (a propeller number) contains:
+#
+#     I      = Q / Kt + I0            Q = P_shaft / omega,  Kt = 60 / (2 pi Kv)
+#     V_emf  = RPM / Kv
+#     V_term = V_emf + I * Rm
+#     P_elec = V_term * I  =  P_shaft + I0 * V_emf + I^2 * Rm
+#
+# so the loss is the no-load (iron and friction) term plus copper. RPM comes
+# from the thrust through a thrust coefficient: TConst if entered, else one
+# fitted from a bench table's RPM column, else the shared estimate from
+# diameter, pitch and blade count. At an axial airspeed V the blade meets the
+# air at a lower angle and thrust falls roughly linearly with advance ratio,
+#
+#     T = C_T * rho * n^2 * D^4 * (1 - J / J0),    J = V / (n D),  J0 ~ P / D
+#
+# which is solved for n in closed form.
+#
+# A motor whose Kv is 0 or blank has no electrical model: its loss is taken
+# as zero, so the ESC efficiency is then the only conversion loss, which is
+# how every version before this one behaved.
+
+
+def _group(cfg: VTOLConfig, group: str) -> dict:
+    """
+    The hardware of one rotor group.
+
+    A vectored type (tiltrotor, tiltwing, tailsitter) has ONE set of rotors
+    that both lifts and cruises, so its "cruise" group is the lift group.
+    """
+    if group == "cruise" and not uses_vectored_thrust(cfg):
+        return {
+            "name": "cruise", "n": cfg.num_cruise_motors,
+            "d_in": cfg.cruise_prop_diameter_in, "p_in": cfg.cruise_prop_pitch_in,
+            "blades": cfg.cruise_prop_blades, "kv": cfg.cruise_motor_kv,
+            "rm": cfg.cruise_motor_resistance, "i0": cfg.cruise_motor_i0_A,
+            "v0": cfg.cruise_motor_v0_V, "tconst": cfg.cruise_prop_tconst,
+            "pconst": cfg.cruise_prop_pconst, "table": cfg.cruise_prop_table,
+            "imax": cfg.cruise_motor_max_current_A,
+            "pmax": cfg.cruise_motor_max_power_W,
+            "max_rpm": cfg.cruise_prop_max_rpm,
+            "poles": cfg.cruise_motor_pole_count,
+        }
+    return {
+        "name": "lift", "n": cfg.num_lift_rotors,
+        "d_in": cfg.lift_prop_diameter_in, "p_in": cfg.lift_prop_pitch_in,
+        "blades": cfg.lift_prop_blades, "kv": cfg.lift_motor_kv,
+        "rm": cfg.lift_motor_resistance, "i0": cfg.lift_motor_i0_A,
+        "v0": cfg.lift_motor_v0_V, "tconst": cfg.lift_prop_tconst,
+        "pconst": cfg.lift_prop_pconst, "table": cfg.lift_prop_table,
+        "imax": cfg.lift_motor_max_current_A,
+        "pmax": cfg.lift_motor_max_power_W,
+        "max_rpm": cfg.lift_prop_max_rpm,
+        "poles": cfg.lift_motor_pole_count,
+    }
+
+
+def prop_coefficients(cfg: VTOLConfig, group: str) -> Dict[str, object]:
+    """
+    Thrust and power coefficients for one group, and where they came from.
+
+    Priority: entered TConst/PConst, then a fit to a bench table with an RPM
+    column, then the shared estimate. The source is returned because a
+    coefficient that is a +/-30% estimate should say so on Metrics.
+    """
+    g = _group(cfg, group)
+    fit = None
+    if g["table"] is not None and "RPM" in g["table"]:
+        # Keyed by the table and diameter: a sensitivity lever that scales the
+        # diameter must not reuse a coefficient fitted at the old one.
+        cache = cfg.__dict__.setdefault("_coeff_cache", {})
+        key = (group, id(g["table"]), round(float(g["d_in"]), 6))
+        if key not in cache:
+            cache[key] = core.derive_prop_coefficients_from_table(g["table"], g["d_in"])
+        fit = cache[key]
+    if g["tconst"]:
+        c_t, source = float(g["tconst"]), "entered"
+    elif fit and fit.get("c_t"):
+        c_t, source = float(fit["c_t"]), "bench table"
+    else:
+        c_t, source = core.estimate_prop_thrust_coefficient(
+            g["d_in"], g["p_in"], g["blades"]), "estimate"
+    if g["pconst"]:
+        c_p = float(g["pconst"])
+    elif fit and fit.get("c_p"):
+        c_p = float(fit["c_p"])
+    else:
+        fom = cfg.lift_figure_of_merit if g["name"] == "lift" else 0.65
+        c_p = core.estimate_prop_power_coefficient(c_t, fom)
+    return {"c_t": c_t, "c_p": c_p, "source": source}
+
+
+def prop_rpm(cfg: VTOLConfig, group: str, thrust_per_rotor_N: float,
+             axial_mps: float = 0.0) -> float:
+    """
+    RPM of one rotor making `thrust_per_rotor_N` with `axial_mps` of
+    freestream through its disc.
+
+    Static thrust from the coefficient, reduced linearly with advance ratio
+    to zero at J0, the advance ratio at which a fixed-pitch blade stops
+    producing thrust. Published APC data puts J0 at about 1.2 x pitch /
+    diameter (a 10x7 reaches zero thrust near J = 0.85). Solving
+    T = C_T rho D^4 (n^2 - n V / (D J0)) for n gives the closed form below;
+    at V = 0 it is the familiar static result.
+    """
+    t = max(float(thrust_per_rotor_N), 0.0)
+    if t <= 0:
+        return 0.0
+    g = _group(cfg, group)
+    d = max(float(g["d_in"]) * 0.0254, 1e-6)
+    rho = max(float(cfg.air_density), 1e-9)
+    c_t = max(float(prop_coefficients(cfg, group)["c_t"]), 1e-6)
+    j0 = max(1.2 * float(g["p_in"]) / max(float(g["d_in"]), 1e-6), 0.2)
+    a = max(float(axial_mps), 0.0) / (d * j0)
+    b = t / (c_t * rho * d ** 4)
+    n_rev_s = 0.5 * (a + math.sqrt(a * a + 4.0 * b))
+    return n_rev_s * 60.0
+
+
+def motor_operating_point(cfg: VTOLConfig, group: str, thrust_per_rotor_N: float,
+                          shaft_per_rotor_W: float, axial_mps: float = 0.0,
+                          measured: bool = False) -> Dict[str, float]:
+    """
+    One motor's electrical state for a given thrust and shaft power.
+
+    `measured` is True where a bench table covers this thrust: the table's
+    power was taken at the ESC input, so it already contains the motor's
+    losses, and the figure of merit derived from it absorbs them. Adding the
+    model's loss on top would count the motor twice, so it is reported but
+    not charged.
+    """
+    g = _group(cfg, group)
+    shaft = max(float(shaft_per_rotor_W), 0.0)
+    rpm = prop_rpm(cfg, group, thrust_per_rotor_N, axial_mps) if shaft > 0 else 0.0
+    kv = float(g["kv"] or 0.0)
+    v_pack = max(float(cfg.battery.vnom_pack), 1e-9)
+    out = {
+        "rpm": rpm, "thrust_N": max(float(thrust_per_rotor_N), 0.0),
+        "shaft_W": shaft, "current_A": 0.0, "v_emf_V": 0.0, "v_term_V": 0.0,
+        "elec_W": shaft, "loss_W": 0.0, "copper_W": 0.0, "iron_W": 0.0,
+        "efficiency": 1.0, "throttle": 0.0, "saturated": False,
+        "torque_Nm": 0.0, "kt": 0.0, "i0_A": 0.0, "measured": bool(measured),
+        "modelled": kv > 0,
+    }
+    if shaft <= 0 or rpm <= 0:
+        return out
+    omega = rpm * 2.0 * math.pi / 60.0
+    torque = shaft / max(omega, 1e-9)
+    out["torque_Nm"] = torque
+    if kv <= 0:
+        # No electrical model: the current is what the shaft power costs at
+        # pack voltage, so Status still has a number to check.
+        out["current_A"] = shaft / v_pack
+        out["throttle"] = float("nan")
+        return out
+    kt = 60.0 / (2.0 * math.pi * kv)
+    v_emf = rpm / kv
+    # No-load current is measured at one voltage; core loss grows with speed,
+    # and the usual approximation scales the current with sqrt(speed).
+    i0 = float(g["i0"] or 0.0)
+    if g["v0"]:
+        i0 *= math.sqrt(max(v_emf, 0.0) / max(float(g["v0"]), 1e-9))
+    current = torque / kt + i0
+    copper = current * current * float(g["rm"] or 0.0)
+    iron = i0 * v_emf
+    v_term = v_emf + current * float(g["rm"] or 0.0)
+    elec = shaft + copper + iron
+    out.update({
+        "current_A": current, "v_emf_V": v_emf, "v_term_V": v_term,
+        "elec_W": elec, "copper_W": copper, "iron_W": iron,
+        "loss_W": 0.0 if measured else copper + iron,
+        "efficiency": shaft / max(elec, 1e-9),
+        "throttle": v_term / v_pack, "saturated": v_term > v_pack,
+        "kt": kt, "i0_A": i0,
+    })
+    return out
+
+
+def lift_table_covers(cfg: VTOLConfig, thrust_per_rotor_N: float) -> bool:
+    """True where the lift bench table measures this thrust."""
+    area = math.pi / 4.0 * (cfg.lift_prop_diameter_in * 0.0254) ** 2
+    return measured_lift_efficiency(cfg, thrust_per_rotor_N, area) is not None
+
+
+def cruise_table_covers(cfg: VTOLConfig, thrust_per_motor_N: float) -> bool:
+    """True where the cruise bench table measures this thrust."""
+    return measured_cruise_efficiency(cfg, thrust_per_motor_N,
+                                      cfg.cruise_disc_area_m2) is not None
+
+
+def coaxial_power_multiplier(cfg: VTOLConfig, thrust_per_rotor_N: float,
+                             airspeed_mps: float = 0.0) -> float:
+    """
+    Interference penalty for stacked lift rotors, the multicopter's model.
+
+    About 1.18 at a 0.2 D spacing in hover, falling with spacing and easing
+    as the freestream sweeps the upper rotor's wake clear of the lower one.
+    1.0 for a flat layout.
+    """
+    if cfg.lift_rotor_layout != "coaxial":
+        return 1.0
+    d = cfg.lift_prop_diameter_in * 0.0254
+    if d <= 0:
+        return 1.18
+    spacing = cfg.coaxial_spacing_m if cfg.coaxial_spacing_m else 0.20 * d
+    inc = 0.25 * math.exp(-3.0 * max(float(spacing) / d, 0.0)) + 0.03
+    v = max(float(airspeed_mps), 0.0)
+    if v > 0 and thrust_per_rotor_N > 0:
+        area = math.pi / 4.0 * d * d
+        v_hover = math.sqrt(thrust_per_rotor_N / max(2.0 * cfg.air_density * area, 1e-9))
+        inc *= 1.0 - 0.30 * v / (v + max(v_hover, 1e-9))
+    return 1.0 + inc
+
+
+def inflow_multiplier(cfg: VTOLConfig, thrust_per_rotor_N: float,
+                      edgewise_mps: float, axial_mps: float = 0.0) -> Tuple[float, float, float]:
+    """
+    (power multiplier, advance ratio mu, inflow efficiency) for a lift rotor
+    meeting `edgewise_mps` of freestream across its disc.
+
+    The multicopter's empirical map, off by default. mu = V / (Omega R).
+    """
+    rpm = prop_rpm(cfg, "lift", thrust_per_rotor_N, axial_mps)
+    r = max(cfg.lift_prop_diameter_in * 0.0254 / 2.0, 1e-9)
+    omega = rpm * 2.0 * math.pi / 60.0
+    mu = max(float(edgewise_mps), 0.0) / max(omega * r, 1e-9) if omega > 0 else 0.0
+    if not cfg.inflow_map_enabled or edgewise_mps <= 0:
+        return 1.0, mu, 1.0
+    eta = max(float(np.interp(mu, cfg.inflow_mu_bp, cfg.inflow_eff_bp)), 0.2)
+    return 1.0 / eta, mu, eta
+
+
+def rotor_power_W(cfg: VTOLConfig, thrust_N: float, airspeed_mps: float = 0.0,
+                  climb_rate_mps: float = 0.0) -> float:
     """
     Shaft power for the lift rotors to make `thrust_N` in total.
 
     Momentum theory with a figure of merit for real losses, using the shared
     forward-flight inflow solver so a rotor climbing away or translating in
-    the transition is not charged its hover induced power.
+    the transition is not charged its hover induced power. A coaxial layout
+    and the optional inflow map scale the result.
     """
     if thrust_N <= 0:
         return 0.0
@@ -586,7 +1085,33 @@ def rotor_power_W(cfg: VTOLConfig, thrust_N: float, airspeed_mps: float = 0.0) -
     vi = core.induced_velocity_forward_flight(v_hover, airspeed_mps, 0.0)
     ideal_per = t_per * vi
     fom = measured_lift_efficiency(cfg, t_per, area) or cfg.lift_figure_of_merit
-    return ideal_per / fom * n
+    mult = coaxial_power_multiplier(cfg, t_per, airspeed_mps)
+    mult *= inflow_multiplier(cfg, t_per, airspeed_mps, climb_rate_mps)[0]
+    return ideal_per / fom * n * mult
+
+
+def cruise_prop_efficiency_at(cfg: VTOLConfig, airspeed_mps: float) -> float:
+    """
+    Cruise propeller efficiency at an airspeed.
+
+    "constant" returns the entered figure everywhere. "curve" is the
+    fixed-wing model: the entered figure is the PEAK, reached near 60% of the
+    full-throttle pitch speed, and it falls away either side of it.
+    """
+    peak = max(float(cfg.cruise_prop_efficiency), 0.10)
+    if cfg.cruise_prop_eff_model != "curve":
+        return peak
+    g = _group(cfg, "cruise")
+    pitch_m = float(g["p_in"]) * 0.0254
+    kv = float(g["kv"] or 0.0)
+    if kv <= 0 or pitch_m <= 0:
+        return peak
+    v_pitch = pitch_m * kv * float(cfg.battery.vmax_pack) / 60.0
+    if v_pitch <= 1e-6:
+        return peak
+    x = max(float(airspeed_mps), 0.0) / v_pitch
+    shape = (x * (1.0 - x)) / (0.60 * 0.40)
+    return min(max(peak * max(shape, 0.0), 0.25 * peak), peak)
 
 
 def cruise_prop_power_W(cfg: VTOLConfig, thrust_N: float, airspeed_mps: float) -> float:
@@ -606,7 +1131,8 @@ def cruise_prop_power_W(cfg: VTOLConfig, thrust_N: float, airspeed_mps: float) -
     # vi from T = 2 rho A vi (V + vi), positive root.
     vi = -v / 2.0 + math.sqrt((v / 2.0) ** 2 +
                               t_per / max(2.0 * cfg.air_density * area, 1e-9))
-    eff = measured_cruise_efficiency(cfg, t_per, area) or cfg.cruise_prop_efficiency
+    eff = (measured_cruise_efficiency(cfg, t_per, area)
+           or cruise_prop_efficiency_at(cfg, v))
     return t_per * (v + vi) / eff * n
 
 
@@ -663,15 +1189,96 @@ def wire_loss_W(cfg: VTOLConfig, power_before_wire_W: float) -> float:
     return loss
 
 
-def electrical_power_W(cfg: VTOLConfig, shaft_power_W: float) -> float:
+def electrical_power_W(cfg: VTOLConfig, shaft_power_W: float,
+                       motor_loss_W: float = 0.0) -> float:
     """
-    Shaft power to pack power: through the ESC, plus the avionics load, plus
-    the main wire run if one was entered.
+    Shaft power to pack power: through the motors and ESC, plus the avionics
+    load, plus the main wire run if one was entered.
+
+    The simple form, for callers that already know the motor loss. The
+    flight regimes use drive_chain, which works the loss out per motor.
     """
-    base = (shaft_power_W / cfg.esc_efficiency
+    base = ((shaft_power_W + motor_loss_W) / cfg.esc_efficiency
             + avionics_input_power_W(cfg)
             + peripheral_power_W(cfg))
     return base + wire_loss_W(cfg, base)
+
+
+def n_escs(cfg: VTOLConfig) -> int:
+    """One ESC per driven rotor: lift rotors, plus cruise motors on a lift+cruise."""
+    return cfg.num_lift_rotors + (0 if uses_vectored_thrust(cfg) else cfg.num_cruise_motors)
+
+
+def drive_chain(cfg: VTOLConfig,
+                rotor_thrust_N: float, rotor_shaft_W: float,
+                cruise_thrust_N: float = 0.0, cruise_shaft_W: float = 0.0,
+                rotor_axial_mps: float = 0.0,
+                cruise_axial_mps: float = 0.0) -> Dict[str, object]:
+    """
+    Everything between the shafts and the cells, for one operating point.
+
+        motor input = shaft + motor loss                      (per motor model)
+        ESC loss    = motor input x (1/eta - 1)               (under load)
+                      + idle current x pack V per ESC         (if entered)
+        pack power  = motor input + ESC loss + avionics + peripherals + wire
+
+    Returns the total and every piece of it, so the Power Budget, Status and
+    Metrics all read the same numbers rather than re-deriving them.
+    """
+    n_lift = max(cfg.num_lift_rotors, 1)
+    t_lift = max(float(rotor_thrust_N), 0.0) / n_lift
+    lift = motor_operating_point(
+        cfg, "lift", t_lift, max(float(rotor_shaft_W), 0.0) / n_lift,
+        rotor_axial_mps, measured=lift_table_covers(cfg, t_lift))
+
+    if uses_vectored_thrust(cfg):
+        cruise = lift
+        n_cruise = 0
+    else:
+        n_cruise = max(cfg.num_cruise_motors, 1)
+        t_cruise = max(float(cruise_thrust_N), 0.0) / n_cruise
+        cruise = motor_operating_point(
+            cfg, "cruise", t_cruise, max(float(cruise_shaft_W), 0.0) / n_cruise,
+            cruise_axial_mps, measured=cruise_table_covers(cfg, t_cruise))
+
+    shaft = max(float(rotor_shaft_W), 0.0) + max(float(cruise_shaft_W), 0.0)
+    # A group a bench table covers is charged nothing here: its measured
+    # power already contains the motor (see motor_operating_point).
+    charged = [(n, op) for n, op in ((n_lift, lift), (n_cruise, cruise))
+               if n and not op["measured"]]
+    motor_loss = sum(n * op["loss_W"] for n, op in charged)
+    copper = sum(n * op["copper_W"] for n, op in charged)
+    iron = sum(n * op["iron_W"] for n, op in charged)
+    motor_in = shaft + motor_loss
+
+    # The efficiency already covers everything the ESC loses under load, so
+    # its resistance does not ADD a loss — it says how much of that loss is
+    # conduction (I^2 R) rather than switching, for the Power Budget. The
+    # idle current is different: a standby draw the ESCs take whether or not
+    # their motor is turning, so it adds.
+    esc_load = motor_in * (1.0 / max(cfg.esc_efficiency, 1e-9) - 1.0)
+    esc_cond = min(cfg.esc_resistance_ohm * (
+        n_lift * lift["current_A"] ** 2 + n_cruise * cruise["current_A"] ** 2), esc_load)
+    esc_idle = cfg.esc_idle_current_A * n_escs(cfg) * cfg.battery.vnom_pack
+    esc_loss = esc_load + esc_idle
+
+    base = motor_in + esc_loss + avionics_input_power_W(cfg) + peripheral_power_W(cfg)
+    wire = wire_loss_W(cfg, base)
+    return {
+        "total_power_W": base + wire,
+        "motor_input_W": motor_in,
+        "motor_loss_W": motor_loss,
+        "motor_copper_W": copper,
+        "motor_iron_W": iron,
+        "esc_loss_W": esc_loss,
+        "esc_conduction_W": esc_cond,
+        "esc_switching_W": esc_load - esc_cond,
+        "esc_idle_W": esc_idle,
+        "wire_loss_W": wire,
+        "drive_efficiency": shaft / max(motor_in, 1e-9) if shaft > 0 else 1.0,
+        "lift_motor": lift,
+        "cruise_motor": cruise,
+    }
 
 
 # ============================================================
@@ -686,12 +1293,13 @@ def hover_power_W(cfg: VTOLConfig, climb_rate_mps: float = 0.0) -> Dict[str, flo
     # download. The transition branch scales the same fraction by the share
     # of weight the rotors still hold, which makes the two meet exactly at
     # zero airspeed instead of stepping.
+    climb = max(float(climb_rate_mps), 0.0)
     thrust_N = cfg.weight_N * (1.0 + hover_download_fraction(cfg))
-    shaft = rotor_power_W(cfg, thrust_N, airspeed_mps=0.0)
+    shaft = rotor_power_W(cfg, thrust_N, airspeed_mps=0.0, climb_rate_mps=climb)
     # Vertical climb adds potential power directly.
-    shaft += thrust_N * max(float(climb_rate_mps), 0.0)
-    total = electrical_power_W(cfg, shaft)
-    return {
+    shaft += thrust_N * climb
+    chain = drive_chain(cfg, thrust_N, shaft, rotor_axial_mps=climb)
+    point = {
         "regime": "hover",
         "airspeed_mps": 0.0,
         "rotor_thrust_N": thrust_N,
@@ -700,8 +1308,9 @@ def hover_power_W(cfg: VTOLConfig, climb_rate_mps: float = 0.0) -> Dict[str, flo
         "rotor_shaft_W": shaft,
         "cruise_shaft_W": 0.0,
         "shaft_power_W": shaft,
-        "total_power_W": total,
     }
+    point.update(chain)
+    return point
 
 
 def cruise_power_W(cfg: VTOLConfig, airspeed_mps: float) -> Dict[str, float]:
@@ -713,10 +1322,11 @@ def cruise_power_W(cfg: VTOLConfig, airspeed_mps: float) -> Dict[str, float]:
     """
     v = max(float(airspeed_mps), 1e-6)
     lift_N = cfg.weight_N
-    drag_N = wing_drag_N(cfg, v, lift_N) + stopped_rotor_drag_N(cfg, v)
+    drag_N = (wing_drag_N(cfg, v, lift_N) + stopped_rotor_drag_N(cfg, v)
+              + body_drag_N(cfg, v))
     shaft = cruise_prop_power_W(cfg, drag_N, v)
-    total = electrical_power_W(cfg, shaft)
-    return {
+    chain = drive_chain(cfg, 0.0, 0.0, drag_N, shaft, cruise_axial_mps=v)
+    point = {
         "regime": "cruise",
         "airspeed_mps": v,
         "rotor_thrust_N": 0.0,
@@ -726,8 +1336,9 @@ def cruise_power_W(cfg: VTOLConfig, airspeed_mps: float) -> Dict[str, float]:
         "rotor_shaft_W": 0.0,
         "cruise_shaft_W": shaft,
         "shaft_power_W": shaft,
-        "total_power_W": total,
     }
+    point.update(chain)
+    return point
 
 
 def transition_power_W(cfg: VTOLConfig, airspeed_mps: float,
@@ -775,15 +1386,16 @@ def transition_power_W(cfg: VTOLConfig, airspeed_mps: float,
     # switched, which is the same flight condition described two ways.
     rotor_drag_N = stopped_rotor_drag_N(cfg, v) * min(max(
         lift_N / max(cfg.weight_N, 1e-9), 0.0), 1.0)
-    drag_N = wing_drag_N(cfg, v, lift_N) + rotor_drag_N
+    drag_N = wing_drag_N(cfg, v, lift_N) + rotor_drag_N + body_drag_N(cfg, v)
     cruise_thrust_N = drag_N
 
     rotor_shaft = rotor_power_W(cfg, rotor_thrust_N, airspeed_mps=v)
     cruise_shaft = cruise_prop_power_W(cfg, cruise_thrust_N, v)
     shaft = rotor_shaft + cruise_shaft
-    total = electrical_power_W(cfg, shaft)
+    chain = drive_chain(cfg, rotor_thrust_N, rotor_shaft,
+                        cruise_thrust_N, cruise_shaft, cruise_axial_mps=v)
 
-    return {
+    point = {
         "regime": "transition",
         "airspeed_mps": v,
         "rotor_thrust_N": rotor_thrust_N,
@@ -794,8 +1406,9 @@ def transition_power_W(cfg: VTOLConfig, airspeed_mps: float,
         "rotor_shaft_W": rotor_shaft,
         "cruise_shaft_W": cruise_shaft,
         "shaft_power_W": shaft,
-        "total_power_W": total,
     }
+    point.update(chain)
+    return point
 
 
 # ============================================================
@@ -891,8 +1504,11 @@ def vectored_rotor_power_W(cfg: VTOLConfig, thrust_N: float,
     # figure of merit where the table covers the thrust.
     hover_eff = measured_lift_efficiency(cfg, t_per, area) or cfg.lift_figure_of_merit
     blend = tilt / 90.0
-    efficiency = (1.0 - blend) * hover_eff + blend * cfg.cruise_prop_efficiency
-    return t_per * (v_axial + vi) / max(efficiency, 0.05) * n
+    efficiency = (1.0 - blend) * hover_eff + blend * cruise_prop_efficiency_at(cfg, v)
+    edgewise = v * math.cos(math.radians(tilt))
+    mult = coaxial_power_multiplier(cfg, t_per, v)
+    mult *= inflow_multiplier(cfg, t_per, edgewise, v_axial)[0]
+    return t_per * (v_axial + vi) / max(efficiency, 0.05) * n * mult
 
 
 def vectored_power_W(cfg: VTOLConfig, airspeed_mps: float,
@@ -926,16 +1542,17 @@ def vectored_power_W(cfg: VTOLConfig, airspeed_mps: float,
     rotor_share = min(max(1.0 - lift_N / max(weight, 1e-9), 0.0), 1.0)
     download = hover_download_fraction(cfg) * rotor_share
 
+    climb = max(float(climb_rate_mps), 0.0)
     vertical_N = max(weight * (1.0 + download) - lift_N, 0.0)
-    drag_N = wing_drag_N(cfg, v, lift_N) if v > 1e-6 else 0.0
+    drag_N = (wing_drag_N(cfg, v, lift_N) + body_drag_N(cfg, v)) if v > 1e-6 else 0.0
 
     thrust_N = math.hypot(vertical_N, drag_N)
     tilt_deg = math.degrees(math.atan2(drag_N, max(vertical_N, 1e-12)))
 
     shaft = vectored_rotor_power_W(cfg, thrust_N, tilt_deg, v)
-    shaft += thrust_N * max(float(climb_rate_mps), 0.0) * math.cos(
-        math.radians(tilt_deg))
-    total = electrical_power_W(cfg, shaft)
+    shaft += thrust_N * climb * math.cos(math.radians(tilt_deg))
+    axial = v * math.sin(math.radians(tilt_deg)) + climb * math.cos(math.radians(tilt_deg))
+    chain = drive_chain(cfg, thrust_N, shaft, rotor_axial_mps=axial)
 
     if v < 1e-6:
         regime = "hover"
@@ -944,7 +1561,7 @@ def vectored_power_W(cfg: VTOLConfig, airspeed_mps: float,
     else:
         regime = "transition"
 
-    return {
+    point = {
         "regime": regime,
         "airspeed_mps": v,
         "rotor_thrust_N": thrust_N,
@@ -957,8 +1574,9 @@ def vectored_power_W(cfg: VTOLConfig, airspeed_mps: float,
         "rotor_shaft_W": shaft,
         "cruise_shaft_W": 0.0,
         "shaft_power_W": shaft,
-        "total_power_W": total,
     }
+    point.update(chain)
+    return point
 
 
 def power_at_airspeed(cfg: VTOLConfig, airspeed_mps: float) -> Dict[str, float]:
@@ -992,6 +1610,393 @@ def transition_speed_mps(cfg: VTOLConfig) -> float:
 
 
 # ============================================================
+# PERFORMANCE — carried over from the fixed-wing and multicopter
+# ============================================================
+#
+# A VTOL is both aircraft, so it answers both sets of questions: the
+# multicopter's (RPM, tip Mach, figure of merit, thrust-to-weight, hover wind
+# limit) for its rotors, and the fixed-wing's (L/D, climb, ceiling, turns,
+# glide, runway) for its wing. The formulas are the ones those two tools use,
+# restated here against the VTOL's own drag and propulsion.
+
+MU_AIR = 1.81e-5            # Pa.s, dynamic viscosity of air near 15 C
+ROC_CEILING_MPS = 0.508     # 100 ft/min, the service-ceiling definition
+
+# Lumped thermal model, per unit: a steady temperature rise of R_th x loss,
+# approached with time constant R_th x C_th. These are the multicopter's
+# whole-aircraft constants spread over the four motors and ESCs it assumes,
+# so the two tools warm a component at the same rate for the same loss.
+THERMAL = {
+    "motor":   {"R": 1.40, "C": 60.0},     # C/W per motor, J/C per motor
+    "esc":     {"R": 3.00, "C": 45.0},     # per ESC
+    "battery": {"R": 0.25, "C": 500.0},    # the pack
+}
+
+
+def blade_chord_m(diameter_in: float, blades: int) -> float:
+    """Average blade chord, the multicopter's coarse estimate."""
+    d_m = max(float(diameter_in), 0.0) * 0.0254
+    b = max(int(blades), 1)
+    return 0.11 * d_m / (1.0 + 0.08 * (b - 2))
+
+
+def prop_solidity(diameter_in: float, blades: int) -> float:
+    """sigma = N_blades * chord / (pi * R)."""
+    r_m = max(float(diameter_in), 0.0) * 0.0254 / 2.0
+    if r_m <= 0:
+        return 0.0
+    return max(int(blades), 1) * blade_chord_m(diameter_in, blades) / (math.pi * r_m)
+
+
+def tip_speed_mps(diameter_in: float, rpm: float) -> float:
+    return math.pi * max(float(diameter_in), 0.0) * 0.0254 * max(float(rpm), 0.0) / 60.0
+
+
+def speed_of_sound_mps(temp_C: float) -> float:
+    return 331.3 * math.sqrt(max(1.0 + float(temp_C) / 273.15, 1e-6))
+
+
+def density_altitude_m(rho: float) -> float:
+    """Standard-atmosphere altitude with this density."""
+    return 44330.8 * (1.0 - (max(float(rho), 1e-9) / 1.225) ** 0.234969)
+
+
+def static_thrust_available_N(cfg: VTOLConfig, group: str) -> Tuple[float, str]:
+    """
+    Largest static thrust the group can make, all rotors together, and where
+    that figure came from — the multicopter's order of preference:
+
+      1. the bench table's highest measured thrust;
+      2. the propeller's rated thrust as entered;
+      3. the motor's max power through an ideal actuator disc;
+      4. the motor at full throttle: Kv x pack voltage sets the RPM, and the
+         thrust coefficient turns that into thrust.
+    """
+    g = _group(cfg, group)
+    n = max(int(g["n"]), 1)
+    rho = max(float(cfg.air_density), 1e-9)
+    d = float(g["d_in"]) * 0.0254
+    area = math.pi / 4.0 * d * d
+    table = g["table"]
+    if table is not None:
+        return float(table["Thrust_g"].max()) * G0 / 1000.0 * n, "bench table"
+    rated_g = (cfg.lift_prop_max_thrust_g if g["name"] == "lift"
+               else cfg.cruise_prop_max_thrust_g)
+    if rated_g and rated_g > 0:
+        return rated_g * G0 / 1000.0 * n, "rated thrust"
+    if g["pmax"]:
+        per = (float(g["pmax"]) * math.sqrt(2.0 * rho * area)) ** (2.0 / 3.0)
+        return per * n, "motor max power"
+    if g["kv"] and float(g["kv"]) > 0:
+        # Loaded, a motor reaches roughly 85% of its no-load speed.
+        n_rev = float(g["kv"]) * float(cfg.battery.vnom_pack) * 0.85 / 60.0
+        c_t = float(prop_coefficients(cfg, group)["c_t"])
+        return c_t * rho * n_rev ** 2 * d ** 4 * n, "Kv at full throttle"
+    return 0.0, "unknown"
+
+
+def forward_thrust_available_N(cfg: VTOLConfig, airspeed_mps: float) -> float:
+    """
+    Thrust available for forward flight at an airspeed, all propulsors.
+
+    The fixed-wing's momentum bound: the ideal power the propeller absorbs
+    at its static maximum is held fixed, and at speed the thrust is whatever
+    that power buys, T (V + vi) = P. At zero airspeed this is the static
+    figure; as the speed rises the thrust falls roughly as P / V.
+    """
+    static_T, _src = static_thrust_available_N(cfg, "cruise")
+    v = max(float(airspeed_mps), 0.0)
+    if static_T <= 0 or v < 0.1:
+        return static_T
+    g = _group(cfg, "cruise")
+    n = max(int(g["n"]), 1)
+    rho = max(float(cfg.air_density), 1e-9)
+    area = math.pi / 4.0 * (float(g["d_in"]) * 0.0254) ** 2
+    t_static = static_T / n
+    p_ideal = t_static * math.sqrt(t_static / (2.0 * rho * area))
+
+    def power_needed(t):
+        vi = -v / 2.0 + math.sqrt((v / 2.0) ** 2 + t / (2.0 * rho * area))
+        return t * (v + vi)
+
+    lo, hi = 0.0, t_static
+    for _ in range(50):
+        mid = 0.5 * (lo + hi)
+        if power_needed(mid) > p_ideal:
+            hi = mid
+        else:
+            lo = mid
+    return lo * n
+
+
+def wingborne_drag_N(cfg: VTOLConfig, airspeed_mps: float, load_factor: float = 1.0) -> float:
+    """Drag in wing-borne flight: the wing at the CL for n x W, rotors stopped."""
+    v = max(float(airspeed_mps), 1e-6)
+    lift = cfg.weight_N * max(float(load_factor), 1.0)
+    drag = wing_drag_N(cfg, v, lift) + body_drag_N(cfg, v)
+    if not uses_vectored_thrust(cfg):
+        drag += stopped_rotor_drag_N(cfg, v)
+    return drag
+
+
+def rate_of_climb_mps(cfg: VTOLConfig, airspeed_mps: float) -> float:
+    """(T_available - D) V / W, wing-borne. Zero where the thrust cannot keep up."""
+    v = max(float(airspeed_mps), 0.1)
+    excess = forward_thrust_available_N(cfg, v) - wingborne_drag_N(cfg, v)
+    return max(excess * v / max(cfg.weight_N, 1e-9), 0.0)
+
+
+def climb_angle_deg(cfg: VTOLConfig, airspeed_mps: float) -> float:
+    """asin((T - D) / W), wing-borne."""
+    v = max(float(airspeed_mps), 0.1)
+    ratio = ((forward_thrust_available_N(cfg, v) - wingborne_drag_N(cfg, v))
+             / max(cfg.weight_N, 1e-9))
+    return math.degrees(math.asin(min(ratio, 1.0))) if ratio > 0 else 0.0
+
+
+def _wingborne_speeds(cfg: VTOLConfig, v_max: Optional[float] = None, steps: int = 120):
+    """Speeds from the transition speed up, where the wing carries the aircraft."""
+    v_lo = max(transition_speed_mps(cfg), 1.0)
+    v_hi = max(v_max or max(cfg.cruise_speed_mps * 1.8, v_lo * 2.5), v_lo + 1.0)
+    return [v_lo + (v_hi - v_lo) * i / steps for i in range(steps + 1)]
+
+
+def best_climb(cfg: VTOLConfig, need_angle: bool = True) -> Dict[str, float]:
+    """Best rate of climb (Vy) and best angle (Vx), wing-borne."""
+    best = {"vy_mps": 0.0, "max_roc_mps": 0.0, "vx_mps": 0.0, "max_climb_angle_deg": 0.0}
+    w = max(cfg.weight_N, 1e-9)
+    for v in _wingborne_speeds(cfg, steps=80):
+        excess = forward_thrust_available_N(cfg, v) - wingborne_drag_N(cfg, v)
+        if excess <= 0:
+            continue
+        roc = excess * v / w
+        if roc > best["max_roc_mps"]:
+            best["vy_mps"], best["max_roc_mps"] = v, roc
+        if need_angle:
+            angle = math.degrees(math.asin(min(excess / w, 1.0)))
+            if angle > best["max_climb_angle_deg"]:
+                best["vx_mps"], best["max_climb_angle_deg"] = v, angle
+    return best
+
+
+def service_ceiling_m(cfg: VTOLConfig, max_alt_m: float = 8000.0) -> float:
+    """
+    Standard-atmosphere altitude where the best wing-borne climb falls to
+    100 ft/min, the fixed-wing's definition. Infinite if it is still above
+    that at `max_alt_m`; the field elevation if it is already below.
+    """
+    import copy
+
+    def roc_at(alt):
+        trial = copy.copy(cfg)
+        trial.__dict__ = dict(cfg.__dict__)
+        trial.__dict__.pop("_coeff_cache", None)
+        trial.air_density = core.air_density(alt)
+        return best_climb(trial, need_angle=False)["max_roc_mps"]
+
+    base = max(cfg.reference_altitude_m, 0.0)
+    if roc_at(base) < ROC_CEILING_MPS:
+        return base
+    lo, hi, alt = base, None, base + 500.0
+    while alt <= max_alt_m:
+        if roc_at(alt) < ROC_CEILING_MPS:
+            hi = alt
+            break
+        lo, alt = alt, alt + 500.0
+    if hi is None:
+        return float("inf")
+    for _ in range(8):
+        mid = 0.5 * (lo + hi)
+        if roc_at(mid) >= ROC_CEILING_MPS:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def best_speeds(cfg: VTOLConfig, v_max: Optional[float] = None,
+                wind_head_mps: float = 0.0, wind_cross_mps: float = 0.0) -> Dict[str, float]:
+    """
+    Best-endurance and best-range airspeeds over the whole speed range,
+    hover to fast cruise — a VTOL can loiter at any speed, so the search
+    starts at zero rather than at the stall. Range is over the ground in the
+    given wind, so a headwind moves the best-range speed up.
+    """
+    v_hi = v_max or max(cfg.cruise_speed_mps * 1.8, transition_speed_mps(cfg) * 1.8)
+    speeds = [v_hi * i / 240 for i in range(241)]
+    usable = cfg.battery.usable_Wh
+    best_e, best_r = (0.0, -1.0), (0.0, -1.0)
+    for v in speeds:
+        p = float(power_at_airspeed(cfg, v)["total_power_W"])
+        minutes = usable / max(p, 1e-9) * 60.0
+        km = minutes * 60.0 * max(core.groundspeed_along_track_mps(
+            v, wind_head_mps, wind_cross_mps), 0.0) / 1000.0
+        if minutes > best_e[1]:
+            best_e = (v, minutes)
+        if km > best_r[1]:
+            best_r = (v, km)
+    return {"best_endurance_speed_mps": best_e[0], "best_endurance_min": best_e[1],
+            "best_range_speed_mps": best_r[0], "best_range_km": best_r[1]}
+
+
+def glide(cfg: VTOLConfig) -> Dict[str, float]:
+    """
+    Unpowered glide, rotors stopped: the fixed-wing's min-sink search and the
+    analytic best-L/D speed, against the VTOL's full drag.
+    """
+    v_lo = max(stall_speed_mps(cfg) * 1.05, 1.0)
+    best_v, best_sink = v_lo, float("inf")
+    for i in range(301):
+        v = v_lo + 40.0 * i / 300
+        ld = cfg.weight_N / max(wingborne_drag_N(cfg, v), 1e-9)
+        sink = v / ld
+        if sink < best_sink:
+            best_v, best_sink = v, sink
+    q_s = 2.0 * cfg.weight_N / (cfg.air_density * cfg.wing_area_m2)
+    v_md = math.sqrt(q_s) * (cfg.induced_drag_factor / max(cfg.CD0, 1e-9)) ** 0.25
+    return {"min_sink_speed_mps": best_v, "min_sink_rate_mps": best_sink,
+            "best_glide_speed_mps": max(v_md, v_lo),
+            "ld_max_analytic": 0.5 * math.sqrt(math.pi * cfg.aspect_ratio * cfg.oswald
+                                               / max(cfg.CD0, 1e-9))}
+
+
+def takeoff_roll_m(cfg: VTOLConfig) -> float:
+    """
+    Conventional take-off roll on the forward thrust — the fixed-wing's
+    Raymer estimate, s = 1.44 W^2 / (g rho S CL_to (T - mu W)), with thrust
+    taken at 0.707 of the lift-off speed. Infinite if the thrust cannot
+    overcome the rolling friction.
+    """
+    v_lof = 1.2 * stall_speed_mps(cfg)
+    thrust = forward_thrust_available_N(cfg, 0.707 * v_lof)
+    net = thrust - cfg.mu_roll * cfg.weight_N
+    if net <= 0:
+        return float("inf")
+    return (1.44 * cfg.weight_N ** 2 /
+            (G0 * cfg.air_density * cfg.wing_area_m2 * cfg.CL_takeoff * net))
+
+
+def landing_distance_m(cfg: VTOLConfig, obstacle_m: float = 15.0) -> float:
+    """Conventional landing over a 15 m obstacle, the fixed-wing's method."""
+    v_s = stall_speed_mps(cfg)
+    v_app, v_td = 1.30 * v_s, 1.15 * v_s
+    ld_app = cfg.weight_N / max(wingborne_drag_N(cfg, v_app), 1e-9)
+    q_td = 0.5 * cfg.air_density * v_td ** 2
+    cl_ground = min(0.25, cfg.CL_max)
+    drag = q_td * cfg.wing_area_m2 * (cfg.CD0 + cfg.induced_drag_factor * cl_ground ** 2)
+    lift = q_td * cfg.wing_area_m2 * cl_ground
+    decel = (max(cfg.mu_brake, 0.08) * max(cfg.weight_N - lift, 0.0) + drag) / (cfg.weight_N / G0)
+    if decel <= 0:
+        return float("inf")
+    return obstacle_m * ld_app + 0.5 * v_td + v_td ** 2 / (2.0 * decel)
+
+
+def turn(cfg: VTOLConfig, airspeed_mps: float, bank_deg: float) -> Dict[str, float]:
+    """
+    A coordinated, level, wing-borne turn: the fixed-wing's figures, plus
+    what the turn costs in power — the wing flies at n x W, so its induced
+    drag rises by n squared.
+    """
+    v = max(float(airspeed_mps), 0.1)
+    phi = math.radians(min(max(float(bank_deg), 0.0), 80.0))
+    n = 1.0 / max(math.cos(phi), 1e-6)
+    tan_phi = math.tan(phi)
+    radius = v * v / (G0 * tan_phi) if tan_phi > 1e-6 else float("inf")
+    rate = math.degrees(G0 * tan_phi / v)
+    drag = wingborne_drag_N(cfg, v, n)
+    shaft = cruise_prop_power_W(cfg, drag, v)
+    if uses_vectored_thrust(cfg):
+        chain = drive_chain(cfg, drag, shaft, rotor_axial_mps=v)
+    else:
+        chain = drive_chain(cfg, 0.0, 0.0, drag, shaft, cruise_axial_mps=v)
+    return {"load_factor": n, "turn_radius_m": radius, "turn_rate_deg_s": rate,
+            "turn_period_s": 360.0 / rate if rate > 1e-9 else float("inf"),
+            "turn_stall_speed_mps": stall_speed_mps(cfg) * math.sqrt(n),
+            "turn_drag_N": drag, "turn_power_W": chain["total_power_W"]}
+
+
+def hover_wind_limit_mps(cfg: VTOLConfig) -> float:
+    """
+    Strongest wind the aircraft can hold station against by tilting its lift
+    rotors, the multicopter's estimate:
+
+        T_h = min( sqrt(T_avail^2 - W^2),  T_avail sin(tilt limit) )
+        V   = sqrt( 2 T_h / (rho CdA_side) )
+
+    NaN when no side drag area is known — an honest "cannot say" rather than
+    a divide by nearly nothing. It ignores the wing, which in a real wind
+    starts lifting too; that makes it conservative.
+    """
+    t_avail, _src = static_thrust_available_N(cfg, "lift")
+    need = cfg.weight_N * (1.0 + hover_download_fraction(cfg))
+    areas = extra_drag_areas(cfg)
+    cda = float(areas["side_CdA"] or areas["frontal_CdA"])
+    if cda < 1e-4:
+        return float("nan")
+    if t_avail <= need:
+        return 0.0
+    t_h = min(math.sqrt(t_avail ** 2 - need ** 2),
+              t_avail * math.sin(math.radians(cfg.max_tilt_deg)))
+    return math.sqrt(2.0 * t_h / (cfg.air_density * cda))
+
+
+def hover_tilt_in_wind(cfg: VTOLConfig, wind_mps: float, wind_direction_deg: float,
+                       course_deg: float) -> Dict[str, float]:
+    """
+    Tilt needed to hold station in a wind, split into pitch and roll by where
+    the wind comes from relative to the heading.
+    """
+    drag = hover_wind_drag_N(cfg, wind_mps)
+    need = cfg.weight_N * (1.0 + hover_download_fraction(cfg))
+    tilt = math.degrees(math.atan2(drag, max(need, 1e-9)))
+    pitch, roll = core.pitch_roll_from_tilt(tilt, float(wind_direction_deg) - float(course_deg))
+    return {"hover_tilt_deg": tilt, "hover_pitch_deg": abs(pitch),
+            "hover_roll_deg": abs(roll), "hover_wind_drag_N": drag}
+
+
+def thermal_steady_C(ambient_C: float, loss_W: float, part: str) -> float:
+    """Steady temperature of one unit dissipating `loss_W`."""
+    return float(ambient_C) + THERMAL[part]["R"] * max(float(loss_W), 0.0)
+
+
+def thermal_status(*pairs) -> str:
+    """
+    OK / WARN / HOT from (temperature, limit) pairs: WARN within 10 C of a
+    limit, HOT past one. The multicopter's absolute 95 / 115 C bands are the
+    fallback where no limit applies.
+    """
+    worst = "OK"
+    for temp, limit in pairs:
+        if limit:
+            if temp > limit:
+                return "HOT"
+            if temp > limit - 10.0:
+                worst = "WARN"
+        elif temp >= 115.0:
+            return "HOT"
+        elif temp >= 95.0:
+            worst = "WARN"
+    return worst
+
+
+def voltage_rating_check(cfg: VTOLConfig, unit: str, lo: Optional[float],
+                         hi: Optional[float]) -> Optional[Dict[str, object]]:
+    """
+    The pack against a component's voltage rating, in the unit it was
+    entered in: series cells for "S", full-charge volts for "V". None when
+    no rating was entered.
+    """
+    if lo is None and hi is None:
+        return None
+    cells = str(unit).upper().startswith("S")
+    value = float(cfg.battery.series_cells) if cells else float(cfg.battery.vmax_pack)
+    ok = (lo is None or value >= lo) and (hi is None or value <= hi)
+    fmt = (lambda x: f"{x:g}S") if cells else (lambda x: f"{x:.1f} V")
+    limit = " - ".join(fmt(x) for x in (lo, hi) if x is not None)
+    return {"value": fmt(value), "limit": limit, "ok": ok}
+
+
+# ============================================================
 # METRICS
 # ============================================================
 
@@ -1006,13 +2011,93 @@ def transition_speed_mps(cfg: VTOLConfig) -> float:
 #
 # This is a view setting only. Hidden fields keep their values, so switching
 # modes never changes a result.
+#
+# Every field whose counterpart is in the multicopter's or the fixed-wing's
+# Simple set is here too, so a user moving between the three finds the same
+# inputs at the same level of detail. The Avionics tab stays fully visible,
+# as it does in both of them: omitting the avionics draw is a common and
+# costly beginner mistake.
 VTOL_SIMPLE_FIELDS = {
-    "weight", "payload", "span", "area", "cd0", "clmax",
-    "n_lift", "lift_d", "lift_p", "lift_kv", "lift_wt",
-    "n_cruise", "cruise_d", "cruise_p", "cruise_kv", "cruise_wt",
-    "chem", "cell_cap", "series", "parallel", "cell_wt",
-    "cruise_v", "alt", "temp", "wind", "wind_dir", "mission", "avionics",
+    # airframe and mass
+    "weight", "payload", "mass_mode", "structure_mass", "avionics_mass",
+    "span", "area", "cd0", "clmax", "oswald",
+    "mu_roll", "mu_brake", "cl_takeoff",
+    "drag_model_mode", "parasite_drag", "parasite_area", "profile_drag",
+    "profile_area", "body_length_m", "body_width_m", "body_height_m",
+    "arm_length_m", "arm_width_m",
+    # lift rotors
+    "n_lift", "lift_layout", "coax_spacing", "lift_d", "lift_p", "lift_blades",
+    "lift_kv", "lift_rm", "lift_i0", "lift_wt", "lift_imax", "lift_pmax",
+    "lift_prop_wt", "lift_max_thrust", "lift_table",
+    # cruise propulsion
+    "n_cruise", "cruise_d", "cruise_p", "cruise_blades", "cruise_kv",
+    "cruise_rm", "cruise_i0", "cruise_wt", "cruise_imax", "cruise_pmax",
+    "cruise_eff", "cruise_eff_model", "cruise_prop_wt", "cruise_max_thrust",
+    "cruise_table",
+    # battery
+    "chem", "unit_mode", "cell_cap", "series", "parallel", "cell_wt",
+    "cells_s_per_pack", "cells_p_per_pack", "pack_cap", "pack_wt",
+    "vmin", "vnom", "vmax", "rcell", "usable", "c_cont", "a_cont", "soc_model",
+    # ESC and avionics
+    "esc_cont", "esc_imax", "esc_wt",
+    "avionics_flat", "periph_current", "avionics_rails",
+    # mission and environment
+    "cruise_v", "alt", "cruise_altitude", "temp", "wind", "wind_dir",
+    "course_deg", "bank_deg", "reserve_percent", "accel", "decel", "max_tilt",
+    "mission", "plot_vmax",
 }
+
+
+def lift_rotor_positions(cfg: VTOLConfig) -> List[Tuple[float, float]]:
+    """
+    Where the lift rotors sit, in metres from the CG: x to starboard, y
+    toward the nose — the plan view's axes. One layout, shared by the
+    Airframe Diagram and the Per-Rotor Loading table, so the numbering on
+    the drawing is the numbering in the table.
+    """
+    span = max(float(cfg.wing_span_m), 1e-3)
+    chord = max(float(cfg.wing_area_m2) / span, 1e-3)
+    lift_r = float(cfg.lift_prop_diameter_in) * 0.0254 / 2.0
+    n = max(int(cfg.num_lift_rotors), 1)
+    per_side = max(n // 2, 1)
+    positions = []
+    if uses_vectored_thrust(cfg):
+        for side in (-1, 1):
+            for k in range(per_side):
+                frac = (k + 1) / (per_side + 1)
+                positions.append((side * frac * span / 2.0, chord / 2.0 + lift_r * 0.15))
+    else:
+        boom_x = span * 0.30
+        for side in (-1, 1):
+            for k in range(per_side):
+                fore = 1 if k % 2 == 0 else -1
+                offset = (k // 2 + 1) * (chord / 2.0 + lift_r * 1.15)
+                positions.append((side * boom_x, fore * offset))
+    return positions[:n]
+
+
+def hover_rotor_thrusts(cfg: VTOLConfig, wind_mps: float = 0.0,
+                        wind_direction_deg: float = 0.0,
+                        course_deg: float = 0.0) -> List[float]:
+    """
+    Thrust each lift rotor makes holding station in a wind, the multicopter's
+    per-rotor model: the airframe's drag acts at its height above the CG, and
+    the rotors counter that moment with uneven thrust. In still air, or with
+    the drag at the CG, they share the load evenly.
+
+    Holding station in a wind is translating into it at the wind speed, so
+    the travel direction relative to the nose is the wind's bearing minus
+    the heading.
+    """
+    need = cfg.weight_N * (1.0 + hover_download_fraction(cfg))
+    drag = hover_wind_drag_N(cfg, wind_mps)
+    total = math.hypot(need, drag)
+    # The core wants +x forward, +y right; the plan view is x right, y forward.
+    positions = [(y, x) for x, y in lift_rotor_positions(cfg)]
+    return core.rotor_thrust_distribution(
+        positions, total, drag_N=drag,
+        translation_azimuth_deg=float(wind_direction_deg) - float(course_deg),
+        drag_height_above_cg_m=cfg.drag_cg_offset_m)
 
 
 def make_airframe_diagram_figure(cfg: VTOLConfig, figsize=(9, 7.5)):
@@ -1042,20 +2127,9 @@ def make_airframe_diagram_figure(cfg: VTOLConfig, figsize=(9, 7.5)):
                             linewidth=1.4, zorder=2))
 
     vectored = uses_vectored_thrust(cfg)
-    positions = []
-    per_side = max(n // 2, 1)
-    if vectored:
-        for side in (-1, 1):
-            for k in range(per_side):
-                frac = (k + 1) / (per_side + 1)
-                positions.append((side * frac * span / 2.0, chord / 2.0 + lift_r * 0.15))
-    else:
+    positions = lift_rotor_positions(cfg)
+    if not vectored:
         boom_x = span * 0.30
-        for side in (-1, 1):
-            for k in range(per_side):
-                fore = 1 if k % 2 == 0 else -1
-                offset = (k // 2 + 1) * (chord / 2.0 + lift_r * 1.15)
-                positions.append((side * boom_x, fore * offset))
         for x, y in positions:
             ax.plot([x, x], [0, y], color="#37474F", linewidth=3.0, zorder=1)
         ax.plot([-boom_x, boom_x], [0, 0], color="#37474F", linewidth=3.0, zorder=1)
@@ -1237,8 +2311,19 @@ def compute_metrics(cfg: VTOLConfig, airspeed_mps: Optional[float] = None,
     head, cross = core.wind_components_mps(wind, wind_direction_deg, course_deg)
 
     hover = hover_power_W(cfg)
-    point = power_at_airspeed(cfg, v)
+    point = dict(power_at_airspeed(cfg, v))
     usable_Wh = cfg.battery.usable_Wh
+
+    # A commanded climb or descent at the cruise point, as the other two
+    # simulators apply it: the potential power W x (climb - descent) through
+    # the drive. Climbing costs it over the efficiency; descending hands it
+    # back scaled by the efficiency, never below the systems' own draw.
+    potential_W = cfg.weight_N * (cfg.climb_rate_mps - cfg.descent_rate_mps)
+    chain_eff = max(cfg.esc_efficiency * float(point.get("drive_efficiency", 1.0)), 1e-9)
+    climb_add_W = potential_W / chain_eff if potential_W >= 0 else potential_W * chain_eff
+    floor_W = avionics_input_power_W(cfg) + peripheral_power_W(cfg)
+    point["steady_power_W"] = float(point["total_power_W"])
+    point["total_power_W"] = max(float(point["total_power_W"]) + climb_add_W, floor_W)
 
     hover_min = usable_Wh / max(hover["total_power_W"], 1e-9) * 60.0
     cruise_min = usable_Wh / max(point["total_power_W"], 1e-9) * 60.0
@@ -1325,9 +2410,276 @@ def compute_metrics(cfg: VTOLConfig, airspeed_mps: Optional[float] = None,
         "periph_current_A": cfg.periph_current_A,
         "peripheral_power_W": peripheral_power_W(cfg),
         "stopped_rotor_drag_area_m2": cfg.stopped_rotor_drag_area_m2,
+        "steady_power_W": point["steady_power_W"],
+        "potential_power_W": potential_W,
+        "climb_power_add_W": point["total_power_W"] - point["steady_power_W"],
+        "climb_rate_cmd_mps": cfg.climb_rate_mps,
+        "descent_rate_cmd_mps": cfg.descent_rate_mps,
     }
     metrics.update(_detail_metrics(cfg, point, hover, pack_I))
+    metrics.update(_extended_metrics(cfg, metrics, point, hover, head, cross))
     return metrics
+
+
+def _motor_metrics(cfg: VTOLConfig, prefix: str, op: dict, group: str,
+                   airspeed_mps: float, axial_mps: float) -> Dict[str, object]:
+    """One motor-and-propeller operating point, flattened under `prefix`."""
+    g = _group(cfg, group)
+    rpm = float(op.get("rpm", 0.0))
+    tip = tip_speed_mps(g["d_in"], rpm)
+    n_rev = rpm / 60.0
+    d_m = float(g["d_in"]) * 0.0254
+    omega_r = rpm * 2.0 * math.pi / 60.0 * d_m / 2.0
+    return {
+        f"{prefix}_rpm": rpm,
+        f"{prefix}_erpm": rpm * g["poles"] / 2.0,
+        f"{prefix}_thrust_N": float(op.get("thrust_N", 0.0)),
+        f"{prefix}_shaft_W": float(op.get("shaft_W", 0.0)),
+        f"{prefix}_elec_W": float(op.get("elec_W", 0.0)),
+        f"{prefix}_current_A": float(op.get("current_A", 0.0)),
+        f"{prefix}_v_emf_V": float(op.get("v_emf_V", 0.0)),
+        f"{prefix}_v_term_V": float(op.get("v_term_V", 0.0)),
+        f"{prefix}_copper_W": float(op.get("copper_W", 0.0)),
+        f"{prefix}_iron_W": float(op.get("iron_W", 0.0)),
+        f"{prefix}_motor_eff": float(op.get("efficiency", 1.0)),
+        f"{prefix}_throttle": float(op.get("throttle", float("nan"))),
+        f"{prefix}_saturated": bool(op.get("saturated", False)),
+        f"{prefix}_torque_Nm": float(op.get("torque_Nm", 0.0)),
+        f"{prefix}_measured": bool(op.get("measured", False)),
+        f"{prefix}_tip_speed_mps": tip,
+        f"{prefix}_tip_mach": tip / speed_of_sound_mps(cfg.ambient_temp_C),
+        f"{prefix}_pitch_speed_mps": float(g["p_in"]) * 0.0254 * n_rev,
+        # J for a propeller meeting the flow head-on, mu for a rotor meeting
+        # it edgewise; both are reported and the reader takes the one that fits.
+        f"{prefix}_advance_J": axial_mps / max(n_rev * d_m, 1e-9) if n_rev > 0 else 0.0,
+        f"{prefix}_advance_mu": (airspeed_mps / max(omega_r, 1e-9)) if omega_r > 0 else 0.0,
+        f"{prefix}_thrust_per_W_g": (float(op.get("thrust_N", 0.0)) / G0 * 1000.0
+                                     / max(float(op.get("elec_W", 0.0)), 1e-9)
+                                     if op.get("elec_W") else 0.0),
+    }
+
+
+def _extended_metrics(cfg: VTOLConfig, m: dict, point: dict, hover: dict,
+                      head: float, cross: float) -> Dict[str, object]:
+    """
+    Everything the multicopter's and the fixed-wing's Metrics tabs report
+    that applies to a VTOL: motors and propellers, the wing's aerodynamics,
+    climb, turns, glide, runway, thermal and environment.
+    """
+    out: Dict[str, object] = {}
+    v = float(m["airspeed_mps"])
+    batt = cfg.battery
+    vnom = max(batt.vnom_pack, 1e-9)
+
+    # ---- motors and propellers ----------------------------------------
+    out.update(_motor_metrics(cfg, "hover_lift", hover["lift_motor"], "lift", 0.0, 0.0))
+    cruise_axial = v * (math.sin(math.radians(float(m.get("tilt_deg", 90.0))))
+                        if uses_vectored_thrust(cfg) else 1.0)
+    out.update(_motor_metrics(cfg, "cruise_motor", point["cruise_motor"],
+                              "cruise", v, cruise_axial))
+    out.update(_motor_metrics(cfg, "point_lift", point["lift_motor"], "lift", v, 0.0))
+    for group in ("lift", "cruise"):
+        g = _group(cfg, group)
+        coeff = prop_coefficients(cfg, group)
+        area = math.pi / 4.0 * (float(g["d_in"]) * 0.0254) ** 2
+        out[f"{group}_c_t"] = coeff["c_t"]
+        out[f"{group}_c_p"] = coeff["c_p"]
+        out[f"{group}_coeff_source"] = coeff["source"]
+        out[f"{group}_disc_area_m2"] = area
+        out[f"{group}_solidity"] = prop_solidity(g["d_in"], g["blades"])
+        out[f"{group}_chord_m"] = blade_chord_m(g["d_in"], g["blades"])
+        out[f"{group}_p_over_d"] = float(g["p_in"]) / max(float(g["d_in"]), 1e-9)
+        out[f"{group}_kt"] = 60.0 / (2.0 * math.pi * float(g["kv"])) if g["kv"] else float("nan")
+        static_T, source = static_thrust_available_N(cfg, group)
+        out[f"{group}_thrust_available_N"] = static_T
+        out[f"{group}_thrust_source"] = source
+
+    # ---- hover ---------------------------------------------------------
+    need = float(hover["rotor_thrust_N"])
+    hover_prop_W = max(float(hover["total_power_W"]) - avionics_input_power_W(cfg)
+                       - peripheral_power_W(cfg), 1e-9)
+    area_lift = cfg.lift_disc_area_m2
+    ideal = need * math.sqrt(need / (2.0 * cfg.air_density * max(area_lift, 1e-9)))
+    lift_avail = float(out["lift_thrust_available_N"])
+    out.update({
+        "hover_ideal_power_W": ideal,
+        "hover_shaft_W": float(hover["shaft_power_W"]),
+        "hover_propulsion_power_W": hover_prop_W,
+        "hover_efficiency_gW": need / G0 * 1000.0 / hover_prop_W,
+        "hover_figure_of_merit": ideal / max(float(hover["shaft_power_W"]), 1e-9),
+        "hover_motor_loss_W": float(hover.get("motor_loss_W", 0.0)),
+        "hover_esc_loss_W": float(hover.get("esc_loss_W", 0.0)),
+        "lift_twr": lift_avail / max(cfg.weight_N, 1e-9),
+        "lift_thrust_margin_pct": ((lift_avail - need) / max(lift_avail, 1e-9) * 100.0
+                                   if lift_avail > 0 else float("nan")),
+        # Extra mass the rotors could lift, download included, in grams.
+        "max_extra_payload_g": ((lift_avail / (1.0 + hover_download_fraction(cfg))
+                                 - cfg.weight_N) / G0 * 1000.0
+                                if lift_avail > 0 else float("nan")),
+        "payload_at_twr2_g": ((lift_avail / 2.0 - cfg.weight_N) / G0 * 1000.0
+                              if lift_avail > 0 else float("nan")),
+        "hover_wind_limit_mps": hover_wind_limit_mps(cfg),
+    })
+    out.update(hover_tilt_in_wind(cfg, m["wind_mps"], m["wind_direction_deg"],
+                                  m["course_deg"]))
+
+    # ---- the wing at the cruise point ---------------------------------
+    q = 0.5 * cfg.air_density * v * v
+    lift = float(point.get("wing_lift_N", 0.0))
+    cl = lift / max(q * cfg.wing_area_m2, 1e-9) if v > 0.1 else 0.0
+    cd_i = cfg.induced_drag_factor * cl * cl
+    d_induced = q * cfg.wing_area_m2 * cd_i
+    d_parasite = q * cfg.wing_area_m2 * cfg.CD0
+    d_stopped = (stopped_rotor_drag_N(cfg, v) * min(max(float(m.get("lift_share_wing", 1.0)), 0.0), 1.0)
+                 if not uses_vectored_thrust(cfg) else 0.0)
+    d_body = body_drag_N(cfg, v)
+    d_total = d_induced + d_parasite + d_stopped + d_body
+    lift_slope = 2.0 * math.pi * cfg.aspect_ratio / (cfg.aspect_ratio + 2.0)
+    chord = cfg.wing_area_m2 / max(cfg.wing_span_m, 1e-9)
+    gl = glide(cfg)
+    glide_alt = (cfg.cruise_altitude_m if cfg.cruise_altitude_m is not None
+                 else cfg.reference_altitude_m)
+    ld = lift / max(d_total, 1e-9) if lift > 0 else 0.0
+    out.update({
+        "cl_cruise": cl, "cl_margin": cfg.CL_max - cl,
+        "cd_cruise": cfg.CD0 + cd_i, "cd_induced": cd_i, "cd_parasite": cfg.CD0,
+        "induced_parasite_ratio": cd_i / max(cfg.CD0, 1e-9),
+        "drag_induced_N": d_induced, "drag_parasite_N": d_parasite,
+        "drag_stopped_rotor_N": d_stopped, "drag_body_N": d_body,
+        "drag_total_N": d_total, "ld_cruise": ld,
+        "ld_max": gl["ld_max_analytic"],
+        "aoa_deg": math.degrees(cl / max(lift_slope, 1e-9)),
+        "lift_curve_slope": lift_slope, "mean_chord_m": chord,
+        "reynolds_number": cfg.air_density * v * chord / MU_AIR,
+        "speed_over_stall": v / max(float(m["stall_speed_mps"]), 1e-9),
+        "min_sink_speed_mps": gl["min_sink_speed_mps"],
+        "min_sink_rate_mps": gl["min_sink_rate_mps"],
+        "best_glide_speed_mps": gl["best_glide_speed_mps"],
+        "glide_ratio": gl["ld_max_analytic"],
+        "glide_reference_altitude_m": glide_alt,
+        "glide_distance_km": glide_alt * gl["ld_max_analytic"] / 1000.0,
+        "extra_drag_source": extra_drag_areas(cfg)["source"],
+        "extra_frontal_CdA_m2": extra_drag_areas(cfg)["frontal_CdA"],
+        "extra_side_CdA_m2": extra_drag_areas(cfg)["side_CdA"],
+    })
+
+    # ---- best speeds, climb, ceiling, runway, turns ----------------------
+    out.update(best_speeds(cfg, wind_head_mps=head, wind_cross_mps=cross))
+    out["cruise_vs_best_endurance_pct"] = (v / max(out["best_endurance_speed_mps"], 1e-9) - 1.0) * 100.0
+    out["cruise_vs_best_range_pct"] = (v / max(out["best_range_speed_mps"], 1e-9) - 1.0) * 100.0
+    climb = best_climb(cfg)
+    out.update({
+        "roc_at_cruise_mps": rate_of_climb_mps(cfg, v) if v >= float(m["transition_speed_mps"]) else 0.0,
+        "max_roc_mps": climb["max_roc_mps"], "vy_mps": climb["vy_mps"],
+        "max_climb_angle_deg": climb["max_climb_angle_deg"], "vx_mps": climb["vx_mps"],
+        "service_ceiling_m": service_ceiling_m(cfg),
+        "takeoff_roll_m": takeoff_roll_m(cfg),
+        "landing_distance_m": landing_distance_m(cfg),
+        "forward_thrust_available_N": forward_thrust_available_N(cfg, v),
+        "forward_static_thrust_N": float(out["cruise_thrust_available_N"]),
+    })
+    ceiling = out["service_ceiling_m"]
+    out["service_ceiling_agl_m"] = (ceiling - cfg.reference_altitude_m
+                                    if math.isfinite(ceiling) else float("inf"))
+    tr = turn(cfg, v, cfg.bank_deg)
+    out.update({f"{k}": val for k, val in tr.items()})
+    out["turn_endurance_min"] = batt.usable_Wh / max(tr["turn_power_W"], 1e-9) * 60.0
+    out["loiter_circles"] = (out["turn_endurance_min"] * 60.0 / tr["turn_period_s"]
+                             if math.isfinite(tr["turn_period_s"]) else 0.0)
+
+    # ---- thrust and power at the cruise point -----------------------------
+    thrust_req = float(point.get("cruise_thrust_N", 0.0))
+    fwd_avail = float(out["forward_thrust_available_N"])
+    total = float(m["total_power_W"])
+    shaft = float(point.get("shaft_power_W", 0.0))
+    out.update({
+        "thrust_required_N": thrust_req,
+        "thrust_margin_pct": ((fwd_avail - thrust_req) / max(fwd_avail, 1e-9) * 100.0
+                              if fwd_avail > 0 else float("nan")),
+        "forward_twr": float(out["forward_static_thrust_N"]) / max(cfg.weight_N, 1e-9),
+        "propulsive_power_W": thrust_req * v,
+        "propulsive_efficiency": thrust_req * v / max(total, 1e-9),
+        "system_efficiency": shaft / max(total, 1e-9),
+        "power_loading_W_per_kg": total / max(cfg.all_up_weight_g / 1000.0, 1e-9),
+        "specific_range_km_per_Wh": float(m["groundspeed_mps"]) * 3.6 / max(total, 1e-9),
+        "specific_endurance_min_per_Wh": 60.0 / max(total, 1e-9),
+        "esc_conduction_W": float(point.get("esc_conduction_W", 0.0)),
+        "esc_switching_W": float(point.get("esc_switching_W", 0.0)),
+        "esc_idle_W": float(point.get("esc_idle_W", 0.0)),
+    })
+
+    # ---- battery -------------------------------------------------------
+    pack_I = float(m["pack_current_A"])
+    r_pack = batt.pack_resistance
+    reserve_pct = cfg.reserve_percent if cfg.reserve_percent is not None else 20.0
+    reserve_Wh = batt.usable_Wh * reserve_pct / 100.0
+    out.update({
+        "battery_chemistry": batt.chemistry,
+        "pack_v_full_V": batt.vmax_pack, "pack_v_nominal_V": batt.vnom_pack,
+        "pack_v_cutoff_V": batt.vmin_pack,
+        "pack_sag_V": batt.vmax_pack - float(m["v_load_V"]),
+        "pack_resistance_ohm": r_pack,
+        "battery_loss_W": pack_I * pack_I * r_pack,
+        "hover_battery_loss_W": float(m["hover_pack_current_A"]) ** 2 * r_pack,
+        "capacity_Wh": batt.capacity_Wh,
+        "usable_mAh": batt.capacity_mAh * batt.usable_fraction,
+        "hover_c_rate": float(m["hover_pack_current_A"]) / max(batt.capacity_Ah, 1e-9),
+        "reserve_percent": reserve_pct,
+        "reserve_target_Wh": reserve_Wh,
+        "reserve_margin_Wh": batt.usable_Wh - reserve_Wh,
+        "cruise_endurance_to_reserve_min": (batt.usable_Wh - reserve_Wh) / max(total, 1e-9) * 60.0,
+        "hover_endurance_to_reserve_min": ((batt.usable_Wh - reserve_Wh)
+                                           / max(float(m["hover_power_W"]), 1e-9) * 60.0),
+    })
+
+    # ---- mass fractions --------------------------------------------------
+    auw = max(cfg.all_up_weight_g, 1e-9)
+    drive = (m["lift_motor_mass_g"] + m["cruise_motor_mass_g"] + m["lift_prop_mass_g"]
+             + m["cruise_prop_mass_g"] + cfg.esc_weight_g * n_escs(cfg))
+    out.update({
+        "battery_mass_fraction": batt.weight_g / auw,
+        "drive_mass_fraction": drive / auw,
+        "payload_fraction": cfg.payload_mass_g / auw,
+        "drive_mass_g": drive,
+    })
+
+    # ---- thermal: hover sizes the lift side, cruise the cruise side --------
+    amb = cfg.ambient_temp_C
+    lift_loss = out["hover_lift_copper_W"] + out["hover_lift_iron_W"]
+    cruise_loss = out["cruise_motor_copper_W"] + out["cruise_motor_iron_W"]
+    esc_hover = float(hover.get("esc_loss_W", 0.0)) / max(n_escs(cfg), 1)
+    esc_cruise = float(point.get("esc_loss_W", 0.0)) / max(n_escs(cfg), 1)
+    t_lift = thermal_steady_C(amb, lift_loss, "motor")
+    t_cruise = thermal_steady_C(amb, cruise_loss, "motor")
+    t_esc = thermal_steady_C(amb, max(esc_hover, esc_cruise), "esc")
+    t_batt = thermal_steady_C(amb, out["hover_battery_loss_W"], "battery")
+    motor_limit = min(cfg.lift_motor_temp_limit_C, cfg.cruise_motor_temp_limit_C)
+    out.update({
+        "ambient_temp_C": amb,
+        "lift_motor_temp_C": t_lift, "cruise_motor_temp_C": t_cruise,
+        "motor_temp_est_C": max(t_lift, t_cruise),
+        "esc_temp_est_C": t_esc, "battery_temp_est_C": t_batt,
+        "motor_thermal_headroom_C": motor_limit - max(t_lift, t_cruise),
+        "esc_thermal_headroom_C": cfg.esc_temp_limit_C - t_esc,
+        "battery_thermal_headroom_C": batt.temp_limit_C - t_batt,
+        "motor_copper_loss_W_per_motor": out["hover_lift_copper_W"],
+        "thermal_status": thermal_status(
+            (t_lift, cfg.lift_motor_temp_limit_C), (t_cruise, cfg.cruise_motor_temp_limit_C),
+            (t_esc, cfg.esc_temp_limit_C), (t_batt, batt.temp_limit_C)),
+        "thermal_basis": "steady state at hover (lift side) and cruise (cruise side)",
+    })
+
+    # ---- environment -----------------------------------------------------
+    out.update({
+        "altitude_m": cfg.reference_altitude_m,
+        "cruise_altitude_m": cfg.cruise_altitude_m,
+        "pressure_Pa": cfg.pressure_Pa,
+        "air_density": cfg.air_density,
+        "density_ratio": cfg.air_density / 1.225,
+        "density_altitude_m": density_altitude_m(cfg.air_density),
+        "speed_of_sound_mps": speed_of_sound_mps(amb),
+    })
+    return out
 
 
 def _detail_metrics(cfg: VTOLConfig, point: dict, hover: dict,
@@ -1338,9 +2690,6 @@ def _detail_metrics(cfg: VTOLConfig, point: dict, hover: dict,
     carries, and what each component weighs.
     """
     shaft = float(point.get("shaft_power_W", 0.0))
-    esc_loss = shaft / max(cfg.esc_efficiency, 1e-9) - shaft
-    before_wire = (shaft / max(cfg.esc_efficiency, 1e-9)
-                   + avionics_input_power_W(cfg) + peripheral_power_W(cfg))
     hover_shaft = float(hover.get("shaft_power_W", 0.0))
     hover_total = float(hover.get("total_power_W", 0.0))
 
@@ -1359,8 +2708,13 @@ def _detail_metrics(cfg: VTOLConfig, point: dict, hover: dict,
         "download_N": float(point.get("download_N", 0.0)),
         "lift_share_wing": float(point.get("lift_share_wing",
                                            1.0 if point.get("regime") == "cruise" else 0.0)),
-        "esc_loss_W": esc_loss,
-        "wire_loss_W": wire_loss_W(cfg, before_wire),
+        "esc_loss_W": float(point.get("esc_loss_W", 0.0)),
+        "wire_loss_W": float(point.get("wire_loss_W", 0.0)),
+        "motor_loss_W": float(point.get("motor_loss_W", 0.0)),
+        "motor_copper_W": float(point.get("motor_copper_W", 0.0)),
+        "motor_iron_W": float(point.get("motor_iron_W", 0.0)),
+        "motor_input_W": float(point.get("motor_input_W", shaft)),
+        "drive_efficiency": float(point.get("drive_efficiency", 1.0)),
         "wire_drop_V": pack_I * float(getattr(cfg, "wire_resistance_ohm", 0.0) or 0.0),
         "c_rate": pack_I / max(cfg.battery.capacity_Ah, 1e-9),
         "hover_pack_current_A": hover_total / max(cfg.battery.vnom_pack, 1e-9),
@@ -1447,7 +2801,7 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
                      wind_mps: float = 0.0, wind_direction_deg: float = 0.0,
                      max_accel_mps2: float = 0.0, max_decel_mps2: float = 0.0,
                      regen_eff: float = 0.0,
-                     transient_dt_s: float = 0.25) -> Tuple[List[tuple], Dict[str, float]]:
+                     transient_dt_s: Optional[float] = None) -> Tuple[List[tuple], Dict[str, float]]:
     """
     Fly the mission by integrating it in time, as the multicopter and
     fixed-wing do.
@@ -1473,9 +2827,15 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
     """
     _require_implemented(cfg)
 
-    dt = max(float(transient_dt_s or 0.25), 0.01)
+    # The step: an explicit argument, else the aircraft's Transient step
+    # field, else 0.25 s.
+    dt = max(float(transient_dt_s or cfg.transient_dt_s or 0.25), 0.01)
     usable_Wh = cfg.battery.usable_Wh
-    reserve_Wh = usable_Wh * mission.reserve_percent / 100.0
+    # A reserve entered on the Mission/Environment tab overrides the file's,
+    # as it does on the other two simulators.
+    reserve_pct = (cfg.reserve_percent if cfg.reserve_percent is not None
+                   else mission.reserve_percent)
+    reserve_Wh = usable_Wh * reserve_pct / 100.0
     remaining_Wh = usable_Wh
 
     results: List[tuple] = []
@@ -1496,19 +2856,65 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
         "rotor_thrust_N", "wing_lift_N", "cruise_thrust_N", "drag_N",
         "energy_used_Wh", "soc_pct", "reserve_margin_Wh",
         "capacity_remaining_mAh", "climb_rate_mps", "specific_power_W_per_kg",
-        "segment_code")}
+        "segment_code",
+        # carried over from the multicopter and fixed-wing mission histories
+        "commanded_airspeed_mps", "groundspeed_mps", "headwind_mps", "crosswind_mps",
+        "accel_mps2", "kinetic_power_W", "potential_power_W", "battery_voltage_V",
+        "battery_loss_W", "esc_loss_W", "motor_loss_W", "systems_power_W",
+        "lift_motor_current_A", "lift_motor_rpm", "lift_motor_throttle",
+        "lift_motor_power_W", "lift_thrust_per_rotor_N",
+        "cruise_motor_current_A", "cruise_motor_rpm", "cruise_motor_throttle",
+        "cruise_motor_power_W", "lift_tip_mach", "advance_ratio_mu",
+        "cl_wing", "lift_drag_ratio", "motor_temp_est_C", "esc_temp_est_C",
+        "battery_temp_est_C", "thermal_status", "reserve_target_Wh",
+        "reserve_breach")}
     # Segment kind as a number, so it can share an axis with everything else.
     # The multicopter plots its segment type the same way.
     _KIND_CODE = {"hover": 0, "climb": 1, "descend": 2,
                   "transition": 3, "cruise": 4}
     auw_kg = max(cfg.all_up_weight_g / 1000.0, 1e-9)
     worst = {"total_power_W": 0.0, "pack_current_A": 0.0, "c_rate": 0.0,
-             "remaining_Wh": usable_Wh, "peak_phase": ""}
+             "remaining_Wh": usable_Wh, "peak_phase": "",
+             "lift_motor_current_A": 0.0, "cruise_motor_current_A": 0.0,
+             "esc_current_A": 0.0, "lift_motor_throttle": 0.0,
+             "cruise_motor_throttle": 0.0, "lift_motor_power_W": 0.0,
+             "cruise_motor_power_W": 0.0, "motor_temp_est_C": 0.0,
+             "esc_temp_est_C": 0.0, "battery_temp_est_C": 0.0,
+             "min_soc_pct": 100.0, "min_battery_voltage_V": float("inf"),
+             "lift_tip_mach": 0.0, "thermal_status": "OK",
+             # Seconds spent above each continuous rating, for the
+             # "time at max" checks.
+             "lift_over_rating_s": 0.0, "cruise_over_rating_s": 0.0,
+             "esc_over_rating_s": 0.0, "battery_over_rating_s": 0.0}
     state = {"t": 0.0, "alt": 0.0, "dist": 0.0, "v": 0.0}
+    # Lumped temperatures, integrated step by step from ambient, per unit.
+    ambient = cfg.ambient_temp_C
+    temps = {"lift": ambient, "cruise": ambient, "esc": ambient, "battery": ambient}
+    n_esc = max(n_escs(cfg), 1)
+    vectored = uses_vectored_thrust(cfg)
 
-    def _record(name, kind, v, alt, power, detail=None):
-        current = power / vnom
+    def _record(name, kind, v, alt, power, detail=None, extra=None):
         d = detail or {}
+        x = extra or {}
+        current = float(x.get("pack_I", power / vnom))
+        lift_op = d.get("lift_motor") or {}
+        cruise_op = d.get("cruise_motor") or {}
+        step = float(x.get("step_dt", 0.0))
+        # Temperatures: each unit warms toward ambient + R x loss.
+        lift_loss = float(lift_op.get("copper_W", 0.0)) + float(lift_op.get("iron_W", 0.0))
+        cruise_loss = (0.0 if vectored else
+                       float(cruise_op.get("copper_W", 0.0)) + float(cruise_op.get("iron_W", 0.0)))
+        for part, key, loss in (("motor", "lift", lift_loss),
+                                ("motor", "cruise", cruise_loss),
+                                ("esc", "esc", float(d.get("esc_loss_W", 0.0)) / n_esc),
+                                ("battery", "battery", float(x.get("battery_loss_W", 0.0)))):
+            temps[key] = core.thermal_step(temps[key], ambient, loss,
+                                           THERMAL[part]["R"], THERMAL[part]["C"], step)
+        status = thermal_status(
+            (temps["lift"], cfg.lift_motor_temp_limit_C),
+            (temps["cruise"], cfg.cruise_motor_temp_limit_C),
+            (temps["esc"], cfg.esc_temp_limit_C),
+            (temps["battery"], cfg.battery.temp_limit_C))
         prev_t = series["t_s"][-1] if series["t_s"] else 0.0
         prev_alt = series["altitude_m"][-1] if series["altitude_m"] else 0.0
         dt = state["t"] - prev_t
@@ -1543,6 +2949,82 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
         series["climb_rate_mps"].append((alt - prev_alt) / dt if dt > 1e-9 else 0.0)
         series["specific_power_W_per_kg"].append(power / auw_kg)
         series["segment_code"].append(float(_KIND_CODE.get(kind, -1)))
+
+        lift_I = float(lift_op.get("current_A", 0.0))
+        cruise_I = float(cruise_op.get("current_A", 0.0))
+        lift_rpm = float(lift_op.get("rpm", 0.0))
+        r_lift = cfg.lift_prop_diameter_in * 0.0254 / 2.0
+        omega_r = lift_rpm * 2.0 * math.pi / 60.0 * r_lift
+        wing_lift = float(d.get("wing_lift_N", 0.0))
+        q_s = 0.5 * cfg.air_density * v * v * cfg.wing_area_m2
+        motor_temp = max(temps["lift"], temps["cruise"])
+        drag = float(d.get("drag_N", 0.0) or 0.0)
+        for key, value in (
+                ("commanded_airspeed_mps", x.get("target_v", v)),
+                ("groundspeed_mps", x.get("ground", v)),
+                ("headwind_mps", x.get("head", 0.0)),
+                ("crosswind_mps", x.get("cross", 0.0)),
+                ("accel_mps2", x.get("accel", 0.0)),
+                ("kinetic_power_W", x.get("kinetic_W", 0.0)),
+                ("potential_power_W", x.get("climb_W", 0.0)),
+                ("battery_voltage_V", x.get("pack_v", vnom)),
+                ("battery_loss_W", x.get("battery_loss_W", 0.0)),
+                ("esc_loss_W", d.get("esc_loss_W", 0.0)),
+                ("motor_loss_W", d.get("motor_loss_W", 0.0)),
+                ("systems_power_W", avionics_input_power_W(cfg) + peripheral_power_W(cfg)),
+                ("lift_motor_current_A", lift_I),
+                ("lift_motor_rpm", lift_rpm),
+                ("lift_motor_throttle", lift_op.get("throttle", 0.0)),
+                ("lift_motor_power_W", lift_op.get("elec_W", 0.0)),
+                ("lift_thrust_per_rotor_N", lift_op.get("thrust_N", 0.0)),
+                ("cruise_motor_current_A", cruise_I),
+                ("cruise_motor_rpm", cruise_op.get("rpm", 0.0)),
+                ("cruise_motor_throttle", cruise_op.get("throttle", 0.0)),
+                ("cruise_motor_power_W", cruise_op.get("elec_W", 0.0)),
+                ("lift_tip_mach", tip_speed_mps(cfg.lift_prop_diameter_in, lift_rpm)
+                 / speed_of_sound_mps(ambient)),
+                ("advance_ratio_mu", v / omega_r if omega_r > 1e-9 else 0.0),
+                ("cl_wing", wing_lift / q_s if q_s > 1e-9 else 0.0),
+                ("lift_drag_ratio", wing_lift / drag if drag > 1e-9 else 0.0),
+                ("motor_temp_est_C", motor_temp),
+                ("esc_temp_est_C", temps["esc"]),
+                ("battery_temp_est_C", temps["battery"]),
+                ("reserve_target_Wh", reserve_Wh),
+                ("reserve_breach", 1.0 if remaining_Wh < reserve_Wh else 0.0)):
+            value = float(value if value is not None else 0.0)
+            series[key].append(value if value == value else 0.0)
+        series["thermal_status"].append(status)
+
+        # Worst values, and time spent above each continuous rating.
+        esc_I = max(lift_I, cruise_I)
+        for key, value in (("lift_motor_current_A", lift_I),
+                           ("cruise_motor_current_A", cruise_I),
+                           ("esc_current_A", esc_I),
+                           ("lift_motor_power_W", float(lift_op.get("elec_W", 0.0))),
+                           ("cruise_motor_power_W", float(cruise_op.get("elec_W", 0.0))),
+                           ("motor_temp_est_C", motor_temp),
+                           ("esc_temp_est_C", temps["esc"]),
+                           ("battery_temp_est_C", temps["battery"]),
+                           ("lift_tip_mach", series["lift_tip_mach"][-1])):
+            worst[key] = max(worst[key], value)
+        for key, op in (("lift_motor_throttle", lift_op), ("cruise_motor_throttle", cruise_op)):
+            th = float(op.get("throttle", 0.0) or 0.0)
+            if th == th:
+                worst[key] = max(worst[key], th)
+        worst["min_soc_pct"] = min(worst["min_soc_pct"], series["soc_pct"][-1])
+        worst["min_battery_voltage_V"] = min(worst["min_battery_voltage_V"],
+                                             series["battery_voltage_V"][-1])
+        order = ("HOT", "WARN", "OK")
+        if order.index(status) < order.index(worst["thermal_status"]):
+            worst["thermal_status"] = status
+        if cfg.lift_motor_max_current_A and lift_I > cfg.lift_motor_max_current_A:
+            worst["lift_over_rating_s"] += step
+        if cfg.cruise_motor_max_current_A and cruise_I > cfg.cruise_motor_max_current_A:
+            worst["cruise_over_rating_s"] += step
+        if cfg.esc_cont_current_A and esc_I > cfg.esc_cont_current_A:
+            worst["esc_over_rating_s"] += step
+        if cfg.battery.discharge_cont_A and current > cfg.battery.discharge_cont_A:
+            worst["battery_over_rating_s"] += step
         if power > worst["total_power_W"]:
             worst["total_power_W"] = power
             worst["peak_phase"] = name
@@ -1633,15 +3115,45 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
             # are still pushing onto it; descending gives nothing back,
             # because a propeller is a poor brake and pretending otherwise
             # would flatter the endurance.
+            # Both extra terms below are shaft work, so they pass through the
+            # motor as well as the ESC — at the efficiency the motor is
+            # running at in this step.
+            lift_eff = float(point.get("lift_motor", {}).get("efficiency", 1.0) or 1.0)
+            drive_eff = float(point.get("drive_efficiency", 1.0) or 1.0)
+            climb_W = 0.0
             if climb_rate > 0:
                 thrust = cfg.weight_N * (1.0 + hover_download_fraction(cfg))
-                power += thrust * climb_rate / max(cfg.esc_efficiency, 1e-9)
+                climb_W = thrust * climb_rate
+                # Put the climb work through the lift motors themselves, so
+                # the current, RPM and loss recorded for this step are the
+                # climbing ones rather than the hover ones.
+                lift_op = point.get("lift_motor") or {}
+                n_l = max(cfg.num_lift_rotors, 1)
+                if lift_op.get("thrust_N", 0.0) > 0:
+                    climbing = motor_operating_point(
+                        cfg, "lift", lift_op["thrust_N"],
+                        lift_op["shaft_W"] + climb_W / n_l, climb_rate,
+                        measured=lift_op.get("measured", False))
+                    extra_in = n_l * ((climbing["shaft_W"] + climbing["loss_W"])
+                                      - (lift_op["shaft_W"] + lift_op["loss_W"]))
+                    point = dict(point)
+                    point["lift_motor"] = climbing
+                    if uses_vectored_thrust(cfg):
+                        point["cruise_motor"] = climbing
+                else:
+                    extra_in = climb_W / max(lift_eff, 1e-9)
+                power += extra_in / max(cfg.esc_efficiency, 1e-9)
 
             # The kinetic cost of the speed change, as mechanical power
-            # through the ESC. Decelerating releases it, scaled by regen_eff.
+            # through the drive. Decelerating releases it, scaled by regen_eff.
             kinetic = core.kinetic_power_term_W(
                 cfg.all_up_weight_g, v_prev, v_next, step_dt, regen_eff=regen_eff)
-            power = max(power + kinetic / max(cfg.esc_efficiency, 1e-9), 0.0)
+            # Spending kinetic energy costs it over the efficiency; recovering
+            # it (regen, negative) returns only the efficiency's share.
+            kinetic_W = kinetic
+            chain_eff = max(cfg.esc_efficiency * drive_eff, 1e-9)
+            kinetic = kinetic / chain_eff if kinetic >= 0 else kinetic * chain_eff
+            power = max(power + kinetic, 0.0)
 
             # Pack loss, charged against the CELLS rather than only shown in
             # the Power Budget. This is what time-stepping buys: the terminal
@@ -1657,7 +3169,8 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
             r_scale = (float(np.interp(soc, cfg.battery.soc_bp,
                                        cfg.battery.r_scale_bp))
                        if getattr(cfg.battery, "r_scale_bp", None) else 1.0)
-            power += pack_I * pack_I * cfg.battery.pack_resistance * r_scale
+            battery_loss_W = pack_I * pack_I * cfg.battery.pack_resistance * r_scale
+            power += battery_loss_W
 
             ground = max(core.groundspeed_along_track_mps(v_next, head, cross), 0.0)
             step_m = ground * step_dt
@@ -1683,7 +3196,13 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
             phase_t += step_dt
             phase_m += step_m
             phase_Wh += step_Wh
-            _record(phase.name, kind, v_next, state["alt"], power, point)
+            _record(phase.name, kind, v_next, state["alt"], power, point, {
+                "step_dt": step_dt, "target_v": target_v, "ground": ground,
+                "head": head, "cross": cross,
+                "accel": (v_next - v_prev) / step_dt if step_dt > 1e-12 else 0.0,
+                "kinetic_W": kinetic_W, "climb_W": climb_W,
+                "pack_v": pack_v - pack_I * cfg.battery.pack_resistance * r_scale,
+                "pack_I": pack_I, "battery_loss_W": battery_loss_W})
 
             if remaining_Wh < 0:
                 depleted = True
@@ -1724,6 +3243,7 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
 
     totals["remaining_Wh"] = remaining_Wh
     totals["reserve_Wh"] = reserve_Wh
+    totals["reserve_percent"] = reserve_pct
     totals["series"] = series
     worst["reserve_margin_Wh"] = worst["remaining_Wh"] - reserve_Wh
     totals["worst"] = worst
@@ -1735,163 +3255,530 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
 
 
 # ============================================================
+# ONE BUILDER FOR GUI, CLI AND BATCH
+# ============================================================
+#
+# Every input is known by its GUI field key. The GUI hands its fields to
+# config_from_fields directly; the CLI maps its flags onto the same keys
+# through FIELD_TO_CLI; the batch driver translates a saved GUI config
+# through the same map. One builder means the three cannot drift apart —
+# they did, twice: the batch map lacked CD0 (so a batch run used the CLI's
+# default drag), and the CLI had no flags for the current limits.
+#
+# GUI key -> CLI argument name (argparse dest). None marks a GUI-only field.
+FIELD_TO_CLI: Dict[str, Optional[str]] = {
+    # airframe and mass
+    "weight": "weight", "payload": "payload_mass_g", "mass_mode": "mass_mode",
+    "structure_mass": "structure_mass", "avionics_mass": "avionics_mass",
+    "span": "wing_span", "area": "wing_area", "cd0": "CD0", "oswald": "oswald",
+    "clmax": "CL_max", "clcruise": "CL_cruise_max",
+    "mu_roll": "mu_roll", "mu_brake": "mu_brake", "cl_takeoff": "CL_takeoff",
+    "drag_model_mode": "drag_model_mode",
+    "parasite_drag": "parasite_drag", "parasite_area": "parasite_area",
+    "profile_drag": "profile_drag", "profile_area": "profile_area",
+    "body_length_m": "body_length_m", "body_width_m": "body_width_m",
+    "body_height_m": "body_height_m", "arm_length_m": "arm_length_m",
+    "arm_width_m": "arm_width_m", "drag_cg_offset_m": "drag_cg_offset_m",
+    # lift rotors
+    "n_lift": "num_lift_rotors", "lift_layout": "lift_rotor_layout",
+    "coax_spacing": "coaxial_spacing_m",
+    "lift_d": "lift_prop_diameter", "lift_p": "lift_prop_pitch",
+    "lift_blades": "lift_prop_blades", "lift_kv": "lift_motor_kv",
+    "lift_rm": "lift_motor_resistance", "lift_i0": "lift_motor_i0",
+    "lift_v0": "lift_motor_v0", "lift_wt": "lift_motor_weight",
+    "lift_imax": "lift_motor_max_current", "lift_pmax": "lift_motor_max_power",
+    "lift_max_time": "lift_motor_max_time", "lift_temp_limit": "lift_motor_temp_limit",
+    "lift_v_unit": "lift_motor_v_unit", "lift_s_min": "lift_motor_rating_min",
+    "lift_s_max": "lift_motor_rating_max", "lift_poles": "lift_motor_pole_count",
+    "lift_size": "lift_motor_size", "fom": "lift_figure_of_merit",
+    "stopped_area": "stopped_rotor_drag_area", "download": "hover_download",
+    "lift_prop_wt": "lift_prop_weight", "lift_max_thrust": "lift_prop_max_thrust",
+    "lift_max_rpm": "lift_prop_max_rpm", "lift_tconst": "lift_prop_tconst",
+    "lift_pconst": "lift_prop_pconst", "lift_table": "lift_prop_table",
+    "inflow_map_enabled": "inflow_map_enabled", "inflow_mu_bp": "inflow_mu_bp",
+    "inflow_eff_bp": "inflow_eff_bp",
+    # cruise propulsion
+    "n_cruise": "num_cruise_motors", "cruise_d": "cruise_prop_diameter",
+    "cruise_p": "cruise_prop_pitch", "cruise_blades": "cruise_prop_blades",
+    "cruise_kv": "cruise_motor_kv", "cruise_rm": "cruise_motor_resistance",
+    "cruise_i0": "cruise_motor_i0", "cruise_v0": "cruise_motor_v0",
+    "cruise_wt": "cruise_motor_weight", "cruise_imax": "cruise_motor_max_current",
+    "cruise_pmax": "cruise_motor_max_power", "cruise_max_time": "cruise_motor_max_time",
+    "cruise_temp_limit": "cruise_motor_temp_limit", "cruise_v_unit": "cruise_motor_v_unit",
+    "cruise_s_min": "cruise_motor_rating_min", "cruise_s_max": "cruise_motor_rating_max",
+    "cruise_poles": "cruise_motor_pole_count", "cruise_size": "cruise_motor_size",
+    "cruise_eff": "cruise_prop_efficiency", "cruise_eff_model": "cruise_prop_eff_model",
+    "cruise_prop_wt": "cruise_prop_weight", "cruise_max_thrust": "cruise_prop_max_thrust",
+    "cruise_max_rpm": "cruise_prop_max_rpm", "cruise_tconst": "cruise_prop_tconst",
+    "cruise_pconst": "cruise_prop_pconst", "cruise_table": "cruise_prop_table",
+    # battery
+    "chem": "battery_chemistry", "cell_cap": "battery_cell_capacity",
+    "series": "battery_series_cells", "parallel": "battery_parallel_cells",
+    "cell_wt": "battery_cell_weight_g", "vmin": "battery_voltage_min",
+    "vnom": "battery_voltage_nominal", "vmax": "battery_voltage_max",
+    "rcell": "battery_resistance_cell", "usable": "battery_usable_percent",
+    "unit_mode": "battery_unit_mode", "cells_s_per_pack": "battery_cells_series_per_pack",
+    "cells_p_per_pack": "battery_cells_parallel_per_pack",
+    "pack_cap": "battery_pack_capacity", "pack_wt": "battery_pack_weight_g",
+    "energy_density": "battery_energy_density", "a_cont": "battery_a_cont",
+    "a_max": "battery_a_max", "charge_a": "battery_charge_current",
+    "c_cont": "battery_c_cont", "c_max": "battery_c_max",
+    "batt_max_time": "battery_max_time", "batt_temp_limit": "battery_temp_limit",
+    "soc_model": "battery_soc_model", "soc_curve": "soc_curve",
+    "soc_bp": "battery_soc_bp", "ocv_cell_bp": "battery_ocv_cell_bp",
+    "r_scale_bp": "battery_r_scale_bp",
+    # ESC
+    "esc_eff_tab": "esc_efficiency", "esc_r": "esc_resistance",
+    "esc_cont": "esc_cont_current", "esc_imax": "esc_max_current",
+    "esc_idle": "esc_idle_current", "esc_wt": "esc_weight_g",
+    "esc_max_time": "esc_max_time", "esc_temp_limit": "esc_temp_limit",
+    "esc_v_unit": "esc_v_unit", "esc_s_min": "esc_rating_min",
+    "esc_s_max": "esc_rating_max",
+    # avionics and wiring
+    "avionics_flat": "avionics_power", "periph_current": "peripheral_current",
+    "avionics_rails": "avionics_rails",
+    "wire_len": "wire_length", "wire_awg": "wire_awg", "wire_ohm_m": "wire_ohm_per_m",
+    "conn_batt_cont": "connector_batt_cont", "conn_batt_max": "connector_batt_max",
+    "conn_esc_cont": "connector_esc_cont", "conn_esc_max": "connector_esc_max",
+    "conn_motor_cont": "connector_motor_cont", "conn_motor_max": "connector_motor_max",
+    # mission and environment
+    "cruise_v": "cruise_speed", "alt": "altitude", "cruise_altitude": "cruise_altitude",
+    "temp": "temperature", "pressure": "pressure", "mission": "mission",
+    "wind": "wind", "wind_dir": "wind_direction", "course_deg": "course_deg",
+    "bank_deg": "bank_deg", "climb_rate": "climb_rate_mps",
+    "descent_rate": "descent_rate_mps", "reserve_percent": "reserve_percent",
+    "accel": "max_accel", "decel": "max_decel", "regen": "regen_eff",
+    "transient_dt": "transient_dt_s", "min_climb": "min_climb_mps",
+    "field_takeoff": "field_takeoff_m", "field_landing": "field_landing_m",
+    "max_tilt": "max_tilt_deg", "max_pitch": "max_pitch_deg", "max_roll": "max_roll_deg",
+    # GUI-only: which connector preset was picked, and the plot range
+    "conn_batt": None, "conn_esc": None, "conn_motor": None, "plot_vmax": None,
+}
+
+# Fields older saved configs carry under a name that has since moved. Read
+# them when the new key is absent, so a config saved before the move still
+# loads to the same aircraft.
+LEGACY_FIELD_ALIASES = {"avionics": "avionics_flat", "esc_eff": "esc_eff_tab"}
+
+
+def migrate_legacy_fields(values: dict) -> dict:
+    """Copy each legacy key onto its new name when the new one is blank."""
+    out = dict(values)
+    for old, new in LEGACY_FIELD_ALIASES.items():
+        if str(out.get(old, "")).strip() and not str(out.get(new, "")).strip():
+            out[new] = out[old]
+    return out
+
+
+def parse_rails(spec) -> dict:
+    """
+    "5:2:0.9, 12:1.5:0.87" into {volts: (amps, efficiency)}.
+
+    Stored as one string so the rails save and load with every other field
+    rather than needing their own serialisation path.
+    """
+    if isinstance(spec, dict):
+        return dict(spec)
+    rails = {}
+    for part in str(spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bits = part.split(":")
+        if len(bits) != 3:
+            continue
+        try:
+            volts, amps, eff = (float(b) for b in bits)
+        except ValueError:
+            continue
+        if volts > 0 and amps >= 0 and 0 < eff <= 1:
+            rails[volts] = (amps, eff)
+    return rails
+
+
+def config_from_fields(values: dict, config_type: str = "lift+cruise") -> VTOLConfig:
+    """
+    Build the aircraft from input values keyed by GUI field name.
+
+    Values may be strings (the GUI, a saved config) or numbers (the CLI).
+    Blank means "not given": optional inputs stay None, and the rest take
+    the defaults below — the same defaults the GUI fields start with.
+    """
+    values = migrate_legacy_fields(values or {})
+
+    def raw(key):
+        x = values.get(key)
+        return "" if x is None else str(x).strip()
+
+    def num(key, default=0.0):
+        s = raw(key)
+        if s == "":
+            return default
+        try:
+            return float(s)
+        except ValueError:
+            raise ValueError(f"'{s}' is not a number (field: {key})")
+
+    def opt(key):
+        s = raw(key)
+        return None if s == "" else num(key)
+
+    def text(key, default=""):
+        return raw(key) or default
+
+    def flag(key, default=False):
+        s = raw(key).lower()
+        if s == "":
+            return default
+        return s in ("1", "true", "yes", "on")
+
+    series, parallel = int(num("series", 6)), int(num("parallel", 2))
+    battery = VTOLBattery(
+        chemistry=text("chem", "LiPo"),
+        cell_capacity_mAh=num("cell_cap", 5000),
+        series_cells=series, parallel_cells=parallel,
+        cell_weight_g=num("cell_wt", 120),
+        voltage_min=num("vmin", 3.3), voltage_nominal=num("vnom", 3.7),
+        voltage_max=num("vmax", 4.2),
+        resistance_cell_mOhm=num("rcell", 4.0),
+        usable_percent=num("usable", 80),
+        discharge_c_cont=opt("c_cont"), discharge_c_max=opt("c_max"),
+        soc_curve_csv=(raw("soc_curve") or None),
+        soc_model=text("soc_model", "auto"),
+        unit_mode=text("unit_mode", "cell"),
+        cells_series_per_unit=int(opt("cells_s_per_pack") or 1),
+        cells_parallel_per_unit=int(opt("cells_p_per_pack") or 1),
+        pack_capacity_mAh=opt("pack_cap"), pack_weight_g=opt("pack_wt"),
+        energy_density_Wh_per_kg=opt("energy_density"),
+        discharge_cont_A=opt("a_cont"), discharge_max_A=opt("a_max"),
+        charge_current_max_A=opt("charge_a"),
+        soc_bp=_parse_float_list(raw("soc_bp")),
+        ocv_cell_bp=_parse_float_list(raw("ocv_cell_bp")),
+        r_scale_bp=_parse_float_list(raw("r_scale_bp")),
+        max_time_s=opt("batt_max_time"),
+        temp_limit_C=num("batt_temp_limit", 55.0),
+    )
+
+    n_lift = int(num("n_lift", 4))
+    n_cruise = int(num("n_cruise", 1))
+    # "enter structure" runs the weight the other way: the frame is known and
+    # the airframe weight is that plus the itemised parts.
+    weight = num("weight", 6000)
+    if text("mass_mode", "derive structure") == "enter structure":
+        vectored = str(config_type).strip().lower() in ("tiltrotor", "tiltwing", "tailsitter")
+        n_esc = n_lift + (0 if vectored else n_cruise)
+        weight = ((opt("structure_mass") or 0.0)
+                  + battery.weight_g
+                  + ((opt("lift_wt") or 0.0) + (opt("lift_prop_wt") or 0.0)) * n_lift
+                  + (0.0 if vectored else
+                     ((opt("cruise_wt") or 0.0) + (opt("cruise_prop_wt") or 0.0)) * n_cruise)
+                  + (opt("esc_wt") or 0.0) * n_esc
+                  + (opt("avionics_mass") or 0.0))
+
+    temp = opt("temp")
+    connectors = {}
+    for name, prefix in (("Battery", "conn_batt"), ("ESC", "conn_esc"),
+                         ("Motor", "conn_motor")):
+        cont, mx = opt(f"{prefix}_cont") or 0.0, opt(f"{prefix}_max") or 0.0
+        if cont > 0 or mx > 0:
+            connectors[name] = (cont, mx)
+    awg = opt("wire_awg")
+
+    cfg = VTOLConfig(
+        config_type=config_type,
+        aircraft_weight_g=weight, payload_mass_g=num("payload", 0),
+        wing_span_m=num("span", 2.4), wing_area_m2=num("area", 0.6),
+        CD0=num("cd0", 0.035), oswald=num("oswald", 0.8),
+        CL_max=num("clmax", 1.2), CL_cruise_max=num("clcruise", 0.9),
+        num_lift_rotors=n_lift,
+        lift_prop_diameter_in=num("lift_d", 18), lift_prop_pitch_in=num("lift_p", 6),
+        lift_motor_kv=num("lift_kv", 300), lift_motor_resistance=num("lift_rm", 0.08),
+        lift_motor_weight_g=num("lift_wt", 200),
+        lift_figure_of_merit=num("fom", 0.65),
+        num_cruise_motors=n_cruise,
+        cruise_prop_diameter_in=num("cruise_d", 14),
+        cruise_prop_pitch_in=num("cruise_p", 8),
+        cruise_motor_kv=num("cruise_kv", 500),
+        cruise_motor_resistance=num("cruise_rm", 0.06),
+        cruise_motor_weight_g=num("cruise_wt", 180),
+        cruise_prop_efficiency=num("cruise_eff", 0.75),
+        stopped_rotor_drag_area_m2=opt("stopped_area"),
+        battery=battery,
+        avionics_power_W=num("avionics_flat", 15),
+        avionics_rails=parse_rails(values.get("avionics_rails")),
+        periph_current_A=opt("periph_current") or 0.0,
+        esc_resistance_ohm=opt("esc_r") or 0.0,
+        esc_max_current_A=opt("esc_imax"),
+        esc_efficiency=num("esc_eff_tab", 0.96),
+        esc_weight_g=opt("esc_wt") or 0.0,
+        # Pressure overrides the altitude-derived value, which is what a field
+        # barometer reading is for: the standard atmosphere is an average.
+        air_density=core.air_density(num("alt", 0), temp, opt("pressure")),
+        cruise_speed_mps=num("cruise_v", 22),
+        reference_altitude_m=num("alt", 0),
+        wire_resistance_ohm=core.wire_resistance_ohm(
+            opt("wire_len") or 0.0, awg=int(awg) if awg else None,
+            ohm_per_m=opt("wire_ohm_m")),
+        connectors=connectors,
+        hover_download_fraction=opt("download"),
+        lift_motor_max_power_W=opt("lift_pmax"),
+        lift_motor_max_current_A=opt("lift_imax"),
+        lift_prop_max_thrust_g=opt("lift_max_thrust") or 0.0,
+        cruise_motor_max_current_A=opt("cruise_imax"),
+        cruise_motor_max_power_W=opt("cruise_pmax"),
+        lift_prop_weight_g=opt("lift_prop_wt") or 0.0,
+        cruise_prop_weight_g=opt("cruise_prop_wt") or 0.0,
+        avionics_mass_g=opt("avionics_mass") or 0.0,
+        lift_prop_table_csv=(raw("lift_table") or None),
+        cruise_prop_table_csv=(raw("cruise_table") or None),
+        lift_motor_i0_A=num("lift_i0", 0.5), lift_motor_v0_V=opt("lift_v0"),
+        cruise_motor_i0_A=num("cruise_i0", 0.5), cruise_motor_v0_V=opt("cruise_v0"),
+        lift_motor_max_time_s=opt("lift_max_time"),
+        cruise_motor_max_time_s=opt("cruise_max_time"),
+        lift_motor_temp_limit_C=num("lift_temp_limit", 100.0),
+        cruise_motor_temp_limit_C=num("cruise_temp_limit", 100.0),
+        lift_motor_v_unit=text("lift_v_unit", "S"),
+        lift_motor_rating_min=opt("lift_s_min"), lift_motor_rating_max=opt("lift_s_max"),
+        cruise_motor_v_unit=text("cruise_v_unit", "S"),
+        cruise_motor_rating_min=opt("cruise_s_min"),
+        cruise_motor_rating_max=opt("cruise_s_max"),
+        lift_motor_pole_count=int(num("lift_poles", 14)),
+        cruise_motor_pole_count=int(num("cruise_poles", 14)),
+        lift_motor_size=text("lift_size"), cruise_motor_size=text("cruise_size"),
+        lift_prop_blades=int(num("lift_blades", 2)),
+        cruise_prop_blades=int(num("cruise_blades", 2)),
+        lift_prop_max_rpm=opt("lift_max_rpm"), cruise_prop_max_rpm=opt("cruise_max_rpm"),
+        lift_prop_tconst=opt("lift_tconst"), lift_prop_pconst=opt("lift_pconst"),
+        cruise_prop_tconst=opt("cruise_tconst"), cruise_prop_pconst=opt("cruise_pconst"),
+        cruise_prop_max_thrust_g=opt("cruise_max_thrust") or 0.0,
+        cruise_prop_eff_model=text("cruise_eff_model", "constant"),
+        esc_cont_current_A=opt("esc_cont"),
+        esc_idle_current_A=opt("esc_idle") or 0.0,
+        esc_max_time_s=opt("esc_max_time"),
+        esc_temp_limit_C=num("esc_temp_limit", 90.0),
+        esc_v_unit=text("esc_v_unit", "S"),
+        esc_rating_min=opt("esc_s_min"), esc_rating_max=opt("esc_s_max"),
+        lift_rotor_layout=text("lift_layout", "flat"),
+        coaxial_spacing_m=opt("coax_spacing"),
+        inflow_map_enabled=flag("inflow_map_enabled", False),
+        inflow_mu_bp=_parse_float_list(raw("inflow_mu_bp")),
+        inflow_eff_bp=_parse_float_list(raw("inflow_eff_bp")),
+        drag_model_mode=text("drag_model_mode", "auto"),
+        parasite_drag_cd=opt("parasite_drag"), parasite_area_m2=opt("parasite_area"),
+        profile_drag_cd=opt("profile_drag"), profile_area_m2=opt("profile_area"),
+        body_length_m=opt("body_length_m"), body_width_m=opt("body_width_m"),
+        body_height_m=opt("body_height_m"), arm_length_m=opt("arm_length_m"),
+        arm_width_m=opt("arm_width_m"),
+        drag_cg_offset_m=opt("drag_cg_offset_m") or 0.0,
+        max_tilt_deg=num("max_tilt", 25.0),
+        max_pitch_deg=opt("max_pitch"), max_roll_deg=opt("max_roll"),
+        mu_roll=num("mu_roll", 0.04), mu_brake=num("mu_brake", 0.30),
+        CL_takeoff=num("cl_takeoff", 0.80),
+        cruise_altitude_m=opt("cruise_altitude"),
+        # Run settings the single-point figures and Status read.
+        bank_deg=num("bank_deg", 0.0),
+        climb_rate_mps=num("climb_rate", 0.0),
+        descent_rate_mps=num("descent_rate", 0.0),
+        reserve_percent=opt("reserve_percent"),
+        transient_dt_s=opt("transient_dt"),
+        min_climb_mps=opt("min_climb"),
+        field_takeoff_m=opt("field_takeoff"),
+        field_landing_m=opt("field_landing"),
+        ambient_temp_C=temp,
+        pressure_Pa=opt("pressure"),
+    )
+    return cfg
+
+
+def fields_from_args(args) -> dict:
+    """The CLI's flags as GUI-keyed values, for config_from_fields."""
+    values = {}
+    for key, dest in FIELD_TO_CLI.items():
+        if dest and hasattr(args, dest):
+            value = getattr(args, dest)
+            if value is not None:
+                values[key] = value
+    return values
+
+
+def load_fields_file(path: str) -> Tuple[dict, str]:
+    """
+    Read a GUI-saved configuration: (values keyed by field, config type).
+
+    The rails are stored in their own field as a string, so everything the
+    builder needs is in `vars`.
+    """
+    with open(path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if payload.get("schema") not in (None, "vtol_power_sim_v1"):
+        raise ValueError(
+            f"{os.path.basename(path)} is a '{payload.get('schema')}' file, not "
+            "a VTOL configuration.")
+    return (migrate_legacy_fields(dict(payload.get("vars") or {})),
+            str(payload.get("config_type") or "lift+cruise"))
+
+
+# ============================================================
 # CLI
 # ============================================================
 
 def build_arg_parser() -> argparse.ArgumentParser:
+    """
+    Every aircraft flag defaults to None: blank means "not given", and the
+    default is applied once, in config_from_fields, exactly as for a blank
+    GUI field. That is also what lets --config load a saved GUI file and the
+    flags given alongside it override only what they name.
+    """
     p = argparse.ArgumentParser(
-        description="VTOL UAV power and endurance simulator (lift+cruise).")
+        description="VTOL UAV power and endurance simulator.")
     p.add_argument("--gui", action="store_true", help="Open the graphical interface.")
-    p.add_argument("--config_type", type=str, default="lift+cruise",
-                   choices=CONFIG_TYPES,
-                   help="Airframe configuration. Only lift+cruise is implemented.")
+    p.add_argument("--config", type=str, default=None,
+                   help="A configuration saved by the GUI. Flags given as well "
+                        "override the values in it.")
+    p.add_argument("--config_type", type=str, default=None, choices=CONFIG_TYPES,
+                   help="Airframe configuration (default lift+cruise).")
 
-    p.add_argument("--weight", type=float, default=6000.0, help="Airframe weight (g).")
-    p.add_argument("--payload_mass_g", type=float, default=0.0)
+    def add(name, kind=float, help_text=None, **kw):
+        p.add_argument(f"--{name}", type=kind, default=None, help=help_text, **kw)
 
-    p.add_argument("--wing_span", type=float, default=2.4)
-    p.add_argument("--wing_area", type=float, default=0.60)
-    p.add_argument("--CD0", type=float, default=0.035)
-    p.add_argument("--oswald", type=float, default=0.80)
-    p.add_argument("--CL_max", type=float, default=1.20)
-    p.add_argument("--CL_cruise_max", type=float, default=0.90,
-                   help="CL cap used during transition; below CL_max for margin.")
+    # ---- airframe, mass and drag -------------------------------------
+    add("weight", help_text="Airframe weight (g), everything but the payload.")
+    add("payload_mass_g")
+    add("mass_mode", str, "derive structure | enter structure",
+        choices=["derive structure", "enter structure"])
+    add("structure_mass", help_text="Bare structure (g); 'enter structure' mode only.")
+    add("avionics_mass", help_text="Avionics mass (g), for the weight budget.")
+    add("wing_span"); add("wing_area"); add("CD0"); add("oswald"); add("CL_max")
+    add("CL_cruise_max", help_text="CL cap used during transition; below CL_max for margin.")
+    add("mu_roll", help_text="Rolling friction, for a conventional take-off roll.")
+    add("mu_brake", help_text="Braking friction, for a conventional landing roll.")
+    add("CL_takeoff", help_text="CL at rotation, for a conventional take-off roll.")
+    add("drag_model_mode", str, "Extra airframe drag beyond CD0: auto | manual | geometry",
+        choices=["auto", "manual", "geometry"])
+    add("parasite_drag", help_text="Frontal Cd of fuselage and booms beyond CD0.")
+    add("parasite_area", help_text="Frontal area (m^2) that Cd applies to.")
+    add("profile_drag", help_text="Side Cd, met hovering level in a wind.")
+    add("profile_area", help_text="Side area (m^2) that Cd applies to.")
+    for dim in ("body_length_m", "body_width_m", "body_height_m",
+                "arm_length_m", "arm_width_m"):
+        add(dim, help_text="Geometry for the derived extra drag (m).")
+    add("drag_cg_offset_m", help_text="Height of the drag centre above the CG (m).")
 
-    p.add_argument("--num_lift_rotors", type=int, default=4)
-    p.add_argument("--lift_prop_diameter", type=float, default=18.0)
-    p.add_argument("--lift_prop_pitch", type=float, default=6.0)
-    p.add_argument("--lift_motor_kv", type=float, default=300.0)
-    p.add_argument("--lift_motor_resistance", type=float, default=0.08)
-    p.add_argument("--lift_motor_weight", type=float, default=200.0)
-    p.add_argument("--lift_figure_of_merit", type=float, default=0.65)
+    # ---- lift rotors ----------------------------------------------------
+    add("num_lift_rotors", int)
+    add("lift_rotor_layout", str, "flat | coaxial", choices=["flat", "coaxial"])
+    add("coaxial_spacing_m", help_text="Vertical spacing of a coaxial pair (m).")
+    add("lift_prop_diameter"); add("lift_prop_pitch"); add("lift_prop_blades", int)
+    add("lift_motor_kv", help_text="0 turns the motor electrical model off.")
+    add("lift_motor_resistance"); add("lift_motor_i0", help_text="No-load current (A).")
+    add("lift_motor_v0", help_text="Voltage the no-load current was measured at (V).")
+    add("lift_motor_weight")
+    add("lift_motor_max_current", help_text="Rated current per lift motor (A).")
+    add("lift_motor_max_power", help_text="Rated power per lift motor (W).")
+    add("lift_motor_max_time", help_text="Seconds the lift motor may run above rating.")
+    add("lift_motor_temp_limit", help_text="Lift motor temperature limit (C).")
+    add("lift_motor_v_unit", str, "S (cells) or V (volts)", choices=["S", "V"])
+    add("lift_motor_rating_min"); add("lift_motor_rating_max")
+    add("lift_motor_pole_count", int); add("lift_motor_size", str)
+    add("lift_figure_of_merit")
+    add("stopped_rotor_drag_area")
+    add("hover_download", help_text="Hover download as a fraction of weight.")
+    add("lift_prop_weight", help_text="Mass of one lift propeller (g).")
+    add("lift_prop_max_thrust", help_text="Rated static thrust of one lift propeller (g).")
+    add("lift_prop_max_rpm"); add("lift_prop_tconst"); add("lift_prop_pconst")
+    add("lift_prop_table", str, "Measured lift-rotor thrust/power CSV.")
+    add("inflow_map_enabled", str, "1 to apply the rotor inflow map, 0 to leave it off.")
+    add("inflow_mu_bp", str, "Advance-ratio breakpoints, comma separated.")
+    add("inflow_eff_bp", str, "Inflow efficiency at each breakpoint.")
 
-    p.add_argument("--num_cruise_motors", type=int, default=1)
-    p.add_argument("--cruise_prop_diameter", type=float, default=14.0)
-    p.add_argument("--cruise_prop_pitch", type=float, default=8.0)
-    p.add_argument("--cruise_motor_kv", type=float, default=500.0)
-    p.add_argument("--cruise_motor_resistance", type=float, default=0.06)
-    p.add_argument("--cruise_motor_weight", type=float, default=180.0)
-    p.add_argument("--cruise_prop_efficiency", type=float, default=0.75)
-    p.add_argument("--stopped_rotor_drag_area", type=float, default=None)
+    # ---- cruise propulsion ---------------------------------------------
+    add("num_cruise_motors", int)
+    add("cruise_prop_diameter"); add("cruise_prop_pitch"); add("cruise_prop_blades", int)
+    add("cruise_motor_kv", help_text="0 turns the motor electrical model off.")
+    add("cruise_motor_resistance"); add("cruise_motor_i0"); add("cruise_motor_v0")
+    add("cruise_motor_weight")
+    add("cruise_motor_max_current", help_text="Rated current per cruise motor (A).")
+    add("cruise_motor_max_power", help_text="Rated power per cruise motor (W).")
+    add("cruise_motor_max_time"); add("cruise_motor_temp_limit")
+    add("cruise_motor_v_unit", str, "S (cells) or V (volts)", choices=["S", "V"])
+    add("cruise_motor_rating_min"); add("cruise_motor_rating_max")
+    add("cruise_motor_pole_count", int); add("cruise_motor_size", str)
+    add("cruise_prop_efficiency", help_text="Propeller efficiency alone; the motor "
+                                            "is modelled separately.")
+    add("cruise_prop_eff_model", str, "constant | curve", choices=["constant", "curve"])
+    add("cruise_prop_weight"); add("cruise_prop_max_thrust"); add("cruise_prop_max_rpm")
+    add("cruise_prop_tconst"); add("cruise_prop_pconst")
+    add("cruise_prop_table", str, "Measured cruise-prop thrust/power CSV.")
 
-    p.add_argument("--battery_chemistry", type=str, default="LiPo")
-    p.add_argument("--battery_cell_capacity", type=float, default=5000.0)
-    p.add_argument("--battery_series_cells", type=int, default=6)
-    p.add_argument("--battery_parallel_cells", type=int, default=2)
-    p.add_argument("--battery_cell_weight_g", type=float, default=120.0)
-    p.add_argument("--battery_voltage_min", type=float, default=3.3)
-    p.add_argument("--battery_voltage_nominal", type=float, default=3.7)
-    p.add_argument("--battery_voltage_max", type=float, default=4.2)
-    p.add_argument("--battery_resistance_cell", type=float, default=4.0)
-    p.add_argument("--battery_usable_percent", type=float, default=80.0)
-    p.add_argument("--battery_soc_model", type=str, default="auto",
-                   help="auto | linear | a chemistry name. 'linear' turns the "
-                        "discharge curve off: voltage is held at full charge "
-                        "all flight, which is optimistic near the end of the "
-                        "pack.")
-    p.add_argument("--battery_unit_mode", type=str, default="cell",
-                   choices=["cell", "pack"],
-                   help="cell: series/parallel count CELLS. pack: they count "
-                        "finished PACKS, each of --battery_cells_series_per_pack "
-                        "cells in series.")
-    p.add_argument("--battery_cells_series_per_pack", type=int, default=1)
-    p.add_argument("--battery_cells_parallel_per_pack", type=int, default=1)
-    p.add_argument("--battery_pack_capacity", type=float, default=None,
-                   help="Capacity of ONE pack (mAh). Pack mode only.")
-    p.add_argument("--battery_pack_weight_g", type=float, default=None,
-                   help="Weight of ONE pack (g). Pack mode only.")
-    p.add_argument("--battery_energy_density", type=float, default=None,
-                   help="Wh/kg. Reported only; blank derives it from the "
-                        "entered weight and capacity.")
-    p.add_argument("--battery_a_cont", type=float, default=None,
-                   help="Continuous discharge limit in amps. Outranks the "
-                        "C-rating when both are given.")
-    p.add_argument("--battery_a_max", type=float, default=None,
-                   help="Burst discharge limit in amps.")
-    p.add_argument("--battery_charge_current", type=float, default=None,
-                   help="Maximum charge current (A), for the charge-time "
-                        "estimate. Not a flight limit.")
-    p.add_argument("--battery_soc_bp", type=str, default=None,
-                   help="State-of-charge breakpoints, 0..1, comma separated. "
-                        "With the two arrays below this defines a discharge "
-                        "curve by hand and outranks a CSV or a preset.")
-    p.add_argument("--battery_ocv_cell_bp", type=str, default=None,
-                   help="Open-circuit volts PER CELL at each breakpoint.")
-    p.add_argument("--battery_r_scale_bp", type=str, default=None,
-                   help="Resistance multiplier at each breakpoint (1.0 = the "
-                        "entered cell resistance).")
+    # ---- battery --------------------------------------------------------
+    add("battery_chemistry", str)
+    add("battery_cell_capacity"); add("battery_series_cells", int)
+    add("battery_parallel_cells", int); add("battery_cell_weight_g")
+    add("battery_voltage_min"); add("battery_voltage_nominal"); add("battery_voltage_max")
+    add("battery_resistance_cell"); add("battery_usable_percent")
+    add("battery_soc_model", str,
+        "auto | linear | a chemistry name. 'linear' turns the discharge curve off: "
+        "voltage is held at full charge all flight, which is optimistic near the "
+        "end of the pack.")
+    add("battery_unit_mode", str,
+        "cell: series/parallel count CELLS. pack: they count finished PACKS, each "
+        "of --battery_cells_series_per_pack cells in series.", choices=["cell", "pack"])
+    add("battery_cells_series_per_pack", int); add("battery_cells_parallel_per_pack", int)
+    add("battery_pack_capacity", help_text="Capacity of ONE pack (mAh). Pack mode only.")
+    add("battery_pack_weight_g", help_text="Weight of ONE pack (g). Pack mode only.")
+    add("battery_energy_density", help_text="Wh/kg. Reported only.")
+    add("battery_a_cont", help_text="Continuous discharge limit (A).")
+    add("battery_a_max", help_text="Burst discharge limit (A).")
+    add("battery_charge_current", help_text="Maximum charge current (A).")
+    add("battery_c_cont"); add("battery_c_max")
+    add("battery_max_time", help_text="Seconds the pack may be held at its max rating.")
+    add("battery_temp_limit", help_text="Cell temperature limit (C).")
+    add("battery_soc_bp", str, "SoC breakpoints, 0..1, comma separated.")
+    add("battery_ocv_cell_bp", str, "Open-circuit volts per cell at each breakpoint.")
+    add("battery_r_scale_bp", str, "Resistance multiplier at each breakpoint.")
+    add("soc_curve", str, "Measured pack discharge curve CSV.")
 
-    p.add_argument("--avionics_power", type=float, default=15.0)
-    p.add_argument("--peripheral_current", type=float, default=0.0,
-                   help="Current drawn straight from the pack by loads that "
-                        "do not sit behind a regulated rail (A). Adds to the "
-                        "avionics figure rather than replacing it.")
-    p.add_argument("--esc_efficiency", type=float, default=0.96)
-    p.add_argument("--esc_weight_g", type=float, default=0.0,
-                   help="Mass of ONE ESC (g), for the weight budget. One is "
-                        "counted per driven rotor.")
-
-    p.add_argument("--cruise_speed", type=float, default=22.0)
-    p.add_argument("--altitude", type=float, default=0.0)
-    p.add_argument("--temperature", type=float, default=None)
-    p.add_argument("--pressure", type=float, default=None,
-                   help="Static pressure (Pa). Overrides the value the "
-                        "standard atmosphere derives from altitude.")
-    p.add_argument("--mission", type=str, default=None)
-    p.add_argument("--wind", type=float, default=0.0,
-                   help="Steady wind speed (m/s).")
-    p.add_argument("--wind_direction", type=float, default=0.0,
-                   help="Direction the wind comes FROM, compass degrees.")
-    p.add_argument("--course_deg", type=float, default=0.0,
-                   help="Heading the fixed-speed run flies, compass degrees. "
-                        "With --wind and --wind_direction this sets the head "
-                        "and cross components, and so the groundspeed and "
-                        "range. Missions ignore it: each leg carries its own "
-                        "course.")
-    p.add_argument("--lift_prop_table", type=str, default=None,
-                   help="Measured lift-rotor thrust/power CSV.")
-    p.add_argument("--cruise_prop_table", type=str, default=None,
-                   help="Measured cruise-prop thrust/power CSV.")
-    # Wiring, connectors and component ratings — the optional detail that was
-    # GUI-only until now. A config saved from the GUI carries these, so the
-    # CLI has to be able to express them too or the two disagree.
-    p.add_argument("--wire_length", type=float, default=0.0,
-                   help="One-way battery lead length (m); both conductors counted.")
-    p.add_argument("--wire_awg", type=int, default=None,
-                   help="Wire gauge (AWG). Higher is thinner.")
-    p.add_argument("--wire_ohm_per_m", type=float, default=None,
-                   help="Measured wire resistance (ohm/m); overrides the gauge.")
-    p.add_argument("--battery_c_cont", type=float, default=None,
-                   help="Pack continuous discharge C-rating.")
-    p.add_argument("--battery_c_max", type=float, default=None,
-                   help="Pack burst discharge C-rating.")
-    p.add_argument("--soc_curve", type=str, default=None,
-                   help="Measured pack discharge curve CSV (SoC, OCV per cell).")
-    p.add_argument("--max_accel", type=float, default=0.0,
-                   help="Acceleration limit (m/s^2). 0 ignores transients.")
-    p.add_argument("--max_decel", type=float, default=0.0,
-                   help="Deceleration limit (m/s^2). Defaults to --max_accel.")
-    p.add_argument("--regen_eff", type=float, default=0.0,
-                   help="Fraction of braking energy recovered (0-1).")
-    p.add_argument("--lift_motor_max_power", type=float, default=None,
-                   help="Rated power per lift motor (W).")
-    p.add_argument("--cruise_motor_max_power", type=float, default=None,
-                   help="Rated power per cruise motor (W).")
-    p.add_argument("--hover_download", type=float, default=None,
-                   help="Hover download as a fraction of weight; overrides the "
-                        "per-configuration default. Applies to tiltrotor, "
-                        "tiltwing and tailsitter only.")
-    p.add_argument("--lift_prop_weight", type=float, default=0.0,
-                   help="Mass of one lift propeller (g), for the weight budget.")
-    p.add_argument("--cruise_prop_weight", type=float, default=0.0,
-                   help="Mass of one cruise propeller (g).")
-    p.add_argument("--avionics_mass", type=float, default=0.0,
-                   help="Avionics mass (g), for the weight budget.")
+    # ---- ESC, avionics, wiring -----------------------------------------
+    add("esc_efficiency", help_text="ESC efficiency under load.")
+    add("esc_resistance", help_text="Splits the ESC loss into conduction and switching.")
+    add("esc_cont_current", help_text="Continuous rating of one ESC (A).")
+    add("esc_max_current", help_text="Burst rating of one ESC (A).")
+    add("esc_idle_current", help_text="Standby draw of one ESC (A).")
+    add("esc_weight_g", help_text="Mass of ONE ESC (g).")
+    add("esc_max_time"); add("esc_temp_limit")
+    add("esc_v_unit", str, "S (cells) or V (volts)", choices=["S", "V"])
+    add("esc_rating_min"); add("esc_rating_max")
+    add("avionics_power", help_text="Flat avionics draw (W), used when no rails are given.")
+    add("avionics_rails", str, "Regulated rails as 'V:A:eff, V:A:eff'. Replace the flat figure.")
+    add("peripheral_current", help_text="Current drawn straight from the pack (A).")
+    add("wire_length", help_text="One-way battery lead length (m).")
+    add("wire_awg", int, "Wire gauge (AWG).")
+    add("wire_ohm_per_m", help_text="Measured wire resistance (ohm/m).")
     for _name in ("batt", "esc", "motor"):
-        p.add_argument(f"--connector_{_name}_cont", type=float, default=None,
-                       help=f"{_name} connector continuous rating (A).")
-        p.add_argument(f"--connector_{_name}_max", type=float, default=None,
-                       help=f"{_name} connector burst rating (A).")
+        add(f"connector_{_name}_cont", help_text=f"{_name} connector continuous rating (A).")
+        add(f"connector_{_name}_max", help_text=f"{_name} connector burst rating (A).")
+
+    # ---- flight and environment ----------------------------------------
+    add("cruise_speed"); add("altitude")
+    add("cruise_altitude", help_text="Height flown (m ASL), for glide distance and ceiling.")
+    add("temperature"); add("pressure", help_text="Static pressure (Pa).")
+    add("mission", str)
+    add("wind", help_text="Steady wind speed (m/s).")
+    add("wind_direction", help_text="Direction the wind comes FROM, compass degrees.")
+    add("course_deg", help_text="Heading the fixed-speed run flies, compass degrees.")
+    add("bank_deg", help_text="Bank angle for the turning-flight figures (deg).")
+    add("climb_rate_mps", help_text="Commanded climb at the cruise point (m/s).")
+    add("descent_rate_mps", help_text="Commanded descent at the cruise point (m/s).")
+    add("reserve_percent", help_text="Energy reserve (%). Overrides the mission file's.")
+    add("max_accel", help_text="Acceleration limit (m/s^2). 0 ignores transients.")
+    add("max_decel", help_text="Deceleration limit (m/s^2). Defaults to --max_accel.")
+    add("regen_eff", help_text="Fraction of braking energy recovered (0-1).")
+    add("transient_dt_s", help_text="Mission time step (s).")
+    add("min_climb_mps", help_text="Required climb rate, checked on Status (m/s).")
+    add("field_takeoff_m", help_text="Runway available for a conventional take-off (m).")
+    add("field_landing_m", help_text="Runway available for a conventional landing (m).")
+    add("max_tilt_deg", help_text="Largest hover tilt the controller allows (deg).")
+    add("max_pitch_deg"); add("max_roll_deg")
     return p
 
 
@@ -1905,6 +3792,8 @@ def _parse_float_list(text) -> Optional[List[float]]:
     """
     if text in (None, ""):
         return None
+    if isinstance(text, (list, tuple)):
+        return [float(x) for x in text] or None
     out = []
     for part in str(text).replace(";", ",").split(","):
         part = part.strip()
@@ -1917,83 +3806,32 @@ def _parse_float_list(text) -> Optional[List[float]]:
     return out or None
 
 
+def values_from_args(args) -> Tuple[dict, str]:
+    """
+    Everything the CLI was told, keyed by GUI field: a --config file first,
+    then any flags given on top of it.
+    """
+    values, config_type = {}, "lift+cruise"
+    if getattr(args, "config", None):
+        values, config_type = load_fields_file(args.config)
+    values.update(fields_from_args(args))
+    return values, (getattr(args, "config_type", None) or config_type)
+
+
 def config_from_args(args) -> VTOLConfig:
-    battery = VTOLBattery(
-        chemistry=args.battery_chemistry,
-        cell_capacity_mAh=args.battery_cell_capacity,
-        series_cells=args.battery_series_cells,
-        parallel_cells=args.battery_parallel_cells,
-        cell_weight_g=args.battery_cell_weight_g,
-        voltage_min=args.battery_voltage_min,
-        voltage_nominal=args.battery_voltage_nominal,
-        voltage_max=args.battery_voltage_max,
-        resistance_cell_mOhm=args.battery_resistance_cell,
-        usable_percent=args.battery_usable_percent,
-        discharge_c_cont=args.battery_c_cont,
-        discharge_c_max=args.battery_c_max,
-        soc_curve_csv=args.soc_curve,
-        soc_model=args.battery_soc_model,
-        unit_mode=args.battery_unit_mode,
-        cells_series_per_unit=args.battery_cells_series_per_pack,
-        cells_parallel_per_unit=args.battery_cells_parallel_per_pack,
-        pack_capacity_mAh=args.battery_pack_capacity,
-        pack_weight_g=args.battery_pack_weight_g,
-        energy_density_Wh_per_kg=args.battery_energy_density,
-        discharge_cont_A=args.battery_a_cont,
-        discharge_max_A=args.battery_a_max,
-        charge_current_max_A=args.battery_charge_current,
-        soc_bp=_parse_float_list(args.battery_soc_bp),
-        ocv_cell_bp=_parse_float_list(args.battery_ocv_cell_bp),
-        r_scale_bp=_parse_float_list(args.battery_r_scale_bp),
-    )
-    return VTOLConfig(
-        config_type=args.config_type,
-        aircraft_weight_g=args.weight, payload_mass_g=args.payload_mass_g,
-        wing_span_m=args.wing_span, wing_area_m2=args.wing_area,
-        CD0=args.CD0, oswald=args.oswald, CL_max=args.CL_max,
-        CL_cruise_max=args.CL_cruise_max,
-        num_lift_rotors=args.num_lift_rotors,
-        lift_prop_diameter_in=args.lift_prop_diameter,
-        lift_prop_pitch_in=args.lift_prop_pitch,
-        lift_motor_kv=args.lift_motor_kv,
-        lift_motor_resistance=args.lift_motor_resistance,
-        lift_motor_weight_g=args.lift_motor_weight,
-        lift_figure_of_merit=args.lift_figure_of_merit,
-        num_cruise_motors=args.num_cruise_motors,
-        cruise_prop_diameter_in=args.cruise_prop_diameter,
-        cruise_prop_pitch_in=args.cruise_prop_pitch,
-        cruise_motor_kv=args.cruise_motor_kv,
-        cruise_motor_resistance=args.cruise_motor_resistance,
-        cruise_motor_weight_g=args.cruise_motor_weight,
-        cruise_prop_efficiency=args.cruise_prop_efficiency,
-        stopped_rotor_drag_area_m2=args.stopped_rotor_drag_area,
-        battery=battery,
-        avionics_power_W=args.avionics_power,
-        periph_current_A=args.peripheral_current,
-        esc_efficiency=args.esc_efficiency,
-        esc_weight_g=args.esc_weight_g,
-        air_density=core.air_density(args.altitude, args.temperature,
-                                     args.pressure),
-        cruise_speed_mps=args.cruise_speed,
-        reference_altitude_m=args.altitude,
-        lift_prop_table_csv=args.lift_prop_table,
-        cruise_prop_table_csv=args.cruise_prop_table,
-        wire_resistance_ohm=core.wire_resistance_ohm(
-            args.wire_length, awg=args.wire_awg, ohm_per_m=args.wire_ohm_per_m),
-        connectors={
-            label: (getattr(args, f"connector_{name}_cont") or 0.0,
-                    getattr(args, f"connector_{name}_max") or 0.0)
-            for label, name in (("Battery", "batt"), ("ESC", "esc"), ("Motor", "motor"))
-            if getattr(args, f"connector_{name}_cont")
-            or getattr(args, f"connector_{name}_max")
-        },
-        hover_download_fraction=args.hover_download,
-        lift_motor_max_power_W=args.lift_motor_max_power,
-        cruise_motor_max_power_W=args.cruise_motor_max_power,
-        lift_prop_weight_g=args.lift_prop_weight,
-        cruise_prop_weight_g=args.cruise_prop_weight,
-        avionics_mass_g=args.avionics_mass,
-    )
+    values, config_type = values_from_args(args)
+    return config_from_fields(values, config_type)
+
+
+def run_settings(values: dict) -> dict:
+    """The per-run inputs that are not part of the aircraft."""
+    def num(key, default=0.0):
+        s = "" if values.get(key) is None else str(values.get(key)).strip()
+        return float(s) if s else default
+    return {"wind": num("wind"), "wind_dir": num("wind_dir"),
+            "course": num("course_deg"), "accel": num("accel"),
+            "decel": num("decel"), "regen": num("regen"),
+            "mission": str(values.get("mission") or "").strip()}
 
 
 def _print_single_point(cfg: VTOLConfig, wind_mps: float = 0.0,
@@ -2037,6 +3875,68 @@ def _print_single_point(cfg: VTOLConfig, wind_mps: float = 0.0,
     print(f"  Loaded voltage       : {m['v_load_V']:.2f} V")
     print(f"  Usable energy        : {m['usable_Wh']:.1f} Wh")
     print(f"  SoC model            : {m['soc_model']}")
+    print_performance_summary(m, print)
+
+
+def _fmt(x, fmt="{:.2f}", na="n/a") -> str:
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return na
+    return fmt.format(x) if math.isfinite(x) else na
+
+
+def performance_summary_lines(m: dict) -> List[str]:
+    """
+    The lines the multicopter and fixed-wing print after a fixed-speed run,
+    for the VTOL. Shared by the CLI and the GUI's Output pane so the two say
+    the same thing.
+    """
+    reserve_ok = float(m.get("reserve_margin_Wh", 0.0)) >= 0
+    ceiling = float(m.get("service_ceiling_m", float("inf")))
+    lines = [
+        f"  Best endurance speed : {m['best_endurance_speed_mps']:.1f} m/s -> "
+        f"{m['best_endurance_min']:.1f} min",
+        f"  Best range speed     : {m['best_range_speed_mps']:.1f} m/s -> "
+        f"{m['best_range_km']:.2f} km",
+        # Labels as the multicopter prints them, so the batch driver's
+        # parser reads the VTOL's numbers too.
+        f"  Hover Efficiency     : {m['hover_efficiency_gW']:.2f} g/W",
+        f"  Figure of Merit      : {m['hover_figure_of_merit']:.3f} (achieved)",
+        f"  Lift thrust/weight   : {_fmt(m['lift_twr'])} ({m['lift_thrust_source']})",
+        f"  Lift motor (hover)   : {m['hover_lift_rpm']:.0f} rpm, "
+        f"{m['hover_lift_current_A']:.2f} A, throttle "
+        f"{_fmt(m['hover_lift_throttle'] * 100, '{:.0f}')}%, "
+        f"eff {m['hover_lift_motor_eff'] * 100:.1f}%",
+        f"  Cruise motor         : {m['cruise_motor_rpm']:.0f} rpm, "
+        f"{m['cruise_motor_current_A']:.2f} A, throttle "
+        f"{_fmt(m['cruise_motor_throttle'] * 100, '{:.0f}')}%",
+        f"  Lift tip Mach        : {m['hover_lift_tip_mach']:.3f}"
+        + ("  (significant aeroacoustic noise likely)" if m['hover_lift_tip_mach'] > 0.6 else ""),
+        f"  L/D cruise / max     : {m['ld_cruise']:.2f} / {m['ld_max']:.2f}",
+        f"  Best climb rate      : {m['max_roc_mps']:.2f} m/s at {m['vy_mps']:.1f} m/s",
+        f"  Service ceiling      : "
+        + ("above 8000 m" if not math.isfinite(ceiling) else f"{ceiling:.0f} m"),
+        f"  Motor + ESC losses   : {m['motor_loss_W']:.1f} + {m['esc_loss_W']:.1f} W",
+        f"  Reserve target/margin: {m['reserve_target_Wh']:.1f} / "
+        f"{m['reserve_margin_Wh']:+.1f} Wh ({m['reserve_percent']:.0f}%)",
+        f"  Reserve Status       : {'OK' if reserve_ok else 'VIOLATION'}",
+        f"  Motor Thermal Status : {m['thermal_status']}",
+        f"  Thermal M/ESC/Batt   : {m['motor_temp_est_C']:.1f} / {m['esc_temp_est_C']:.1f} / "
+        f"{m['battery_temp_est_C']:.1f} C [{m['thermal_status']}]",
+        f"  Hover wind limit     : "
+        + _fmt(m['hover_wind_limit_mps'], "{:.1f} m/s",
+               "n/a (set a profile area or body dimensions)"),
+    ]
+    if m.get("hover_lift_saturated") or m.get("cruise_motor_saturated"):
+        lines.append("  WARNING: a motor needs more than 100% throttle — its Kv is "
+                     "too low for this pack and propeller.")
+    return lines
+
+
+def print_performance_summary(m: dict, out=print) -> None:
+    for line in performance_summary_lines(m):
+        out(line)
 
 
 def _print_mission(cfg: VTOLConfig, path: str,
@@ -2070,23 +3970,48 @@ def _print_mission(cfg: VTOLConfig, path: str,
           f"cruise {totals['cruise_Wh']:.1f} Wh")
     print(f"  Remaining    : {totals['remaining_Wh']:.1f} Wh "
           f"(reserve target {totals['reserve_Wh']:.1f} Wh)")
+    for line in mission_summary_lines(totals):
+        print(line)
+
+
+def mission_summary_lines(totals: dict) -> List[str]:
+    """The worst-case lines the other two simulators print after a mission."""
+    w = totals.get("worst") or {}
+    if "min_soc_pct" not in w:
+        return []
+    return [
+        f"  Reserve      : {totals.get('reserve_percent', 20):.0f}% target, lowest "
+        f"margin {w['reserve_margin_Wh']:+.1f} Wh "
+        f"[{'OK' if w['reserve_margin_Wh'] >= 0 else 'VIOLATION'}]",
+        f"  SoC (min)    : {w['min_soc_pct']:.1f}%",
+        f"  Peak current : pack {w['pack_current_A']:.1f} A, lift motor "
+        f"{w['lift_motor_current_A']:.1f} A, cruise motor {w['cruise_motor_current_A']:.1f} A",
+        f"  Thermal peak : motor {w['motor_temp_est_C']:.1f} / ESC {w['esc_temp_est_C']:.1f} / "
+        f"battery {w['battery_temp_est_C']:.1f} C [{w['thermal_status']}]",
+    ]
 
 
 def main() -> None:
+    core.make_console_safe()
     args = build_arg_parser().parse_args()
     if args.gui:
         launch_gui(args)
         return
 
-    cfg = config_from_args(args)
+    values, config_type = values_from_args(args)
     try:
-        if args.mission:
-            _print_mission(cfg, args.mission, args.wind, args.wind_direction,
-                           args.max_accel, args.max_decel, args.regen_eff)
+        cfg = config_from_fields(values, config_type)
+    except (ValueError, FileNotFoundError) as exc:
+        raise SystemExit(str(exc))
+    run = run_settings(values)
+    try:
+        if run["mission"]:
+            _print_mission(cfg, run["mission"], run["wind"], run["wind_dir"],
+                           run["accel"], run["decel"], run["regen"])
         else:
-            _print_single_point(cfg, wind_mps=args.wind,
-                                wind_direction_deg=args.wind_direction,
-                                course_deg=args.course_deg)
+            _print_single_point(cfg, wind_mps=run["wind"],
+                                wind_direction_deg=run["wind_dir"],
+                                course_deg=run["course"])
     except NotImplementedError as exc:
         raise SystemExit(str(exc))
 
@@ -2382,15 +4307,22 @@ def launch_gui(args=None) -> None:
                     "matters for a rotor that also cruises, which is why the vectored "
                     "types care and lift+cruise does not.")
     r = add_section(tab_lift, "Lift Motor",
-                    ("lift_kv", "lift_rm", "lift_wt"), row=r)
+                    ("lift_kv", "lift_rm", "lift_i0", "lift_wt"), row=r)
     r = add_row(tab_lift, r, "Lift motor Kv", "lift_kv", 300,
-                    "RPM per volt, unloaded. Low Kv on a big rotor is the efficient "
-                    "combination; high Kv on a small one buys responsiveness at the "
-                    "cost of endurance.")
+                    "RPM per volt, unloaded. With Rm and the no-load current it "
+                    "drives the motor model: RPM, current, back-EMF, throttle and "
+                    "the motor's own losses.\n\n"
+                    "Low Kv on a big rotor is the efficient combination; high Kv "
+                    "on a small one buys responsiveness at the cost of endurance. "
+                    "0 turns the motor model off.")
     r = add_row(tab_lift, r, "Lift motor Rm (ohm)", "lift_rm", 0.08,
                     "Winding resistance of one lift motor. Drives the copper loss, "
                     "which grows with the SQUARE of current — so it bites hardest in "
                     "hover.")
+    r = add_row(tab_lift, r, "Lift motor no-load current I0 (A)", "lift_i0", 0.5,
+                    "Current the motor draws spinning with no propeller, from its "
+                    "datasheet. Times back-EMF it is the iron and bearing loss, "
+                    "paid however lightly the motor is loaded.")
     r = add_row(tab_lift, r, "Lift motor weight (g)", "lift_wt", 200,
                     "Mass of one lift motor, for the Weight Budget. On a VTOL the "
                     "lift motors are dead weight in cruise, so this is a real cruise "
@@ -2418,18 +4350,27 @@ def launch_gui(args=None) -> None:
                     "spends its life advancing through air, and too little pitch caps "
                     "the speed it can reach.")
     r = add_section(tab_cruise, "Cruise Motor",
-                    ("cruise_kv", "cruise_rm", "cruise_wt"), row=r)
+                    ("cruise_kv", "cruise_rm", "cruise_i0", "cruise_wt"), row=r)
     r = add_row(tab_cruise, r, "Cruise motor Kv", "cruise_kv", 500,
                     "RPM per volt for the cruise motor. Usually higher than the lift "
-                    "motors', because it turns a smaller propeller faster.")
+                    "motors', because it turns a smaller propeller faster. 0 turns "
+                    "the motor model off.")
     r = add_row(tab_cruise, r, "Cruise motor Rm (ohm)", "cruise_rm", 0.06,
                     "Winding resistance of one cruise motor, driving its copper loss.")
+    r = add_row(tab_cruise, r, "Cruise motor no-load current I0 (A)", "cruise_i0", 0.5,
+                    "Datasheet no-load current of the cruise motor, for its iron "
+                    "and bearing loss.")
     r = add_row(tab_cruise, r, "Cruise motor weight (g)", "cruise_wt", 180,
                     "Mass of one cruise motor, for the Weight Budget.")
     r = add_section(tab_cruise, "Propeller Efficiency",
-                    ("cruise_eff",), row=r)
+                    ("cruise_eff", "cruise_eff_model"), row=r)
     r = add_row(tab_cruise, r, "Cruise prop efficiency", "cruise_eff", 0.75,
-                "Combined motor and propeller efficiency in cruise.")
+                "The PROPELLER's efficiency in cruise — thrust power over shaft "
+                "power. The motor is modelled separately from its Kv, Rm and "
+                "I0, so do not fold its losses in here.\n\n"
+                "Typical 0.75-0.85 for a well-matched cruise propeller. Before "
+                "v1.11 this was the combined motor-and-propeller figure; divide "
+                "an old value by about 0.9 to convert it.")
 
     r = 0
     # A dropdown, not free text: only three chemistries have a preset curve,
@@ -2539,15 +4480,10 @@ def launch_gui(args=None) -> None:
                 "Worth entering on a day well away from standard: the ISA "
                 "is an average, and density drives every rotor and wing "
                 "number on this aircraft. Sea-level standard is 101325 Pa.")
-    r = add_section(tab_env, "Systems (superseded by their own tabs)",
-                    ("avionics", "esc_eff"), row=r)
-    r = add_row(tab_env, r, "Avionics power (W)", "avionics", 15,
-                "Autopilot, radios and payload electronics.")
-    r = add_row(tab_env, r, "ESC efficiency", "esc_eff", 0.96,
-                    "Combined ESC and motor electrical efficiency. Motor losses are "
-                    "folded in here because this model has no separate motor "
-                    "electrical model, which is why it sits lower than an ESC "
-                    "datasheet figure.")
+    # The avionics power and ESC efficiency that used to sit here duplicated
+    # the Avionics and ESC tabs' own fields, and the two could disagree. A
+    # config saved with the old keys still loads: migrate_legacy_fields maps
+    # them onto the tab fields.
     ttk.Label(tab_env, text="Mission JSON").grid(row=r, column=0, sticky="w", pady=2)
     v_mission = tk.StringVar(value="")
     fields["mission"] = v_mission
@@ -2674,7 +4610,7 @@ def launch_gui(args=None) -> None:
                   "covers the thrust. Ignored for the vectored types, whose "
                   "lift rotors do the cruising.")
     add_section(tab_env, "Transients (mission runs)",
-                ("accel", "decel", "regen"))
+                ("accel", "decel", "regen", "transient_dt"))
     _append_row(tab_env, "Max acceleration (m/s²)", "accel", "",
                 "Limits how fast the aircraft may change speed between legs.\n\n"
                 "Blank ignores transients entirely and each leg starts at its "
@@ -2690,7 +4626,10 @@ def launch_gui(args=None) -> None:
     _append_row(tab_env, "Regen efficiency (0-1)", "regen", "0",
                 "Fraction of braking energy recovered. Fixed-pitch propellers "
                 "are poor regenerators, so 0 is the honest default.")
-    add_section(tab_env, "Wind", ("wind", "wind_dir"))
+    _append_row(tab_env, "Transient step dt (s)", "transient_dt", "",
+                "Mission time step. Blank uses 0.25 s. Smaller is finer and "
+                "slower; the answer should not move much below 0.5 s.")
+    add_section(tab_env, "Wind", ("wind", "wind_dir", "course_deg"))
     _append_row(tab_env, "Wind speed (m/s)", "wind", "0",
                 "Steady wind. Power follows AIRSPEED, but progress follows "
                 "GROUNDSPEED, so a leg measured over the ground takes longer "
@@ -2790,17 +4729,21 @@ def launch_gui(args=None) -> None:
               wraplength=300, justify="left", foreground="#555555"
               ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 6))
     _append_row(tab_esc, "ESC efficiency", "esc_eff_tab", "0.96",
-                "Combined switching and conduction efficiency, one ESC.\n\n"
-                "Motor losses are folded in here too, because the VTOL model "
-                "has no separate motor electrical model — which is why this "
-                "sits lower than an ESC datasheet figure would.")
+                "Switching and conduction efficiency of one ESC under load. "
+                "The ESC alone: the motors' losses come from their own Kv, "
+                "Rm and no-load current, so a datasheet figure belongs here.\n\n"
+                "Typical 0.95-0.98.")
     _append_row(tab_esc, "ESC resistance (Ω)", "esc_r", "",
-                "Optional. Series resistance of one ESC, for the loss "
-                "breakdown. Blank leaves it out entirely.")
+                "Optional. Series resistance of one ESC. It does not add a "
+                "loss — the efficiency above already covers everything lost "
+                "under load — but splits that loss into conduction (I²R) and "
+                "switching on the Metrics tab.")
+    _append_row(tab_esc, "ESC continuous current (A)", "esc_cont", "",
+                "Continuous rating of one ESC. Status checks the current each "
+                "ESC carries in hover and in cruise against it.")
     _append_row(tab_esc, "ESC max current (A)", "esc_imax", "",
-                "Optional. Continuous rating of one ESC. Status checks the "
-                "current each ESC actually carries in HOVER against it, "
-                "because hover is the heaviest steady load a VTOL sees.")
+                "Burst rating of one ESC. Above continuous but below this is "
+                "amber on Status; above it is red.")
     _append_row(tab_esc, "ESC weight (g, each)", "esc_wt", "",
                 "Mass of ONE ESC. Counted once per lift rotor, and once per "
                 "cruise motor on a lift+cruise.\n\n"
@@ -3040,6 +4983,251 @@ def launch_gui(args=None) -> None:
                 fields[f"{_p}_cont"].set(f"{defaults[0]:g}")
                 fields[f"{_p}_max"].set(f"{defaults[1]:g}")
         _type_var.trace_add("write", _fill)
+
+    # ==================================================================
+    # INPUTS CARRIED OVER FROM THE MULTICOPTER AND FIXED-WING
+    # ==================================================================
+    # Each block below is an input one or both of the other simulators has,
+    # with the same meaning. Blank or default values leave every result as it
+    # was before the field existed; each tooltip says what the field feeds.
+
+    # ---- Airframe: extra drag, conventional take-off --------------------
+    add_section(tab_airframe, "Extra Airframe Drag (beyond CD0)",
+                ("drag_model_mode", "parasite_drag", "parasite_area",
+                 "profile_drag", "profile_area", "body_length_m", "body_width_m",
+                 "body_height_m", "arm_length_m", "arm_width_m", "drag_cg_offset_m"))
+    add_combo_row(tab_airframe, "Drag model mode", "drag_model_mode",
+                  ("auto", "manual", "geometry"), "auto",
+                  "Drag of the fuselage, booms or payload pod ON TOP of the "
+                  "wing's CD0 — the multicopter's drag inputs.\n\n"
+                  "auto: the Cd and areas below if entered, else the body and "
+                  "boom dimensions if entered, else nothing.\n"
+                  "manual: only the entered Cd and areas.\n"
+                  "geometry: derive from the dimensions (box body, square-tube "
+                  "booms).\n\n"
+                  "Everything blank adds no drag, so CD0 stays the "
+                  "whole-aircraft figure it has always been.")
+    _append_row(tab_airframe, "Parasite Cd (frontal)", "parasite_drag", "",
+                "Drag coefficient of the frontal silhouette, met in forward "
+                "flight. Adds to the cruise and transition drag.")
+    _append_row(tab_airframe, "Parasite area (m²)", "parasite_area", "",
+                "Frontal area that Cd applies to.")
+    _append_row(tab_airframe, "Profile Cd (side)", "profile_drag", "",
+                "Drag coefficient of the side silhouette, met hovering level "
+                "in a wind. Sets the hover wind limit and the hover tilt Status "
+                "checks.")
+    _append_row(tab_airframe, "Profile area (m²)", "profile_area", "",
+                "Side area that Cd applies to.")
+    _append_row(tab_airframe, "Body length (m)", "body_length_m", "",
+                "Fuselage length, for the derived side area.")
+    _append_row(tab_airframe, "Body width (m)", "body_width_m", "",
+                "Fuselage width, for the derived frontal area.")
+    _append_row(tab_airframe, "Body height (m)", "body_height_m", "",
+                "Fuselage height, for both derived areas.")
+    _append_row(tab_airframe, "Boom length (m)", "arm_length_m", "",
+                "Length of one rotor boom or pylon. A lift+cruise's booms run "
+                "fore and aft, so they present only their end in cruise.")
+    _append_row(tab_airframe, "Boom width (m)", "arm_width_m", "",
+                "Outer width of the boom tube. Blank uses 20 mm.")
+    _append_row(tab_airframe, "Drag height above CG (m)", "drag_cg_offset_m", "",
+                "Where the drag acts relative to the centre of gravity. Held in "
+                "a wind, drag above the CG pitches the aircraft and the rotors "
+                "must counter it with uneven thrust — shown on the Per-Rotor "
+                "Loading table. Blank or 0 assumes it acts through the CG.")
+    add_section(tab_airframe, "Conventional Take-off / Landing",
+                ("mu_roll", "mu_brake", "cl_takeoff"))
+    _append_row(tab_airframe, "Rolling friction μ", "mu_roll", "0.04",
+                "Wheel friction on the runway, for the conventional take-off "
+                "roll on the Metrics tab — what the aircraft would need if it "
+                "took off on its cruise propeller like an aeroplane.\n\n"
+                "0.02-0.05 paved, 0.08-0.12 grass.")
+    _append_row(tab_airframe, "Braking friction μ", "mu_brake", "0.30",
+                "Braking friction for the conventional landing roll.")
+    _append_row(tab_airframe, "CL at take-off rotation", "cl_takeoff", "0.80",
+                "Lift coefficient at rotation, below CL_max so the wing does "
+                "not stall as it leaves the ground.")
+
+    # ---- Lift rotors: layout, propeller, ratings --------------------------
+    add_section(tab_lift, "Layout and Propeller",
+                ("lift_layout", "coax_spacing", "lift_blades"))
+    add_combo_row(tab_lift, "Lift rotor layout", "lift_layout", ("flat", "coaxial"),
+                  "flat",
+                  "coaxial: the lift rotors are stacked in pairs, one above the "
+                  "other. The lower rotor works in the upper one's wake, which "
+                  "costs about 18% more hover power at a 0.2 D spacing — the "
+                  "multicopter's model. 'Number of lift rotors' counts every "
+                  "rotor, so an X8 is 8.")
+    _append_row(tab_lift, "Coaxial spacing (m)", "coax_spacing", "",
+                "Vertical gap between the two rotors of a pair. Blank assumes "
+                "0.2 x diameter. Wider spacing costs less.")
+    _append_row(tab_lift, "Lift prop blades", "lift_blades", "2",
+                "Blade count. More blades raise the thrust coefficient, so the "
+                "rotor makes the same thrust at lower RPM.")
+    add_section(tab_lift, "Lift Motor Ratings",
+                ("lift_v0", "lift_max_time", "lift_temp_limit", "lift_v_unit",
+                 "lift_s_min", "lift_s_max", "lift_poles", "lift_size"))
+    _append_row(tab_lift, "Lift motor I0 test voltage (V)", "lift_v0", "",
+                "The voltage the datasheet measured I0 at. Given it, the "
+                "no-load current is scaled with motor speed, as iron loss is. "
+                "Blank holds I0 constant.")
+    _append_row(tab_lift, "Lift motor time at max (s)", "lift_max_time", "",
+                "How long the motor may run above its continuous rating. A "
+                "mission holding it there longer is flagged on Status.")
+    _append_row(tab_lift, "Lift motor temp limit (°C)", "lift_temp_limit", "100",
+                "Winding temperature the motor must stay below.")
+    add_combo_row(tab_lift, "Lift motor voltage unit", "lift_v_unit", ("S", "V"), "S",
+                  "Whether the rating range below is in cells (S) or volts.")
+    _append_row(tab_lift, "Lift motor rating min", "lift_s_min", "",
+                "Lowest pack voltage the motor is rated for.")
+    _append_row(tab_lift, "Lift motor rating max", "lift_s_max", "",
+                "Highest pack voltage the motor is rated for. Status checks the "
+                "pack against it.")
+    _append_row(tab_lift, "Lift motor pole count", "lift_poles", "14",
+                "Magnet poles. Sets the electrical RPM the ESC must commutate.")
+    _append_row(tab_lift, "Lift motor size", "lift_size", "",
+                "Stator size, e.g. 5010. Shown on Metrics; nothing is computed "
+                "from it.")
+    add_section(tab_lift, "Lift Propeller Coefficients",
+                ("lift_max_rpm", "lift_tconst", "lift_pconst"))
+    _append_row(tab_lift, "Lift prop max RPM", "lift_max_rpm", "",
+                "The propeller maker's RPM limit. Status checks hover RPM "
+                "against it.")
+    _append_row(tab_lift, "Lift prop TConst (C_T)", "lift_tconst", "",
+                "Thrust coefficient, T = C_T rho n² D⁴. Sets RPM from thrust. "
+                "Blank fits it from a bench table's RPM column, else estimates "
+                "it from diameter, pitch and blades (±30%).")
+    _append_row(tab_lift, "Lift prop PConst (C_P)", "lift_pconst", "",
+                "Power coefficient, P = C_P rho n³ D⁵. Shown on Metrics.")
+    add_section(tab_lift, "Rotor Inflow Map",
+                ("inflow_map_enabled", "inflow_mu_bp", "inflow_eff_bp"))
+    add_combo_row(tab_lift, "Inflow map enabled (1/0)", "inflow_map_enabled",
+                  ("0", "1"), "0",
+                  "The multicopter's empirical correction to lift-rotor power "
+                  "against advance ratio μ = V / ΩR. Off by default: the "
+                  "forward-flight inflow solver already carries translational "
+                  "lift, and this is a refinement for measured data.")
+    _append_row(tab_lift, "Inflow μ breakpoints", "inflow_mu_bp", "",
+                "Comma separated. Blank uses 0, 0.08, 0.16, 0.24, 0.32, 0.40, 0.50.")
+    _append_row(tab_lift, "Inflow η breakpoints", "inflow_eff_bp", "",
+                "Efficiency at each μ; above 1 makes the rotor cheaper. Blank "
+                "uses 1.00, 1.04, 1.08, 1.06, 1.00, 0.94, 0.88.")
+
+    # ---- Cruise: propeller, ratings --------------------------------------
+    add_section(tab_cruise, "Cruise Propeller Detail",
+                ("cruise_blades", "cruise_eff_model", "cruise_max_thrust"))
+    _append_row(tab_cruise, "Cruise prop blades", "cruise_blades", "2",
+                "Blade count of the cruise propeller.")
+    add_combo_row(tab_cruise, "Prop efficiency model", "cruise_eff_model",
+                  ("constant", "curve"), "constant",
+                  "constant: the propeller efficiency above at every speed.\n\n"
+                  "curve: the fixed-wing's model — the entered figure is the "
+                  "PEAK, reached near 60% of the full-throttle pitch speed, "
+                  "falling away either side. Needs the cruise motor Kv.")
+    _append_row(tab_cruise, "Cruise prop rated thrust (g)", "cruise_max_thrust", "",
+                "Static thrust ONE cruise propeller is rated for. Sets the "
+                "thrust available for the climb figures and the conventional "
+                "take-off roll; blank derives it from the motor's max power.")
+    add_section(tab_cruise, "Cruise Motor Ratings",
+                ("cruise_v0", "cruise_max_time", "cruise_temp_limit", "cruise_v_unit",
+                 "cruise_s_min", "cruise_s_max", "cruise_poles", "cruise_size"))
+    _append_row(tab_cruise, "Cruise motor I0 test voltage (V)", "cruise_v0", "",
+                "The voltage the datasheet measured I0 at. Blank holds I0 constant.")
+    _append_row(tab_cruise, "Cruise motor time at max (s)", "cruise_max_time", "",
+                "How long the motor may run above its continuous rating.")
+    _append_row(tab_cruise, "Cruise motor temp limit (°C)", "cruise_temp_limit", "100",
+                "Winding temperature the motor must stay below.")
+    add_combo_row(tab_cruise, "Cruise motor voltage unit", "cruise_v_unit",
+                  ("S", "V"), "S", "Whether the rating range is in cells (S) or volts.")
+    _append_row(tab_cruise, "Cruise motor rating min", "cruise_s_min", "",
+                "Lowest pack voltage the motor is rated for.")
+    _append_row(tab_cruise, "Cruise motor rating max", "cruise_s_max", "",
+                "Highest pack voltage the motor is rated for.")
+    _append_row(tab_cruise, "Cruise motor pole count", "cruise_poles", "14",
+                "Magnet poles, for the electrical RPM.")
+    _append_row(tab_cruise, "Cruise motor size", "cruise_size", "",
+                "Stator size. Shown on Metrics only.")
+    add_section(tab_cruise, "Cruise Propeller Coefficients",
+                ("cruise_max_rpm", "cruise_tconst", "cruise_pconst"))
+    _append_row(tab_cruise, "Cruise prop max RPM", "cruise_max_rpm", "",
+                "The propeller maker's RPM limit.")
+    _append_row(tab_cruise, "Cruise prop TConst (C_T)", "cruise_tconst", "",
+                "Static thrust coefficient. Blank fits or estimates it.")
+    _append_row(tab_cruise, "Cruise prop PConst (C_P)", "cruise_pconst", "",
+                "Static power coefficient. Shown on Metrics.")
+
+    # ---- Battery: thermal limits --------------------------------------------
+    add_section(tab_batt, "Thermal Limits (optional)",
+                ("batt_max_time", "batt_temp_limit"))
+    _append_row(tab_batt, "Time at max C-rate (s)", "batt_max_time", "",
+                "How long the pack may be held at its burst rating. A mission "
+                "that holds it above continuous longer is flagged on Status.")
+    _append_row(tab_batt, "Battery temp limit (°C)", "batt_temp_limit", "55",
+                "Cell temperature the pack must stay below. Cells age fast "
+                "above about 60 °C.")
+
+    # ---- ESC: ratings -------------------------------------------------------
+    add_section(tab_esc, "Ratings and Limits",
+                ("esc_idle", "esc_max_time", "esc_temp_limit", "esc_v_unit",
+                 "esc_s_min", "esc_s_max"))
+    _append_row(tab_esc, "ESC idle current (A)", "esc_idle", "",
+                "Standby draw of one ESC, paid whether or not its motor turns — "
+                "so a lift+cruise pays it for the stopped lift ESCs all through "
+                "cruise. Blank is none.")
+    _append_row(tab_esc, "ESC time at max (s)", "esc_max_time", "",
+                "How long the ESC may run above its continuous rating.")
+    _append_row(tab_esc, "ESC temp limit (°C)", "esc_temp_limit", "90",
+                "Temperature the ESC must stay below.")
+    add_combo_row(tab_esc, "ESC voltage unit", "esc_v_unit", ("S", "V"), "S",
+                  "Whether the rating range is in cells (S) or volts.")
+    _append_row(tab_esc, "ESC rating min", "esc_s_min", "",
+                "Lowest pack voltage the ESC is rated for.")
+    _append_row(tab_esc, "ESC rating max", "esc_s_max", "",
+                "Highest pack voltage the ESC is rated for. Status checks the "
+                "pack against it.")
+
+    # ---- Mission / environment: the run settings ---------------------------
+    add_section(tab_env, "Flight Settings",
+                ("reserve_percent", "cruise_altitude", "bank_deg", "climb_rate",
+                 "descent_rate", "max_tilt", "max_pitch", "max_roll"))
+    _append_row(tab_env, "Reserve percent (%)", "reserve_percent", "",
+                "Energy kept back at landing, as a share of usable energy. "
+                "Sets the reserve target and margin on Metrics and Status, and "
+                "overrides the mission file's own reserve when entered.\n\n"
+                "Blank uses the mission file's value, or 20% for a fixed-speed "
+                "run.")
+    _append_row(tab_env, "Cruise altitude (m)", "cruise_altitude", "",
+                "Height actually flown, above sea level. Used for the glide "
+                "distance and to express the ceiling above it. Blank means "
+                "the same as Altitude, which is the field elevation.")
+    _append_row(tab_env, "Bank angle (deg)", "bank_deg", "",
+                "Bank for the Turning Flight figures on Metrics: load factor, "
+                "turn radius and rate, turn stall speed and the power a "
+                "sustained turn costs. Blank or 0 is straight flight.")
+    _append_row(tab_env, "Climb rate cmd (m/s)", "climb_rate", "",
+                "A steady climb at the cruise speed. Its potential power is "
+                "added to the cruise figures, as on the other two simulators.")
+    _append_row(tab_env, "Descent rate cmd (m/s)", "descent_rate", "",
+                "A steady descent at the cruise speed. Its potential power is "
+                "given back. Ignored when a climb is entered.")
+    _append_row(tab_env, "Max hover tilt (deg)", "max_tilt", "25",
+                "Largest tilt the flight controller allows in hover. Sets the "
+                "hover wind limit on Metrics and the hover tilt check on "
+                "Status.")
+    _append_row(tab_env, "Max pitch (deg)", "max_pitch", "",
+                "Pitch limit in hover, for the station-keeping check. Blank "
+                "uses the tilt limit.")
+    _append_row(tab_env, "Max roll (deg)", "max_roll", "",
+                "Roll limit in hover. A crosswind is held with roll.")
+    add_section(tab_env, "Requirements (checked on Status)",
+                ("min_climb", "field_takeoff", "field_landing"))
+    _append_row(tab_env, "Minimum climb rate (m/s)", "min_climb", "",
+                "The wing-borne climb rate the aircraft must manage. Status "
+                "checks the best climb against it.")
+    _append_row(tab_env, "Take-off run available (m)", "field_takeoff", "",
+                "Runway for a conventional take-off, for when the aircraft is "
+                "too heavy to lift off vertically.")
+    _append_row(tab_env, "Landing distance available (m)", "field_landing", "",
+                "Runway for a conventional landing.")
 
     # One notebook-level wheel binding, attached after every input tab exists.
     # It routes the scroll to whichever canvas belongs to the selected tab,
@@ -3422,6 +5610,49 @@ def launch_gui(args=None) -> None:
                     f"Within 5% of the {ref:.{decimals}f} {unit} rating — no margin left.")
         _row(tv, metric, f"{v:.{decimals}f} {unit}", limit, tag, note)
 
+    def _at_least(value, minimum, warn_frac=0.9):
+        """ok at or above `minimum`, warn a little below it, bad well below."""
+        try:
+            v, lim = float(value), float(minimum)
+        except (TypeError, ValueError):
+            return "na"
+        if not (math.isfinite(v) and math.isfinite(lim)):
+            return "na"
+        if v >= lim:
+            return "ok"
+        return "warn" if v >= lim * warn_frac else "bad"
+
+    def _temp_row(tv, label, temp, limit, note=""):
+        tag = "bad" if temp > limit else ("warn" if temp > limit - 10.0 else "ok")
+        _row(tv, label, f"{temp:.1f} °C", f"<= {limit:.0f} °C", tag,
+             note or ("Within 10 °C of the limit." if tag == "warn" else
+                      "Above the limit." if tag == "bad" else "Comfortable."))
+
+    def _rating_row(tv, label, unit, lo, hi):
+        check = voltage_rating_check(_status_cfg["cfg"], unit, lo, hi)
+        if check is None:
+            _row(tv, label, "", "Not Specified", "na",
+                 "Enter the component's voltage rating to check the pack against it.")
+        else:
+            _row(tv, label, check["value"], check["limit"],
+                 "ok" if check["ok"] else "bad",
+                 "The pack is inside the rated range." if check["ok"] else
+                 "The pack is OUTSIDE the rated range — the part will be "
+                 "over- or under-driven.")
+
+    def _time_row(tv, label, seconds, limit):
+        if not limit:
+            if seconds > 0:
+                _row(tv, label, f"{seconds:.0f} s", "Not Specified", "na",
+                     "Time spent above the continuous rating. Enter a time at "
+                     "max to check it.")
+            return
+        _row(tv, label, f"{seconds:.0f} s", f"<= {limit:.0f} s",
+             _classify(seconds, limit),
+             "Time spent above the continuous rating during the mission.")
+
+    _status_cfg = {"cfg": None}
+
     def update_status(cfg, m, worst=None):
         """
         Fixed speed: every row at the cruise speed, plus hover — which for a
@@ -3432,8 +5663,10 @@ def launch_gui(args=None) -> None:
         for _title, _tv in _STATUS_TABLES:
             _clear_tree(_tv)
         status_detail.configure(text="")
+        _status_cfg["cfg"] = cfg
         batt = cfg.battery
         cont_A, max_A = batt.discharge_cont_A, batt.discharge_max_A
+        vectored = uses_vectored_thrust(cfg)
 
         if worst is not None:
             _dual(batt_status_tv, "Peak pack current", worst["pack_current_A"],
@@ -3447,6 +5680,58 @@ def launch_gui(args=None) -> None:
                  ">= 0 Wh", "ok" if margin >= 0 else "bad",
                  "Energy left above the reserve at the lowest point of the "
                  "mission. Negative means the reserve was eaten into.")
+            if "min_soc_pct" in worst:
+                soc = float(worst["min_soc_pct"])
+                _row(batt_status_tv, "Minimum state of charge", f"{soc:.1f} %", "> 0 %",
+                     "ok" if soc > 0 else "bad", "Of the usable energy.")
+                v_min = float(worst["min_battery_voltage_V"])
+                _row(batt_status_tv, "Lowest loaded pack voltage", f"{v_min:.2f} V",
+                     f">= {batt.vmin_pack:.2f} V",
+                     "ok" if v_min >= batt.vmin_pack else "bad",
+                     "Under load, at the emptiest point. Below the cutoff the "
+                     "ESCs may cut out.")
+                _temp_row(batt_status_tv, "Peak battery temperature",
+                          float(worst["battery_temp_est_C"]), batt.temp_limit_C)
+                _time_row(batt_status_tv, "Time above pack rating",
+                          float(worst["battery_over_rating_s"]), batt.max_time_s)
+
+                _dual(motor_status_tv, "Peak lift motor current",
+                      worst["lift_motor_current_A"], cfg.lift_motor_max_current_A, None, "A")
+                _time_row(motor_status_tv, "Lift motor time above rating",
+                          float(worst["lift_over_rating_s"]), cfg.lift_motor_max_time_s)
+                if not vectored:
+                    _dual(motor_status_tv, "Peak cruise motor current",
+                          worst["cruise_motor_current_A"], cfg.cruise_motor_max_current_A,
+                          None, "A")
+                    _time_row(motor_status_tv, "Cruise motor time above rating",
+                              float(worst["cruise_over_rating_s"]), cfg.cruise_motor_max_time_s)
+                _dual(motor_status_tv, "Peak ESC current", worst["esc_current_A"],
+                      cfg.esc_cont_current_A, cfg.esc_max_current_A, "A")
+                _time_row(motor_status_tv, "ESC time above rating",
+                          float(worst["esc_over_rating_s"]), cfg.esc_max_time_s)
+                for label, key in (("Peak lift motor throttle", "lift_motor_throttle"),
+                                   ("Peak cruise motor throttle", "cruise_motor_throttle")):
+                    if key == "cruise_motor_throttle" and vectored:
+                        continue
+                    th = float(worst.get(key, 0.0)) * 100.0
+                    if th > 0:
+                        _row(motor_status_tv, label, f"{th:.0f} %", "<= 100 %",
+                             _classify(th, 100.0),
+                             "Above 100% the pack cannot spin the motor fast "
+                             "enough for the thrust asked of it.")
+                _temp_row(motor_status_tv, "Peak motor temperature",
+                          float(worst["motor_temp_est_C"]),
+                          min(cfg.lift_motor_temp_limit_C, cfg.cruise_motor_temp_limit_C),
+                          "Integrated through the mission from ambient.")
+                _temp_row(motor_status_tv, "Peak ESC temperature",
+                          float(worst["esc_temp_est_C"]), cfg.esc_temp_limit_C)
+                _row(motor_status_tv, "Thermal status", str(worst["thermal_status"]),
+                     "OK", {"OK": "ok", "WARN": "warn", "HOT": "bad"}.get(
+                         str(worst["thermal_status"]), "na"))
+                mach = float(worst["lift_tip_mach"])
+                _row(rotor_status_tv, "Peak lift rotor tip Mach", f"{mach:.3f}", "<= 0.60",
+                     _classify(mach, 0.60),
+                     "Above about Mach 0.6 noise rises sharply and efficiency falls.")
             for _title, _tv in _STATUS_TABLES:
                 if not _tv.get_children():
                     _row(_tv, "—", "", "",  "na",
@@ -3461,20 +5746,67 @@ def launch_gui(args=None) -> None:
         _dual(batt_status_tv, "Cruise pack current", point_I, cont_A, max_A, "A")
         _dual(batt_status_tv, "Hover C-rate", hover_I / max(batt.capacity_Ah, 1e-9),
               batt.discharge_c_cont, batt.discharge_c_max, "C")
+        _dual(batt_status_tv, "Cruise C-rate", point_I / max(batt.capacity_Ah, 1e-9),
+              batt.discharge_c_cont, batt.discharge_c_max, "C")
+        v_hover = batt.voltage_under_load(hover_I)
+        _row(batt_status_tv, "Pack voltage (loaded, hover)", f"{v_hover:.2f} V",
+             f">= {batt.vmin_pack:.2f} V",
+             "ok" if v_hover >= batt.vmin_pack * 1.05 else
+             ("warn" if v_hover >= batt.vmin_pack else "bad"),
+             "Full-charge pack under the hover current. Near the cutoff the "
+             "ESCs may cut out before the pack is empty.")
+        _row(batt_status_tv, "Total electrical power",
+             f"{float(m.get('hover_power_W', 0.0)):.0f} W hover / "
+             f"{float(m.get('total_power_W', 0.0)):.0f} W cruise", "—", "na")
+        total = max(float(m.get("total_power_W", 0.0)), 1e-9)
+        motor_in = float(m.get("motor_input_W", 0.0))
+        systems = float(m.get("avionics_input_power_W", 0.0)) + float(m.get("peripheral_power_W", 0.0))
+        _row(batt_status_tv, "Power split (Motor/ESC/Av)",
+             f"{motor_in / total * 100:.0f} / "
+             f"{float(m.get('esc_loss_W', 0.0)) / total * 100:.0f} / "
+             f"{systems / total * 100:.0f} %", "—", "na",
+             "At the cruise speed: motor input, ESC loss and avionics plus "
+             "peripherals, as shares of pack power.")
+        _row(batt_status_tv, "Usable energy", f"{float(m.get('usable_Wh', 0.0)):.1f} Wh",
+             "—", "na")
+        if "reserve_margin_Wh" in m:
+            margin = float(m["reserve_margin_Wh"])
+            _row(batt_status_tv, "Energy reserve margin", f"{margin:.1f} Wh", ">= 0 Wh",
+                 "ok" if margin >= 0 else "bad",
+                 f"Usable energy above the {float(m.get('reserve_percent', 20)):.0f}% "
+                 f"reserve. Run a mission to see what a real flight leaves.")
+        if "battery_temp_est_C" in m:
+            _temp_row(batt_status_tv, "Battery temperature (est)",
+                      float(m["battery_temp_est_C"]), batt.temp_limit_C,
+                      "Steady state in hover, the heaviest load.")
 
         if cfg.lift_motor_max_power_W:
-            per = float(m.get("hover_power_per_lift_motor_W", 0.0))
+            per = float(m.get("hover_lift_elec_W", m.get("hover_power_per_lift_motor_W", 0.0)))
             _row(motor_status_tv, "Lift motor power in hover", f"{per:.0f} W",
                  f"<= {cfg.lift_motor_max_power_W:.0f} W",
                  _classify(per, cfg.lift_motor_max_power_W),
-                 "Hover is the heaviest load a lift motor carries.")
+                 "Electrical input per motor. Hover is the heaviest load a lift "
+                 "motor carries.")
         else:
             _row(motor_status_tv, "Lift motor power in hover",
-                 f"{float(m.get('hover_power_per_lift_motor_W', 0.0)):.0f} W",
+                 f"{float(m.get('hover_lift_elec_W', m.get('hover_power_per_lift_motor_W', 0.0))):.0f} W",
                  "Not Specified", "na", "Enter a motor max power to check it.")
 
-        if not uses_vectored_thrust(cfg):
-            per = float(m.get("cruise_power_per_motor_W", 0.0))
+        # Current against the motor's own rating — the check the rated-current
+        # fields always promised and never made.
+        _dual(motor_status_tv, "Lift motor current in hover",
+              float(m.get("hover_lift_current_A", 0.0)),
+              cfg.lift_motor_max_current_A, None, "A")
+        th = float(m.get("hover_lift_throttle", float("nan")))
+        if math.isfinite(th):
+            _row(motor_status_tv, "Lift motor throttle in hover", f"{th * 100:.0f} %",
+                 "<= 100 %", "bad" if th > 1.0 else ("warn" if th > 0.85 else "ok"),
+                 "Terminal voltage over pack voltage. Above about 85% there is "
+                 "little left for control; above 100% the motor cannot reach "
+                 "the RPM at all — a lower Kv or more cells is needed.")
+
+        if not vectored:
+            per = float(m.get("cruise_motor_elec_W", m.get("cruise_power_per_motor_W", 0.0)))
             if cfg.cruise_motor_max_power_W:
                 _row(motor_status_tv, "Cruise motor power", f"{per:.0f} W",
                      f"<= {cfg.cruise_motor_max_power_W:.0f} W",
@@ -3482,6 +5814,68 @@ def launch_gui(args=None) -> None:
             else:
                 _row(motor_status_tv, "Cruise motor power", f"{per:.0f} W",
                      "Not Specified", "na")
+            _dual(motor_status_tv, "Cruise motor current",
+                  float(m.get("cruise_motor_current_A", 0.0)),
+                  cfg.cruise_motor_max_current_A, None, "A")
+        th = float(m.get("cruise_motor_throttle", float("nan")))
+        if math.isfinite(th) and float(m.get("cruise_motor_rpm", 0.0)) > 0:
+            _row(motor_status_tv, "Cruise throttle", f"{th * 100:.0f} %", "<= 100 %",
+                 "bad" if th > 1.0 else ("warn" if th > 0.9 else "ok"),
+                 "At the cruise speed. Above 100% the propeller would have to "
+                 "turn faster than the pack can drive it.")
+
+        # Each ESC carries its motor's current. Hover loads the lift ESCs, and
+        # cruise the cruise ESCs.
+        esc_hover = float(m.get("hover_lift_current_A", 0.0))
+        esc_cruise = float(m.get("cruise_motor_current_A", 0.0))
+        _dual(motor_status_tv, "ESC current in hover", esc_hover,
+              cfg.esc_cont_current_A, cfg.esc_max_current_A, "A")
+        _dual(motor_status_tv, "ESC current in cruise", esc_cruise,
+              cfg.esc_cont_current_A, cfg.esc_max_current_A, "A")
+        _rating_row(motor_status_tv, "ESC voltage rating", cfg.esc_v_unit,
+                    cfg.esc_rating_min, cfg.esc_rating_max)
+        _rating_row(motor_status_tv, "Lift motor voltage rating", cfg.lift_motor_v_unit,
+                    cfg.lift_motor_rating_min, cfg.lift_motor_rating_max)
+        if not vectored:
+            _rating_row(motor_status_tv, "Cruise motor voltage rating", cfg.cruise_motor_v_unit,
+                        cfg.cruise_motor_rating_min, cfg.cruise_motor_rating_max)
+        if "lift_motor_temp_C" in m:
+            _temp_row(motor_status_tv, "Lift motor temperature (est)",
+                      float(m["lift_motor_temp_C"]), cfg.lift_motor_temp_limit_C,
+                      "Steady state in hover.")
+            if not vectored:
+                _temp_row(motor_status_tv, "Cruise motor temperature (est)",
+                          float(m["cruise_motor_temp_C"]), cfg.cruise_motor_temp_limit_C,
+                          "Steady state at the cruise speed.")
+            _temp_row(motor_status_tv, "ESC temperature (est)",
+                      float(m["esc_temp_est_C"]), cfg.esc_temp_limit_C)
+
+        if "lift_twr" in m and float(m.get("lift_thrust_available_N", 0.0)) > 0:
+            twr = float(m["lift_twr"])
+            _row(motor_status_tv, "Thrust-to-weight (max available)", f"{twr:.2f}:1",
+                 ">= 2.0:1", "ok" if twr >= 2.0 else ("warn" if twr >= 1.5 else "bad"),
+                 f"Lift rotors at full thrust ({m['lift_thrust_source']}) over "
+                 f"weight. Below 1.5 hover control is dangerously marginal.")
+            pay = float(m["max_extra_payload_g"])
+            _row(motor_status_tv, "Max additional payload", f"{pay:.0f} g", ">= 0 g",
+                 "ok" if pay >= 0 else "bad",
+                 "Extra mass liftable with no hover margin at all.")
+            pay2 = float(m["payload_at_twr2_g"])
+            _row(motor_status_tv, "Payload at TWR 2.0", f"{max(pay2, 0):.0f} g", ">= 0 g",
+                 "ok" if pay2 > 0 else "warn",
+                 "Extra mass while keeping a 2:1 margin — the usable figure.")
+        hover_need = cfg.weight_N * (1.0 + hover_download_fraction(cfg))
+        _row(motor_status_tv, "Thrust required / weight (hover)",
+             f"{hover_need / max(cfg.weight_N, 1e-9):.2f}:1", "~1.0:1", "ok",
+             "Above 1 by the hover download the rotors also have to lift.")
+
+        esc_loss = float(m.get("esc_loss_W", 0.0)) + float(m.get("motor_loss_W", 0.0))
+        if esc_loss > 0:
+            _row(motor_status_tv, "ESC + motor loss at cruise",
+                 f"{esc_loss:.1f} W", "—", "na",
+                 f"{esc_loss / max(float(m.get('total_power_W', 0.0)), 1e-9) * 100:.1f}% "
+                 f"of pack power: {float(m.get('motor_loss_W', 0.0)):.1f} W in the "
+                 f"motors, {float(m.get('esc_loss_W', 0.0)):.1f} W in the ESCs.")
 
         v_stall = float(m.get("stall_speed_mps", 0.0))
         v_trans = float(m.get("transition_speed_mps", 0.0))
@@ -3501,6 +5895,76 @@ def launch_gui(args=None) -> None:
              f"At {v_cruise:.1f} m/s the wing carries only part of the weight, "
              f"so the rotors are still lifting — the cruise speed is below the "
              f"{v_trans:.1f} m/s transition speed.")
+
+        if "cl_cruise" in m:
+            cl = float(m["cl_cruise"])
+            _row(aero_status_tv, "CL at cruise vs CL_max", f"{cl:.3f}",
+                 f"<= {cfg.CL_max * 0.8:.2f} (80% CL_max)",
+                 "ok" if cl <= cfg.CL_max * 0.8 else ("warn" if cl <= cfg.CL_max else "bad"),
+                 "Flying above about 80% of CL_max leaves little margin for a "
+                 "gust or a turn.")
+            sos = float(m["speed_over_stall"])
+            _row(aero_status_tv, "Cruise vs stall speed", f"{sos:.2f}x", ">= 1.30x",
+                 "ok" if sos >= 1.3 else ("warn" if sos >= 1.1 else "bad"))
+            _row(aero_status_tv, "L/D ratio (cruise)", f"{float(m['ld_cruise']):.2f}",
+                 "—", "na", f"Against {float(m['ld_max']):.1f} at best.")
+            _row(aero_status_tv, "Glide ratio", f"{float(m['glide_ratio']):.1f} : 1", "—", "na",
+                 "Rotors stopped, motors off.")
+            roc = float(m["roc_at_cruise_mps"])
+            best = float(m["max_roc_mps"])
+            if cfg.min_climb_mps:
+                _row(aero_status_tv, "Rate of climb", f"{best:.2f} m/s best",
+                     f">= {cfg.min_climb_mps:.2f} m/s", _at_least(best, cfg.min_climb_mps),
+                     f"Best wing-borne climb, at {float(m['vy_mps']):.1f} m/s; "
+                     f"{roc:.2f} m/s at the cruise speed.")
+            else:
+                _row(aero_status_tv, "Rate of climb", f"{best:.2f} m/s best",
+                     "Not Specified", "na",
+                     "Enter a minimum climb rate on the Mission/Environment tab to "
+                     "check it.")
+            _row(aero_status_tv, "Max angle of climb",
+                 f"{float(m['max_climb_angle_deg']):.1f} deg", "—", "na")
+            ceiling = float(m["service_ceiling_m"])
+            want = cfg.cruise_altitude_m
+            if want is not None:
+                _row(aero_status_tv, "Service ceiling",
+                     "above 8000 m" if not math.isfinite(ceiling) else f"{ceiling:.0f} m",
+                     f">= {want:.0f} m", "ok" if ceiling >= want else "bad",
+                     "Wing-borne ceiling against the cruise altitude.")
+            else:
+                _row(aero_status_tv, "Service ceiling",
+                     "above 8000 m" if not math.isfinite(ceiling) else f"{ceiling:.0f} m",
+                     "—", "na")
+            for label, key, avail in (("Take-off ground roll", "takeoff_roll_m", cfg.field_takeoff_m),
+                                      ("Landing distance (over 15 m obstacle)",
+                                       "landing_distance_m", cfg.field_landing_m)):
+                dist = float(m[key])
+                text = "not possible" if not math.isfinite(dist) else f"{dist:.0f} m"
+                if avail:
+                    _row(aero_status_tv, label, text, f"<= {avail:.0f} m",
+                         _classify(dist, avail) if math.isfinite(dist) else "bad",
+                         "Conventional, on the runway entered on the "
+                         "Mission/Environment tab.")
+                else:
+                    _row(aero_status_tv, label, text, "Not Specified", "na",
+                         "Only matters if the aircraft is flown off a runway; "
+                         "enter the runway length to check it.")
+            re_n = float(m["reynolds_number"])
+            _row(aero_status_tv, "Reynolds number", f"{re_n:,.0f}", ">= 100,000",
+                 "ok" if re_n >= 1e5 else ("warn" if re_n >= 5e4 else "bad"),
+                 "Below about 100,000 the airfoil's lift and drag degrade "
+                 "noticeably from their published values.")
+            _row(aero_status_tv, "Wing loading", f"{cfg.wing_loading_N_m2:.1f} N/m²",
+                 "—", "na")
+            _row(aero_status_tv, "Specific range",
+                 f"{float(m['specific_range_km_per_Wh']):.3f} km/Wh", "—", "na")
+            if cfg.bank_deg > 0:
+                v_ts = float(m["turn_stall_speed_mps"])
+                _row(aero_status_tv, "Turn stall speed",
+                     f"{v_ts:.1f} m/s at {cfg.bank_deg:.0f} deg", f"< {v_cruise:.1f} m/s",
+                     "ok" if v_ts < v_cruise * 0.9 else ("warn" if v_ts < v_cruise else "bad"),
+                     "The stall speed rises with the square root of the load "
+                     "factor in a turn.")
 
         if uses_vectored_thrust(cfg):
             tilt = float(m.get("tilt_deg", 0.0))
@@ -3555,6 +6019,99 @@ def launch_gui(args=None) -> None:
                  f"{t_per:.1f} N", "Not Specified", "na",
                  "Enter the propeller's rated thrust on the Lift Rotors tab "
                  "to check it.")
+        if cfg.lift_prop_table is not None:
+            lo = float(cfg.lift_prop_table["Thrust_g"].min())
+            hi = float(cfg.lift_prop_table["Thrust_g"].max())
+            grams = t_per / G0 * 1000.0
+            _row(rotor_status_tv, "Table thrust range",
+                 f"{grams:.0f} g in {lo:.0f}-{hi:.0f} g", "inside the table",
+                 "ok" if lo <= grams <= hi else "warn",
+                 "Outside the measured range the table says nothing and the "
+                 "estimate is used instead.")
+
+        if "hover_lift_rpm" in m:
+            rpm = float(m["hover_lift_rpm"])
+            if cfg.lift_prop_max_rpm:
+                _row(rotor_status_tv, "Lift prop RPM (hover)", f"{rpm:.0f} rpm",
+                     f"<= {cfg.lift_prop_max_rpm:.0f} rpm",
+                     _classify(rpm, cfg.lift_prop_max_rpm),
+                     "Against the propeller maker's limit.")
+            else:
+                _row(rotor_status_tv, "Lift prop RPM (hover)", f"{rpm:.0f} rpm",
+                     "Not Specified", "na", "Enter the prop's max RPM to check it.")
+            mach = float(m["hover_lift_tip_mach"])
+            _row(rotor_status_tv, "Lift rotor tip Mach", f"{mach:.3f}", "<= 0.60",
+                 _classify(mach, 0.60),
+                 f"Hover. Above about Mach 0.6 the tip goes transonic: noise "
+                 f"rises sharply and efficiency falls. Speed of sound is "
+                 f"{float(m['speed_of_sound_mps']):.0f} m/s here.")
+            if not vectored and float(m.get("cruise_motor_rpm", 0.0)) > 0:
+                c_rpm = float(m["cruise_motor_rpm"])
+                if cfg.cruise_prop_max_rpm:
+                    _row(rotor_status_tv, "Cruise prop RPM", f"{c_rpm:.0f} rpm",
+                         f"<= {cfg.cruise_prop_max_rpm:.0f} rpm",
+                         _classify(c_rpm, cfg.cruise_prop_max_rpm))
+                c_mach = float(m["cruise_motor_tip_mach"])
+                _row(rotor_status_tv, "Cruise prop tip Mach", f"{c_mach:.3f}", "<= 0.60",
+                     _classify(c_mach, 0.60),
+                     "Helical tip speed excludes the forward speed; add it for "
+                     "a fast aircraft.")
+                pitch_v = float(m["cruise_motor_pitch_speed_mps"])
+                _row(rotor_status_tv, "Pitch speed vs cruise",
+                     f"{pitch_v:.1f} m/s vs {v_cruise:.1f} m/s", ">= 1.15x cruise",
+                     "ok" if pitch_v >= v_cruise * 1.15 else
+                     ("warn" if pitch_v >= v_cruise else "bad"),
+                     "The propeller's pitch speed must clear the cruise speed "
+                     "or it runs out of thrust. More pitch or more RPM.")
+            dl = float(m["disc_loading_N_m2"])
+            ideal_gW = 1000.0 / (G0 * math.sqrt(dl / (2.0 * cfg.air_density)))
+            _row(rotor_status_tv, "Disk loading", f"{dl:.1f} N/m²", "Not Specified", "na",
+                 f"A design choice — high disk loading buys compactness at the "
+                 f"cost of hover efficiency. At this loading the ideal ceiling "
+                 f"is {ideal_gW:.1f} g/W.")
+            he = float(m["hover_efficiency_gW"])
+            frac = he / max(ideal_gW, 1e-9)
+            _row(rotor_status_tv, "Hover efficiency", f"{he:.2f} g/W",
+                 f">= {0.55 * ideal_gW:.1f} g/W",
+                 "ok" if frac >= 0.55 else ("warn" if frac >= 0.40 else "bad"),
+                 f"{frac * 100:.0f}% of the {ideal_gW:.1f} g/W ideal for this disk "
+                 f"loading — rotor and drivetrain losses together.")
+            d_in = cfg.lift_prop_diameter_in
+            fm_target = 0.70 if d_in >= 15 else (0.60 if d_in >= 9 else 0.45)
+            fm = float(m["hover_figure_of_merit"])
+            _row(rotor_status_tv, "Figure of merit", f"{fm:.3f}", f">= {fm_target:.2f}",
+                 _at_least(fm, fm_target),
+                 f"Achieved, penalties included. Expectation scaled for a "
+                 f"{d_in:.0f} in rotor, as the multicopter scales it.")
+            _row(rotor_status_tv, "Prop solidity σ", f"{float(m['lift_solidity']):.3f}",
+                 "—", "na", "Blade area over disc area, estimated from diameter "
+                 "and blade count.")
+            limit = float(m["hover_wind_limit_mps"])
+            if math.isfinite(limit):
+                _row(rotor_status_tv, "Max hover wind resistance",
+                     f"{limit:.1f} m/s  ({limit * 1.944:.1f} kt)", ">= 5 m/s",
+                     "ok" if limit >= 8 else ("warn" if limit >= 4 else "bad"),
+                     "Strongest wind the lift rotors can hold station in at the "
+                     "tilt limit, wing ignored.")
+            wind_now = float(m.get("wind_mps", 0.0))
+            if wind_now > 0 and float(m.get("hover_wind_drag_N", 0.0)) > 0:
+                tilt = float(m["hover_tilt_deg"])
+                lim_pitch = cfg.max_pitch_deg or cfg.max_tilt_deg
+                lim_roll = cfg.max_roll_deg or cfg.max_tilt_deg
+                ok = (tilt <= cfg.max_tilt_deg and float(m["hover_pitch_deg"]) <= lim_pitch
+                      and float(m["hover_roll_deg"]) <= lim_roll)
+                _row(rotor_status_tv, "Hover tilt in this wind",
+                     f"{tilt:.1f} deg (pitch {float(m['hover_pitch_deg']):.1f}, "
+                     f"roll {float(m['hover_roll_deg']):.1f})",
+                     f"<= {cfg.max_tilt_deg:.0f} deg", "ok" if ok else "bad",
+                     "Tilt needed to hold station against the airframe's side "
+                     "drag, against the tilt, pitch and roll limits.")
+            if not vectored:
+                margin = float(m["thrust_margin_pct"])
+                _row(rotor_status_tv, "Cruise thrust margin", _f(margin, "{:.0f} %"),
+                     ">= 30 %", _at_least(margin, 30.0, 0.5) if math.isfinite(margin) else "na",
+                     "Forward thrust in hand at the cruise speed, for climbing "
+                     "and accelerating.")
 
         conns = dict(getattr(cfg, "connectors", {}) or {})
         if conns:
@@ -3616,14 +6173,6 @@ def launch_gui(args=None) -> None:
                  f"{m.get('station_regime', '')}. Translational lift makes "
                  f"that cheaper than still-air hover.")
 
-        esc_loss = float(m.get("esc_loss_W", 0.0))
-        if esc_loss > 0:
-            _row(motor_status_tv, "ESC + motor loss at cruise",
-                 f"{esc_loss:.1f} W", "—", "na",
-                 f"{esc_loss / max(float(m.get('total_power_W', 0.0)), 1e-9) * 100:.1f}% "
-                 f"of pack power. The VTOL model folds motor losses into the "
-                 f"ESC efficiency, so this covers both.")
-
         _size_status_tables()
 
     # ---- Mission Plots -------------------------------------------------
@@ -3660,6 +6209,37 @@ def launch_gui(args=None) -> None:
         ("drag_N", "Drag (N)"),
         ("lift_share_wing", "Wing lift share (—)"),
         ("tilt_deg", "Rotor tilt (deg)"),
+        # The multicopter's and fixed-wing's mission variables.
+        ("commanded_airspeed_mps", "Commanded airspeed (m/s)"),
+        ("groundspeed_mps", "Groundspeed (m/s)"),
+        ("headwind_mps", "Headwind (m/s)"),
+        ("crosswind_mps", "Crosswind (m/s)"),
+        ("accel_mps2", "Acceleration (m/s²)"),
+        ("kinetic_power_W", "Kinetic power (W)"),
+        ("potential_power_W", "Climb (potential) power (W)"),
+        ("battery_voltage_V", "Battery voltage, loaded (V)"),
+        ("battery_loss_W", "Battery I²R loss (W)"),
+        ("esc_loss_W", "ESC loss (W)"),
+        ("motor_loss_W", "Motor loss (W)"),
+        ("systems_power_W", "Avionics + peripherals (W)"),
+        ("lift_motor_current_A", "Lift motor current (A)"),
+        ("lift_motor_rpm", "Lift motor RPM"),
+        ("lift_motor_throttle", "Lift motor throttle (—)"),
+        ("lift_motor_power_W", "Lift motor power, each (W)"),
+        ("lift_thrust_per_rotor_N", "Thrust per lift rotor (N)"),
+        ("cruise_motor_current_A", "Cruise motor current (A)"),
+        ("cruise_motor_rpm", "Cruise motor RPM"),
+        ("cruise_motor_throttle", "Cruise motor throttle (—)"),
+        ("cruise_motor_power_W", "Cruise motor power, each (W)"),
+        ("lift_tip_mach", "Lift rotor tip Mach (—)"),
+        ("advance_ratio_mu", "Lift rotor advance ratio μ (—)"),
+        ("cl_wing", "Wing CL (—)"),
+        ("lift_drag_ratio", "L/D (—)"),
+        ("motor_temp_est_C", "Motor temperature (°C)"),
+        ("esc_temp_est_C", "ESC temperature (°C)"),
+        ("battery_temp_est_C", "Battery temperature (°C)"),
+        ("reserve_target_Wh", "Reserve target (Wh)"),
+        ("reserve_breach", "Reserve breached (1/0)"),
     ]
 
     mplot_controls = ttk.LabelFrame(tab_mplots, text="Y-axis variables",
@@ -3891,7 +6471,8 @@ def launch_gui(args=None) -> None:
         rows = core.build_power_budget(
             total_in_W=float(m.get("total_power_W", 0.0)),
             motor_shaft_W=float(m.get("shaft_power_W", 0.0)),
-            motor_copper_W=0.0,
+            motor_copper_W=float(m.get("motor_copper_W", 0.0)),
+            motor_iron_W=float(m.get("motor_iron_W", 0.0)),
             battery_i2r_W=pack_I ** 2 * cfg.battery.pack_resistance,
             esc_loss_W=float(m.get("esc_loss_W", 0.0)),
             wire_loss_W=float(m.get("wire_loss_W", 0.0)),
@@ -3919,9 +6500,10 @@ def launch_gui(args=None) -> None:
                                   else str(r["current"]))))
         pb_scope.configure(text=(
             f"At the cruise speed of {float(m.get('airspeed_mps', 0.0)):.1f} m/s "
-            f"({m.get('regime', '')}). Motor losses are folded into the ESC "
-            f"efficiency and rotor losses into the figure of merit, so there is "
-            f"no separate motor copper-loss line."))
+            f"({m.get('regime', '')}). Motor losses come from the Kv / Rm / I0 "
+            f"model; rotor aerodynamic losses are inside the shaft power, through "
+            f"the figure of merit and propeller efficiency. A motor covered by a "
+            f"bench table has its loss inside the measured power instead."))
 
         # Only the leaf rows: the subtotal and total rows are sums of these,
         # so charting them too would double the whole.
@@ -3986,10 +6568,16 @@ def launch_gui(args=None) -> None:
     sens_bar = ttk.Frame(tab_sens)
     sens_bar.grid(row=0, column=0, columnspan=2, sticky="ew")
     ttk.Label(sens_bar, text="Output:").pack(side="left")
+    # The multicopter's and fixed-wing's outputs join the VTOL's own.
     _SENS_POINT = ["Cruise power (W)", "Cruise endurance (min)", "Cruise range (km)",
-                   "Hover power (W)", "Hover endurance (min)", "Transition speed (m/s)"]
+                   "Hover power (W)", "Hover endurance (min)", "Transition speed (m/s)",
+                   "Stall speed (m/s)", "Pack current (A)", "Hover pack current (A)",
+                   "Hover efficiency (g/W)", "Lift motor current (A)",
+                   "Motor temperature (°C)", "L/D at cruise", "Best climb rate (m/s)",
+                   "Take-off roll (m)"]
     _SENS_MISSION = ["Mission energy (Wh)", "Mission time (min)",
-                     "Reserve margin (Wh)", "Peak power (W)"]
+                     "Mission distance (km)", "Reserve margin (Wh)", "Peak power (W)",
+                     "Minimum SoC (%)", "Peak pack current (A)", "Peak motor temp (°C)"]
     v_sens_out = tk.StringVar(value=_SENS_POINT[0])
     sens_box = ttk.Combobox(sens_bar, textvariable=v_sens_out, state="readonly",
                             width=24, values=_SENS_POINT)
@@ -4025,6 +6613,34 @@ def launch_gui(args=None) -> None:
         ("Avionics power", lambda c, f: setattr(c, "avionics_power_W", c.avionics_power_W * f)),
         ("Hover download", lambda c, f: setattr(
             c, "hover_download_fraction", hover_download_fraction(c) * f)),
+        # The multicopter's and fixed-wing's levers.
+        ("Lift motor Kv", lambda c, f: setattr(c, "lift_motor_kv", c.lift_motor_kv * f)),
+        ("Lift motor resistance", lambda c, f: setattr(
+            c, "lift_motor_resistance", c.lift_motor_resistance * f)),
+        ("Lift prop pitch", lambda c, f: setattr(c, "lift_prop_pitch_in", c.lift_prop_pitch_in * f)),
+        ("Cruise motor Kv", lambda c, f: setattr(c, "cruise_motor_kv", c.cruise_motor_kv * f)),
+        ("Cruise motor resistance", lambda c, f: setattr(
+            c, "cruise_motor_resistance", c.cruise_motor_resistance * f)),
+        ("Cruise prop diameter", lambda c, f: setattr(
+            c, "cruise_prop_diameter_in", c.cruise_prop_diameter_in * f)),
+        ("Cruise prop pitch", lambda c, f: setattr(
+            c, "cruise_prop_pitch_in", c.cruise_prop_pitch_in * f)),
+        ("Motor no-load current", lambda c, f: (
+            setattr(c, "lift_motor_i0_A", c.lift_motor_i0_A * f),
+            setattr(c, "cruise_motor_i0_A", c.cruise_motor_i0_A * f))),
+        ("Stopped-rotor drag area", lambda c, f: setattr(
+            c, "_stopped_rotor_drag_area_m2", c.stopped_rotor_drag_area_m2 * f)),
+        ("Wing span", lambda c, f: setattr(c, "wing_span_m", c.wing_span_m * f)),
+        ("CL_max", lambda c, f: setattr(c, "CL_max", c.CL_max * f)),
+        ("CL cap in transition", lambda c, f: setattr(
+            c, "CL_cruise_max", min(c.CL_cruise_max * f, c.CL_max))),
+        ("Air density", lambda c, f: setattr(c, "air_density", c.air_density * f)),
+        ("Battery resistance", lambda c, f: setattr(
+            c.battery, "resistance_cell", c.battery.resistance_cell * f)),
+        ("ESC efficiency", lambda c, f: setattr(
+            c, "esc_efficiency", min(c.esc_efficiency * f, 1.0))),
+        ("Peripheral current", lambda c, f: setattr(
+            c, "periph_current_A", c.periph_current_A * f)),
     ]
 
     def _set_sens_mode(from_mission):
@@ -4058,11 +6674,17 @@ def launch_gui(args=None) -> None:
                         cfg, mission, wind_mps=_sens_state.get("wind", 0.0),
                         wind_direction_deg=_sens_state.get("wind_dir", 0.0),
                         max_accel_mps2=_sens_state.get("accel", 0.0),
+                        max_decel_mps2=_sens_state.get("decel", 0.0),
                         regen_eff=_sens_state.get("regen", 0.0))
+                    worst = tot["worst"]
                     return {"Mission energy (Wh)": tot["energy_Wh"],
                             "Mission time (min)": tot["time_s"] / 60.0,
-                            "Reserve margin (Wh)": tot["worst"]["reserve_margin_Wh"],
-                            "Peak power (W)": tot["worst"]["total_power_W"]}[choice]
+                            "Mission distance (km)": tot["distance_m"] / 1000.0,
+                            "Reserve margin (Wh)": worst["reserve_margin_Wh"],
+                            "Peak power (W)": worst["total_power_W"],
+                            "Minimum SoC (%)": worst["min_soc_pct"],
+                            "Peak pack current (A)": worst["pack_current_A"],
+                            "Peak motor temp (°C)": worst["motor_temp_est_C"]}[choice]
                 # The same wind as the run this sensitivity is based on:
                 # "Cruise range" depends on it, so a still-air sweep here
                 # would disagree with the number on the Metrics tab.
@@ -4076,7 +6698,16 @@ def launch_gui(args=None) -> None:
                         "Cruise range (km)": mm["cruise_range_km"],
                         "Hover power (W)": mm["hover_power_W"],
                         "Hover endurance (min)": mm["hover_endurance_min"],
-                        "Transition speed (m/s)": mm["transition_speed_mps"]}[choice]
+                        "Transition speed (m/s)": mm["transition_speed_mps"],
+                        "Stall speed (m/s)": mm["stall_speed_mps"],
+                        "Pack current (A)": mm["pack_current_A"],
+                        "Hover pack current (A)": mm["hover_pack_current_A"],
+                        "Hover efficiency (g/W)": mm["hover_efficiency_gW"],
+                        "Lift motor current (A)": mm["hover_lift_current_A"],
+                        "Motor temperature (°C)": mm["motor_temp_est_C"],
+                        "L/D at cruise": mm["ld_cruise"],
+                        "Best climb rate (m/s)": mm["max_roc_mps"],
+                        "Take-off roll (m)": mm["takeoff_roll_m"]}[choice]
             except Exception:
                 return None
         evaluate.base_config = base
@@ -4128,7 +6759,36 @@ def launch_gui(args=None) -> None:
                   ("lift_share_wing", "Wing lift share", 3),
                   ("esc_loss_W", "ESC loss (W)", 2),
                   ("wire_loss_W", "Wire loss (W)", 2),
-                  ("all_up_weight_g", "All-up weight (g)", 0)]
+                  ("all_up_weight_g", "All-up weight (g)", 0),
+                  # The multicopter's and fixed-wing's Compare rows.
+                  ("v_load_V", "Loaded voltage (V)", 2),
+                  ("rotor_thrust_N", "Rotor thrust at cruise (N)", 2),
+                  ("hover_efficiency_gW", "Hover efficiency (g/W)", 2),
+                  ("hover_figure_of_merit", "Figure of merit (achieved)", 3),
+                  ("disc_loading_N_m2", "Disc loading (N/m²)", 1),
+                  ("wing_loading_N_m2", "Wing loading (N/m²)", 1),
+                  ("lift_twr", "Lift thrust-to-weight", 2),
+                  ("ld_cruise", "L/D at cruise", 2),
+                  ("cl_cruise", "CL at cruise", 3),
+                  ("roc_at_cruise_mps", "Rate of climb at cruise (m/s)", 2),
+                  ("max_roc_mps", "Best climb rate (m/s)", 2),
+                  ("glide_ratio", "Glide ratio", 2),
+                  ("best_endurance_speed_mps", "Best endurance speed (m/s)", 2),
+                  ("best_range_speed_mps", "Best range speed (m/s)", 2),
+                  ("takeoff_roll_m", "Take-off roll (m)", 1),
+                  ("reynolds_number", "Reynolds number", 0),
+                  ("groundspeed_mps", "Groundspeed (m/s)", 2),
+                  ("reserve_margin_Wh", "Reserve margin (Wh)", 2),
+                  ("forward_thrust_available_N", "Forward thrust available (N)", 2),
+                  ("hover_lift_current_A", "Lift motor current, hover (A)", 2),
+                  ("cruise_motor_current_A", "Cruise motor current (A)", 2),
+                  ("hover_lift_rpm", "Lift RPM, hover", 0),
+                  ("hover_lift_tip_mach", "Lift tip Mach, hover", 3),
+                  ("motor_loss_W", "Motor losses (W)", 2),
+                  ("battery_loss_W", "Pack I2R loss (W)", 2),
+                  ("motor_temp_est_C", "Motor temp (°C)", 1),
+                  ("esc_temp_est_C", "ESC temp (°C)", 1),
+                  ("battery_temp_est_C", "Battery temp (°C)", 1)]
     _CMP_MISSION = [("energy_Wh", "Mission energy (Wh)", 2),
                     ("time_min", "Mission time (min)", 2),
                     ("distance_km", "Distance (km)", 3),
@@ -4138,7 +6798,12 @@ def launch_gui(args=None) -> None:
                     ("remaining_Wh", "Energy remaining (Wh)", 2),
                     ("peak_power_W", "Peak power (W)", 1),
                     ("peak_current_A", "Peak pack current (A)", 2),
-                    ("reserve_margin_Wh", "Lowest reserve margin (Wh)", 2)]
+                    ("reserve_margin_Wh", "Lowest reserve margin (Wh)", 2),
+                    ("min_soc_pct", "Minimum SoC (%)", 1),
+                    ("peak_lift_current_A", "Peak lift motor current (A)", 2),
+                    ("peak_motor_temp_C", "Peak motor temp (°C)", 1),
+                    ("peak_esc_temp_C", "Peak ESC temp (°C)", 1),
+                    ("peak_battery_temp_C", "Peak battery temp (°C)", 1)]
 
     def refresh_comparison():
         _clear_tree(cmp_tv)
@@ -4238,11 +6903,16 @@ def launch_gui(args=None) -> None:
     def update_rotor_loading(cfg, m):
         _clear_tree(rl_tv)
         n = max(int(cfg.num_lift_rotors), 1)
-        total_N = cfg.weight_N * (1.0 + hover_download_fraction(cfg))
-        per_N = total_N / n
+        # Held in the run's wind: with a drag height above the CG entered,
+        # the rotors downwind carry more than those upwind.
+        thrusts = hover_rotor_thrusts(cfg, float(m.get("wind_mps", 0.0) or 0.0),
+                                      float(m.get("wind_direction_deg", 0.0) or 0.0),
+                                      float(m.get("course_deg", 0.0) or 0.0))
+        total_N = sum(thrusts)
         rated_N = (cfg.lift_prop_max_thrust_g / 1000.0 * 9.80665
                    if getattr(cfg, "lift_prop_max_thrust_g", 0) else None)
         for i in range(1, n + 1):
+            per_N = thrusts[i - 1] if i - 1 < len(thrusts) else total_N / n
             if rated_N:
                 margin = (rated_N - per_N) / rated_N * 100.0
                 tag = ("bad" if margin < 0 else "warn" if margin < 20 else "ok")
@@ -4251,7 +6921,7 @@ def launch_gui(args=None) -> None:
                 tag, margin_text = "na", "no rated thrust entered"
             rl_tv.insert("", "end", tags=(tag,), values=(
                 f"{i}", f"{per_N:.1f}", f"{per_N / 9.80665 * 1000:.0f}",
-                f"{100.0 / n:.1f}%", margin_text))
+                f"{per_N / max(total_N, 1e-9) * 100.0:.1f}%", margin_text))
         rl_tv.insert("", "end", tags=("total",), values=(
             "TOTAL", f"{total_N:.1f}", f"{total_N / 9.80665 * 1000:.0f}",
             "100%", ""))
@@ -4289,24 +6959,35 @@ def launch_gui(args=None) -> None:
         return (title, headers, rows)
 
     def _sweep_section(cfg):
-        """The speed sweep behind the Fixed Speed Plots, as numbers."""
-        speeds, rows = [], []
-        # Plot Settings wins when a maximum was entered.
-        v_max = (opt("plot_vmax")
-                 or max(cfg.cruise_speed_mps * 1.6,
-                        transition_speed_mps(cfg) * 1.6))
-        steps = 40
-        for i in range(steps + 1):
-            v = v_max * i / steps
-            point = power_at_airspeed(cfg, v)
-            rows.append([round(v, 2), round(point["total_power_W"], 1),
-                         point.get("regime", ""),
-                         round(float(point.get("tilt_deg", 0.0)), 1),
-                         round(float(point.get("lift_share_wing", 0.0)), 3)])
-            speeds.append(v)
-        return ("Speed Sweep",
-                ["Airspeed (m/s)", "Total power (W)", "Regime", "Tilt (deg)",
-                 "Wing lift share"], rows)
+        """
+        The speed sweep behind the Fixed Speed Plots, as numbers — built from
+        the same data the panels draw, so each column is a curve on screen.
+        """
+        d = _sweep_data(cfg)
+        cols = [("Airspeed (m/s)", "speed", 2), ("Total power (W)", "total", 1),
+                ("Shaft power (W)", "shaft", 1), ("Lift rotor shaft (W)", "rotor_W", 1),
+                ("Cruise prop shaft (W)", "cruise_W", 1), ("Endurance (min)", "endurance", 2),
+                ("Range (km)", "range", 3), ("Regime", "regime", None),
+                ("Tilt (deg)", "tilt", 1), ("Wing lift share", "share", 3),
+                ("Rotor thrust (N)", "rotor_N", 2), ("Wing lift (N)", "wing_N", 2),
+                ("Thrust required (N)", "thrust_req", 2),
+                ("Thrust available (N)", "thrust_avail", 2),
+                ("Rate of climb (m/s)", "roc", 2), ("Drag induced (N)", "drag_induced", 2),
+                ("Drag CD0 (N)", "drag_cd0", 2), ("Drag stopped rotors (N)", "drag_stopped", 2),
+                ("Drag fuselage/booms (N)", "drag_body", 2), ("Drag total (N)", "drag_total", 2)]
+        rows = []
+        for i in range(len(d["speed"])):
+            row = []
+            for _h, key, dec in cols:
+                value = d[key][i]
+                if dec is None:
+                    row.append(value)
+                elif value != value:
+                    row.append("")
+                else:
+                    row.append(round(float(value), dec))
+            rows.append(row)
+        return ("Speed Sweep", [h for h, _k, _d in cols], rows)
 
     def _export_sections():
         cfg = _export_state["cfg"]
@@ -4417,7 +7098,11 @@ def launch_gui(args=None) -> None:
                 story.append(table)
                 story.append(Spacer(1, 5 * mm))
 
-            for maker in (lambda: make_airframe_diagram_figure(cfg, figsize=(7, 5.8)),):
+            makers = [lambda: make_airframe_diagram_figure(cfg, figsize=(7, 5.8))]
+            if not _export_state["from_mission"] and _export_state.get("metrics"):
+                makers.append(lambda: make_motor_figure(
+                    cfg, _export_state["metrics"], (10, 4.2 * (1 if uses_vectored_thrust(cfg) else 2))))
+            for maker in makers:
                 try:
                     fig = maker()
                 except Exception:
@@ -4527,7 +7212,7 @@ def launch_gui(args=None) -> None:
         if cfg is None or _export_state.get("from_mission"):
             return
         try:
-            draw_plots(cfg)
+            draw_plots(cfg, _export_state.get("metrics"))
         except Exception:
             pass
 
@@ -4634,13 +7319,15 @@ def launch_gui(args=None) -> None:
             "Modelled: momentum-theory hover with a figure of merit, wing "
             "lift and drag from CD0 and the Oswald factor, the transition "
             "between them, vectored-thrust force balance, hover download, "
+            "a Kv / Rm / I0 motor model (RPM, current, throttle, losses), "
             "pack sag from a state-of-charge curve, ESC and wiring losses, "
-            "and time-stepped missions.\n\n"
-            "NOT modelled: rotor-to-rotor and rotor-to-wing interference, "
-            "blade-element aerodynamics, control-system behaviour, "
-            "structural loads, or any thermal limit. Motor losses are "
-            "folded into the ESC efficiency rather than given a separate "
-            "electrical model.\n\n"
+            "climb, ceiling, turns, glide and runway figures from the "
+            "fixed-wing, lumped thermal estimates, and time-stepped "
+            "missions.\n\n"
+            "NOT modelled: rotor-to-rotor and rotor-to-wing interference "
+            "(beyond the coaxial penalty), blade-element aerodynamics, "
+            "control-system behaviour or structural loads. Temperatures are "
+            "lumped estimates, not a thermal model of any real part.\n\n"
             "This is a performance-level model. It is for comparing designs "
             "and sizing a pack, not for certifying one.")
 
@@ -4690,29 +7377,6 @@ def launch_gui(args=None) -> None:
             return default
         return float(raw)
 
-    def _parse_rails(spec: str) -> dict:
-        """
-        "5:2:0.9, 12:1.5:0.87" into {volts: (amps, efficiency)}.
-
-        Stored as one string so the rails save and load with every other
-        field rather than needing their own serialisation path.
-        """
-        rails = {}
-        for part in str(spec or "").split(","):
-            part = part.strip()
-            if not part:
-                continue
-            bits = part.split(":")
-            if len(bits) != 3:
-                continue
-            try:
-                volts, amps, eff = (float(b) for b in bits)
-            except ValueError:
-                continue
-            if volts > 0 and amps >= 0 and 0 < eff <= 1:
-                rails[volts] = (amps, eff)
-        return rails
-
     def opt(key):
         """An optional numeric field: None when blank, a clear error when not a number."""
         var = fields.get(key)
@@ -4726,119 +7390,16 @@ def launch_gui(args=None) -> None:
         except ValueError:
             raise ValueError(f"'{raw}' is not a number (field: {key})")
 
-    def _airframe_weight_g() -> float:
-        """
-        Airframe weight, by whichever route the user chose.
-
-        "derive structure" is the original behaviour: they give the airframe
-        weight and structure falls out as the residual. "enter structure"
-        runs it the other way, for when the frame is known and the components
-        are still being chosen.
-        """
-        entered = num("weight", 6000)
-        if fields["mass_mode"].get() != "enter structure":
-            return entered
-        structure = opt("structure_mass") or 0.0
-        parts = ((opt("cell_wt") or 0.0) * int(num("series", 1)) * int(num("parallel", 1))
-                 + (opt("lift_wt") or 0.0) * int(num("n_lift", 1))
-                 + (opt("lift_prop_wt") or 0.0) * int(num("n_lift", 1))
-                 + (opt("cruise_wt") or 0.0) * int(num("n_cruise", 0))
-                 + (opt("cruise_prop_wt") or 0.0) * int(num("n_cruise", 0))
-                 + (opt("avionics_mass") or 0.0))
-        return structure + parts
+    def field_values() -> dict:
+        """Every input field's current text, keyed by field name."""
+        return {key: var.get() for key, var in fields.items()}
 
     def build_config() -> VTOLConfig:
-        battery = VTOLBattery(
-            chemistry=fields["chem"].get().strip() or "LiPo",
-            cell_capacity_mAh=num("cell_cap", 5000),
-            series_cells=int(num("series", 6)),
-            parallel_cells=int(num("parallel", 1)),
-            cell_weight_g=num("cell_wt", 120),
-            voltage_min=num("vmin", 3.3), voltage_nominal=num("vnom", 3.7),
-            voltage_max=num("vmax", 4.2),
-            resistance_cell_mOhm=num("rcell", 4.0),
-            usable_percent=num("usable", 80),
-            discharge_c_cont=opt("c_cont"),
-            discharge_c_max=opt("c_max"),
-            soc_curve_csv=(fields["soc_curve"].get().strip() or None),
-            soc_model=(fields["soc_model"].get().strip() or "auto"),
-            unit_mode=(fields["unit_mode"].get().strip() or "cell"),
-            cells_series_per_unit=int(opt("cells_s_per_pack") or 1),
-            cells_parallel_per_unit=int(opt("cells_p_per_pack") or 1),
-            pack_capacity_mAh=opt("pack_cap"),
-            pack_weight_g=opt("pack_wt"),
-            energy_density_Wh_per_kg=opt("energy_density"),
-            discharge_cont_A=opt("a_cont"),
-            discharge_max_A=opt("a_max"),
-            charge_current_max_A=opt("charge_a"),
-            soc_bp=_parse_float_list(fields["soc_bp"].get()),
-            ocv_cell_bp=_parse_float_list(fields["ocv_cell_bp"].get()),
-            r_scale_bp=_parse_float_list(fields["r_scale_bp"].get()),
-        )
-        temp = fields["temp"].get().strip()
-        return VTOLConfig(
-            config_type=v_config_type.get(),
-            aircraft_weight_g=_airframe_weight_g(),
-            payload_mass_g=num("payload", 0),
-            wing_span_m=num("span", 2.4), wing_area_m2=num("area", 0.6),
-            CD0=num("cd0", 0.035), oswald=num("oswald", 0.8),
-            CL_max=num("clmax", 1.2), CL_cruise_max=num("clcruise", 0.9),
-            num_lift_rotors=int(num("n_lift", 4)),
-            lift_prop_diameter_in=num("lift_d", 18),
-            lift_prop_pitch_in=num("lift_p", 6),
-            lift_motor_kv=num("lift_kv", 300),
-            lift_motor_resistance=num("lift_rm", 0.08),
-            lift_motor_weight_g=num("lift_wt", 200),
-            lift_figure_of_merit=num("fom", 0.65),
-            num_cruise_motors=int(num("n_cruise", 1)),
-            cruise_prop_diameter_in=num("cruise_d", 14),
-            cruise_prop_pitch_in=num("cruise_p", 8),
-            cruise_motor_kv=num("cruise_kv", 500),
-            cruise_motor_resistance=num("cruise_rm", 0.06),
-            cruise_motor_weight_g=num("cruise_wt", 180),
-            cruise_prop_efficiency=num("cruise_eff", 0.75),
-            stopped_rotor_drag_area_m2=(num("stopped_area")
-                                        if fields["stopped_area"].get().strip() else None),
-            battery=battery,
-            avionics_power_W=(opt("avionics_flat") or num("avionics", 15)),
-            periph_current_A=(opt("periph_current") or 0.0),
-            # The ESC tab's field wins; the old Mission/Env one is kept as a
-            # fallback so configs saved before the tab existed still load.
-            esc_efficiency=(opt("esc_eff_tab") or num("esc_eff", 0.96)),
-            esc_resistance_ohm=opt("esc_r") or 0.0,
-            esc_max_current_A=opt("esc_imax"),
-            esc_weight_g=(opt("esc_wt") or 0.0),
-            avionics_rails=_parse_rails(fields["avionics_rails"].get()),
-            # Pressure overrides the altitude-derived value, which is what
-              # a field barometer reading is for: the standard atmosphere is
-              # an average, and a real day is not.
-            air_density=core.air_density(num("alt", 0),
-                                         float(temp) if temp else None,
-                                         opt("pressure")),
-            cruise_speed_mps=num("cruise_v", 22),
-            reference_altitude_m=num("alt", 0),
-            wire_resistance_ohm=core.wire_resistance_ohm(
-                opt("wire_len") or 0.0,
-                awg=int(opt("wire_awg")) if opt("wire_awg") else None,
-                ohm_per_m=opt("wire_ohm_m")),
-            connectors={
-                name: (opt(f"{prefix}_cont") or 0.0, opt(f"{prefix}_max") or 0.0)
-                for name, prefix in (("Battery", "conn_batt"), ("ESC", "conn_esc"),
-                                     ("Motor", "conn_motor"))
-                if (opt(f"{prefix}_cont") or 0.0) > 0 or (opt(f"{prefix}_max") or 0.0) > 0
-            },
-            hover_download_fraction=opt("download"),
-            lift_motor_max_power_W=opt("lift_pmax"),
-            lift_motor_max_current_A=opt("lift_imax"),
-            lift_prop_max_thrust_g=opt("lift_max_thrust") or 0.0,
-            cruise_motor_max_current_A=opt("cruise_imax"),
-            cruise_motor_max_power_W=opt("cruise_pmax"),
-            lift_prop_table_csv=(fields["lift_table"].get().strip() or None),
-            cruise_prop_table_csv=(fields["cruise_table"].get().strip() or None),
-            lift_prop_weight_g=opt("lift_prop_wt") or 0.0,
-            cruise_prop_weight_g=opt("cruise_prop_wt") or 0.0,
-            avionics_mass_g=opt("avionics_mass") or 0.0,
-        )
+        """
+        The aircraft on screen. Built by the same function the CLI and the
+        batch driver use, so a config saved here gives the same answer there.
+        """
+        return config_from_fields(field_values(), v_config_type.get())
 
     # What each metric means, keyed by its label. Kept beside the table
     # rather than inside show_metrics so the row list stays readable.
@@ -4990,29 +7551,166 @@ def launch_gui(args=None) -> None:
             return f"{grams:.0f} g  ({grams / 1000.0:.2f} kg)"
         return f"{grams:.0f} g"
 
-    def show_metrics(m):
+    def _f(x, fmt="{:.2f}", na="n/a"):
+        """Format a number, or say n/a for a missing or non-finite one."""
+        try:
+            x = float(x)
+        except (TypeError, ValueError):
+            return na
+        if not math.isfinite(x):
+            return na
+        return fmt.format(x)
+
+    def _km(km: float) -> str:
+        return f"{km:.2f} km  ({km * 0.539957:.2f} NM / {km * 0.621371:.2f} mi)"
+
+    def _motor_section(title, prefix, m, cfg, group, label):
+        """
+        One motor-and-propeller operating point, the rows the multicopter's
+        "Motor @ Operating Point" and the fixed-wing's motor rows carry.
+        """
+        g = _group(cfg, group)
+        _metrics_add_section(title)
+        rpm = float(m.get(f"{prefix}_rpm", 0.0))
+        if rpm <= 0:
+            _metrics_row(f"{label} state", "stopped",
+                         "Not turning at this operating point.")
+            return
+        _metrics_row(f"{label} Kv", f"{_f(g['kv'], '{:.0f}')} rpm/V")
+        _metrics_row(f"{label} Kt", f"{_f(m.get(f'{group}_kt'), '{:.4f}')} Nm/A",
+                     "Torque per amp, 60 / (2 pi Kv).")
+        _metrics_row(f"{label} no-load current", f"{_f(g['i0'])} A")
+        _metrics_row(f"{label} resistance", f"{_f(float(g['rm'] or 0) * 1000, '{:.1f}')} mΩ")
+        _metrics_row(f"{label} RPM", f"{rpm:.0f} rpm  ({_f(m.get(f'{prefix}_erpm'), '{:.0f}')} eRPM)",
+                     "Mechanical RPM, and the electrical RPM the ESC commutates "
+                     "(RPM x poles / 2).")
+        _metrics_row(f"{label} current", f"{_f(m.get(f'{prefix}_current_A'))} A",
+                     "Winding current: torque over Kt, plus the no-load current.")
+        _metrics_row(f"{label} back-EMF", f"{_f(m.get(f'{prefix}_v_emf_V'))} V")
+        _metrics_row(f"{label} terminal voltage", f"{_f(m.get(f'{prefix}_v_term_V'))} V",
+                     "Back-EMF plus the I x Rm drop — what the ESC must supply.")
+        throttle = float(m.get(f"{prefix}_throttle", float("nan")))
+        _metrics_row(f"{label} throttle",
+                     _f(throttle * 100.0, "{:.0f} %")
+                     + ("  ⚠ above 100% — the pack cannot spin it this fast"
+                        if m.get(f"{prefix}_saturated") else ""),
+                     "Terminal voltage over pack voltage. Above 100% the motor "
+                     "cannot reach the RPM this thrust needs: a lower-Kv motor, "
+                     "more pitch or more cells is required.")
+        _metrics_row(f"{label} electrical power", f"{_f(m.get(f'{prefix}_elec_W'), '{:.1f}')} W")
+        _metrics_row(f"{label} shaft power", f"{_f(m.get(f'{prefix}_shaft_W'), '{:.1f}')} W")
+        _metrics_row(f"{label} efficiency", _f(float(m.get(f"{prefix}_motor_eff", 1.0)) * 100, "{:.1f} %")
+                     + ("  (inside the bench table)" if m.get(f"{prefix}_measured") else ""),
+                     "Shaft power over electrical power.")
+        _metrics_row(f"{label} copper loss", f"{_f(m.get(f'{prefix}_copper_W'))} W", "I² x Rm.")
+        _metrics_row(f"{label} no-load loss", f"{_f(m.get(f'{prefix}_iron_W'))} W",
+                     "No-load current times back-EMF: iron and bearing loss.")
+        _metrics_row(f"{label} torque", f"{_f(m.get(f'{prefix}_torque_Nm'), '{:.3f}')} Nm")
+        thrust = float(m.get(f"{prefix}_thrust_N", 0.0))
+        _metrics_row(f"{label} thrust", f"{thrust / G0 * 1000:.0f} g  ({thrust:.2f} N)")
+        _metrics_row(f"{label} thrust per watt",
+                     f"{_f(m.get(f'{prefix}_thrust_per_W_g'))} g/W")
+        _metrics_row(f"{label} rated current",
+                     "not entered" if not g["imax"] else f"{float(g['imax']):.0f} A")
+        _metrics_row(f"{label} rated power",
+                     "not entered" if not g["pmax"] else f"{float(g['pmax']):.0f} W")
+        size = cfg.lift_motor_size if group == "lift" else cfg.cruise_motor_size
+        _metrics_row(f"{label} poles / size", f"{g['poles']} poles" + (f", {size}" if size else ""))
+
+    def show_metrics(m, cfg=None):
         for item in metrics_tv.get_children():
             metrics_tv.delete(item)
+        vectored = cfg is not None and uses_vectored_thrust(cfg)
 
         _metrics_add_section("Aircraft")
         _metrics_row("Configuration", str(m["config_type"]))
         _metrics_row("Regime at cruise speed", str(m["regime"]))
         _metrics_row("All-up weight",
                      f"{_mass(m['all_up_weight_g'])}  ({m['weight_N']:.1f} N)")
-        _metrics_row("Wing loading", f"{m['wing_loading_N_m2']:.1f} N/m²")
+        _metrics_row("Payload", f"{_mass(m['payload_mass_g'])}  "
+                     f"({_f(m.get('payload_fraction', 0) * 100, '{:.1f}')}% of AUW)")
+        _metrics_row("Battery mass fraction", _f(m.get("battery_mass_fraction", 0) * 100, "{:.1f} %"),
+                     "Pack mass over all-up weight. A VTOL carries its hover "
+                     "motors all the way through cruise, so it cannot spend as "
+                     "much of its weight on battery as a pure fixed-wing.")
+        _metrics_row("Drive mass fraction", _f(m.get("drive_mass_fraction", 0) * 100, "{:.1f} %"),
+                     "Motors, propellers and ESCs over all-up weight.")
+        _metrics_row("Wing loading", f"{m['wing_loading_N_m2']:.1f} N/m²  "
+                     f"({m['wing_loading_N_m2'] / G0 * 100:.1f} g/dm²)")
         _metrics_row("Disc loading (hover)", f"{m['disc_loading_N_m2']:.1f} N/m²")
         _metrics_row("Aspect ratio", f"{m['aspect_ratio']:.2f}")
+        if cfg is not None:
+            _metrics_row("Mean chord", f"{_f(m.get('mean_chord_m'), '{:.3f}')} m")
+            _metrics_row("Induced drag factor k", f"{cfg.induced_drag_factor:.5f}",
+                         "1 / (pi AR e). Multiplies CL² to give the induced drag coefficient.")
+            _metrics_row("Lift rotor layout", cfg.lift_rotor_layout
+                         + (f", {cfg.coaxial_spacing_m:.3f} m spacing"
+                            if cfg.lift_rotor_layout == "coaxial" and cfg.coaxial_spacing_m else ""))
 
         _metrics_add_section("Speeds")
         _metrics_row("Stall speed", _speed(m["stall_speed_mps"]))
         _metrics_row("Transition speed", _speed(m["transition_speed_mps"]))
         _metrics_row("Cruise speed", _speed(m["airspeed_mps"]))
+        if "speed_over_stall" in m:
+            _metrics_row("Speed / stall margin", f"{m['speed_over_stall']:.2f} x Vs",
+                         "Cruise speed over stall speed. Below about 1.3 a gust "
+                         "or a turn can stall the wing.")
+            _metrics_row("Best endurance speed",
+                         f"{_speed(m['best_endurance_speed_mps'])}  → "
+                         f"{m['best_endurance_min']:.1f} min",
+                         "Where total power is lowest, searched from hover up. "
+                         "It can sit in the transition, where the rotors are "
+                         "still helping.")
+            _metrics_row("Best range speed",
+                         f"{_speed(m['best_range_speed_mps'])}  → {m['best_range_km']:.2f} km",
+                         "Where distance per watt-hour is greatest, over the "
+                         "ground in the entered wind.")
+            _metrics_row("Min-sink glide speed",
+                         f"{_speed(m['min_sink_speed_mps'])}  "
+                         f"(sink {m['min_sink_rate_mps']:.2f} m/s)",
+                         "Slowest descent with the motors off and the rotors stopped.")
+            _metrics_row("Best glide speed (max L/D)", _speed(m["best_glide_speed_mps"]))
+            _metrics_row("Cruise vs best endurance", f"{m['cruise_vs_best_endurance_pct']:+.0f} %")
+            _metrics_row("Cruise vs best range", f"{m['cruise_vs_best_range_pct']:+.0f} %")
 
         _metrics_add_section("Hover")
         _metrics_row("Hover power", f"{m['hover_power_W']:.0f} W")
         _metrics_row("Hover endurance",
                      f"{m['hover_endurance_min']:.1f} min  "
                      f"({m['hover_endurance_min'] * 60:.0f} s)")
+        if "hover_efficiency_gW" in m:
+            _metrics_row("Hover endurance to reserve",
+                         f"{m['hover_endurance_to_reserve_min']:.1f} min",
+                         "Hover time before the reserve is reached.")
+            _metrics_row("Hover efficiency", f"{m['hover_efficiency_gW']:.2f} g/W",
+                         "Grams of thrust per watt of propulsion power, "
+                         "avionics excluded — the multicopter's headline figure.")
+            _metrics_row("Figure of merit (achieved)",
+                         f"{m['hover_figure_of_merit']:.3f}",
+                         "Ideal momentum power over the shaft power actually "
+                         "needed, coaxial and inflow penalties included.")
+            _metrics_row("Ideal hover power", f"{m['hover_ideal_power_W']:.0f} W",
+                         "T x sqrt(T / 2 rho A): the least any rotor of this disc "
+                         "area could need.")
+            _metrics_row("Hover shaft power", f"{m['hover_shaft_W']:.0f} W")
+            _metrics_row("Lift thrust available",
+                         f"{m['lift_thrust_available_N'] / G0 * 1000:.0f} g  "
+                         f"({m['lift_thrust_available_N']:.1f} N, {m['lift_thrust_source']})")
+            _metrics_row("Lift thrust-to-weight", _f(m["lift_twr"], "{:.2f}"),
+                         "Below about 1.5 there is little margin for gusts, "
+                         "descent control or a motor out.")
+            _metrics_row("Max extra payload", _f(m["max_extra_payload_g"], "{:.0f} g"),
+                         "Mass the lift rotors could still raise at full thrust, "
+                         "download included. Zero margin — not a flyable load.")
+            _metrics_row("Payload at TWR 2.0", _f(m["payload_at_twr2_g"], "{:.0f} g"),
+                         "Extra mass that keeps a 2:1 thrust margin, the usual "
+                         "multirotor sizing rule.")
+            _metrics_row("Hover wind limit",
+                         _f(m["hover_wind_limit_mps"], "{:.1f} m/s",
+                            "n/a — enter a profile area or body dimensions"),
+                         "Strongest wind the lift rotors can hold station in at "
+                         "the tilt limit. Ignores the wing's own lift, so it is "
+                         "conservative.")
 
         _metrics_add_section("Cruise")
         _metrics_row("Cruise power", f"{m['total_power_W']:.0f} W")
@@ -5027,6 +7725,17 @@ def launch_gui(args=None) -> None:
                         f"   [still air {m['cruise_range_still_air_km']:.2f} km]"))
         _metrics_row("Hover / cruise power",
                      f"{m['hover_to_cruise_power_ratio']:.2f} x")
+        if "specific_range_km_per_Wh" in m:
+            _metrics_row("Cruise endurance to reserve",
+                         f"{m['cruise_endurance_to_reserve_min']:.1f} min")
+            _metrics_row("Specific range", f"{m['specific_range_km_per_Wh']:.3f} km/Wh")
+            _metrics_row("Specific endurance", f"{m['specific_endurance_min_per_Wh']:.3f} min/Wh")
+            _metrics_row("Commanded climb / descent",
+                         f"{m['climb_rate_cmd_mps']:.2f} / {m['descent_rate_cmd_mps']:.2f} m/s  "
+                         f"({m['climb_power_add_W']:+.0f} W)",
+                         "A steady climb or descent at the cruise speed, entered "
+                         "on the Mission/Environment tab. Its potential power "
+                         "is already in the cruise power above.")
 
         _metrics_add_section("Wind")
         _metrics_row("Wind", _speed(m["wind_mps"])
@@ -5040,6 +7749,14 @@ def launch_gui(args=None) -> None:
                      f"{m['station_power_W']:.0f} W  ({m['station_regime']})")
         _metrics_row("Station-keeping endurance",
                      f"{m['station_endurance_min']:.1f} min")
+        if "hover_tilt_deg" in m:
+            _metrics_row("Hover tilt in this wind",
+                         f"{m['hover_tilt_deg']:.1f} deg  (pitch {m['hover_pitch_deg']:.1f}, "
+                         f"roll {m['hover_roll_deg']:.1f})",
+                         "Tilt the lift rotors need to hold station against the "
+                         "airframe's side drag, split by where the wind comes "
+                         "from. Zero until a profile area or body dimensions "
+                         "are entered.")
 
         _metrics_add_section("Battery")
         # NOT "Configuration": _METRIC_NOTES is keyed by label, and the
@@ -5049,12 +7766,32 @@ def launch_gui(args=None) -> None:
                      f"{m['battery_series_cells']}S x {m['battery_parallel_cells']}P  "
                      f"({m['battery_total_cells']} cells, entered by "
                      f"{m['battery_unit_mode']})")
+        if "battery_chemistry" in m:
+            _metrics_row("Chemistry", str(m["battery_chemistry"]))
         _metrics_row("Pack capacity",
                      f"{m['battery_capacity_mAh']:.0f} mAh  "
                      f"({m['battery_capacity_mAh'] / 1000.0:.2f} Ah)")
         _metrics_row("Pack current", f"{m['pack_current_A']:.2f} A")
         _metrics_row("Loaded voltage", f"{m['v_load_V']:.2f} V")
+        if "pack_v_full_V" in m:
+            _metrics_row("Pack voltage (full / nominal / cutoff)",
+                         f"{m['pack_v_full_V']:.2f} / {m['pack_v_nominal_V']:.2f} / "
+                         f"{m['pack_v_cutoff_V']:.2f} V")
+            _metrics_row("Voltage sag at cruise",
+                         f"{m['pack_sag_V']:.2f} V  "
+                         f"({m['pack_sag_V'] / max(m['pack_v_full_V'], 1e-9) * 100:.1f}% of full)")
+            _metrics_row("Pack resistance", f"{m['pack_resistance_ohm'] * 1000:.1f} mΩ")
+            _metrics_row("Pack I²R loss", f"{m['battery_loss_W']:.2f} W at cruise, "
+                         f"{m['hover_battery_loss_W']:.2f} W in hover")
+            _metrics_row("Cruise C-rate", f"{m['c_rate']:.2f} C")
+            _metrics_row("Hover C-rate (pack)", f"{m['hover_c_rate']:.2f} C")
+            _metrics_row("Energy (total)", f"{m['capacity_Wh']:.1f} Wh")
+            _metrics_row("Usable capacity", f"{m['usable_mAh']:.0f} mAh")
         _metrics_row("Usable energy", f"{m['usable_Wh']:.1f} Wh")
+        if "reserve_target_Wh" in m:
+            _metrics_row("Reserve target", f"{m['reserve_target_Wh']:.1f} Wh  "
+                         f"({m['reserve_percent']:.0f}% of usable)")
+            _metrics_row("Energy above reserve", f"{m['reserve_margin_Wh']:.1f} Wh")
         _metrics_row("Battery weight",
                      f"{_mass(m['battery_weight_g'])}  "
                      f"({m['battery_weight_g'] / max(m['all_up_weight_g'], 1e-9) * 100:.0f}% of AUW)")
@@ -5077,53 +7814,353 @@ def launch_gui(args=None) -> None:
         _metrics_row("Peripheral load at the pack",
                      f"{m['peripheral_power_W']:.1f} W")
 
+        if "propulsive_efficiency" in m:
+            _metrics_add_section("Thrust & Power")
+            _metrics_row("Thrust required at cruise", f"{m['thrust_required_N']:.2f} N",
+                         "Forward thrust the cruise propulsion must make — the drag.")
+            _metrics_row("Forward thrust available",
+                         f"{m['forward_thrust_available_N']:.2f} N at cruise, "
+                         f"{m['forward_static_thrust_N']:.1f} N static  ({m['cruise_thrust_source']})")
+            _metrics_row("Thrust margin at cruise", _f(m["thrust_margin_pct"], "{:.0f} %"))
+            _metrics_row("Forward thrust-to-weight", _f(m["forward_twr"], "{:.2f}"),
+                         "Static forward thrust over weight — what a conventional "
+                         "take-off and a wing-borne climb have to work with.")
+            _metrics_row("Propulsive power (T·V)", f"{m['propulsive_power_W']:.0f} W")
+            _metrics_row("Shaft power at cruise", f"{m['shaft_power_W']:.0f} W")
+            _metrics_row("Motor losses", f"{m['motor_loss_W']:.1f} W  "
+                         f"(copper {m['motor_copper_W']:.1f}, no-load {m['motor_iron_W']:.1f})")
+            _metrics_row("ESC losses", f"{m['esc_loss_W']:.1f} W",
+                         "Under load, from the ESC efficiency, plus any idle draw.")
+            _metrics_row("  ESC conduction / switching / idle",
+                         f"{m['esc_conduction_W']:.1f} / {m['esc_switching_W']:.1f} / "
+                         f"{m['esc_idle_W']:.1f} W",
+                         "Conduction is I²R from the ESC resistance, if entered; "
+                         "the rest of the under-load loss is switching.")
+            _metrics_row("Wire loss", f"{m['wire_loss_W']:.1f} W")
+            _metrics_row("Drive efficiency", f"{m['drive_efficiency'] * 100:.1f} %",
+                         "Shaft power over motor input — the motors' share of the losses.")
+            _metrics_row("System efficiency", f"{m['system_efficiency'] * 100:.1f} %",
+                         "Shaft power over pack power.")
+            _metrics_row("Propulsive efficiency", f"{m['propulsive_efficiency'] * 100:.1f} %",
+                         "Thrust power T·V over pack power: how much of the "
+                         "battery's output becomes useful work against drag.")
+            _metrics_row("Power loading", f"{m['power_loading_W_per_kg']:.0f} W/kg")
+
         _metrics_add_section("Aerodynamics")
         _metrics_row("Stopped-rotor drag area",
                      f"{m['stopped_rotor_drag_area_m2']*1e4:.0f} cm²")
+        if "cl_cruise" in m:
+            _metrics_row("Cruise CL", f"{m['cl_cruise']:.3f}")
+            _metrics_row("CL margin to stall", f"{m['cl_margin']:.3f}")
+            _metrics_row("Cruise CD", f"{m['cd_cruise']:.4f}  "
+                         f"(CD0 {m['cd_parasite']:.4f} + induced {m['cd_induced']:.4f})")
+            _metrics_row("Induced / parasitic ratio", f"{m['induced_parasite_ratio']:.2f}",
+                         "1.0 at the best-L/D speed; above 1 you are flying slow "
+                         "for your weight, below it fast.")
+            _metrics_row("Induced drag", f"{m['drag_induced_N']:.2f} N")
+            _metrics_row("Parasitic drag (CD0)", f"{m['drag_parasite_N']:.2f} N")
+            _metrics_row("Stopped-rotor drag", f"{m['drag_stopped_rotor_N']:.2f} N")
+            _metrics_row("Fuselage / boom drag", f"{m['drag_body_N']:.2f} N  "
+                         f"({m['extra_drag_source']})",
+                         "Drag beyond CD0 from the Extra Airframe Drag inputs.")
+            _metrics_row("Total drag", f"{m['drag_total_N']:.2f} N")
+            _metrics_row("L/D at cruise", f"{m['ld_cruise']:.2f}")
+            _metrics_row("Max L/D (analytic)", f"{m['ld_max']:.2f}",
+                         "0.5 sqrt(pi AR e / CD0): the wing and CD0 alone.")
+            _metrics_row("Angle of attack", f"{m['aoa_deg']:.1f} deg",
+                         "CL over the finite-wing lift slope 2 pi AR / (AR + 2), "
+                         "measured from zero lift.")
+            _metrics_row("Reynolds number", f"{m['reynolds_number']:,.0f}")
 
-    def draw_plots(cfg):
-        v_stall = stall_speed_mps(cfg)
+            _metrics_add_section("Climb & Glide")
+            _metrics_row("Rate of climb at cruise", f"{m['roc_at_cruise_mps']:.2f} m/s  "
+                         f"({m['roc_at_cruise_mps'] * 60:.0f} m/min)",
+                         "Wing-borne, with all the forward thrust available.")
+            _metrics_row("Best climb rate (Vy)",
+                         f"{m['max_roc_mps']:.2f} m/s at {m['vy_mps']:.1f} m/s")
+            _metrics_row("Best climb angle (Vx)",
+                         f"{m['max_climb_angle_deg']:.1f} deg at {m['vx_mps']:.1f} m/s")
+            ceiling = m["service_ceiling_m"]
+            _metrics_row("Service ceiling (ASL)",
+                         "above 8000 m" if not math.isfinite(ceiling) else f"{ceiling:.0f} m",
+                         "Where the best wing-borne climb falls to 100 ft/min.")
+            _metrics_row("Service ceiling (AGL)",
+                         "above 8000 m" if not math.isfinite(ceiling)
+                         else f"{m['service_ceiling_agl_m']:.0f} m")
+            _metrics_row("Glide ratio", f"{m['glide_ratio']:.1f} : 1")
+            _metrics_row("Glide distance",
+                         f"{m['glide_distance_km']:.2f} km from "
+                         f"{m['glide_reference_altitude_m']:.0f} m",
+                         "Unpowered, rotors stopped, from the cruise altitude "
+                         "(or the field elevation when none is entered).")
+
+            _metrics_add_section("Turning Flight")
+            bank = cfg.bank_deg if cfg is not None else 0.0
+            if bank <= 0:
+                _metrics_row("Bank angle", "0 deg (straight flight)",
+                             "Enter a bank angle on the Mission/Environment tab "
+                             "for the turn figures.")
+            else:
+                _metrics_row("Bank angle", f"{bank:.0f} deg")
+                _metrics_row("Load factor", f"{m['load_factor']:.2f} g")
+                _metrics_row("Turn stall speed", _speed(m["turn_stall_speed_mps"]))
+                _metrics_row("Turn radius", f"{m['turn_radius_m']:.0f} m")
+                _metrics_row("Turn rate", f"{m['turn_rate_deg_s']:.1f} deg/s")
+                _metrics_row("Turn period", f"{m['turn_period_s']:.1f} s")
+                _metrics_row("Turn power", f"{m['turn_power_W']:.0f} W  "
+                             f"({m['turn_endurance_min']:.1f} min)",
+                             "Sustained level turn: the wing flies at n x W, so "
+                             "induced drag rises by n².")
+                _metrics_row("Loiter circles", f"{m['loiter_circles']:.0f}")
+
+            _metrics_add_section("Conventional Take-off / Landing")
+            _metrics_row("Take-off ground roll",
+                         _f(m["takeoff_roll_m"], "{:.0f} m", "cannot take off"),
+                         "Rolling take-off on the forward thrust, as an aeroplane "
+                         "— useful when the aircraft is too heavy to lift off "
+                         "vertically. Raymer's estimate, the fixed-wing's method.")
+            _metrics_row("Landing distance (over 15 m obstacle)",
+                         _f(m["landing_distance_m"], "{:.0f} m"))
+
+        if cfg is not None and "hover_lift_rpm" in m:
+            _motor_section("Lift Motor (hover)", "hover_lift", m, cfg, "lift", "Lift motor")
+            if vectored:
+                _motor_section("Rotor Motors in Cruise", "cruise_motor", m, cfg,
+                               "cruise", "Cruising rotor")
+            else:
+                _motor_section("Cruise Motor (at cruise)", "cruise_motor", m, cfg,
+                               "cruise", "Cruise motor")
+
+            _metrics_add_section("Propellers & Rotors")
+            for group, name, prefix in (("lift", "Lift prop", "hover_lift"),
+                                        ("cruise", "Cruise prop", "cruise_motor")):
+                if group == "cruise" and vectored:
+                    continue
+                g = _group(cfg, group)
+                _metrics_row(f"{name} size",
+                             f"{g['d_in']:.1f} x {g['p_in']:.1f} in, {g['blades']} blades  "
+                             f"(P/D {m[f'{group}_p_over_d']:.2f})")
+                _metrics_row(f"{name} disc area",
+                             f"{m[f'{group}_disc_area_m2'] * 1e4:.0f} cm² each, "
+                             f"{m[f'{group}_disc_area_m2'] * g['n'] * 1e4:.0f} cm² total")
+                _metrics_row(f"{name} C_T / C_P",
+                             f"{m[f'{group}_c_t']:.4f} / {m[f'{group}_c_p']:.4f}  "
+                             f"({m[f'{group}_coeff_source']})",
+                             "Thrust and power coefficients. An estimate is good to "
+                             "about ±30%; enter TConst or load a table with RPM for "
+                             "better.")
+                _metrics_row(f"{name} solidity σ",
+                             f"{m[f'{group}_solidity']:.3f}  "
+                             f"(chord {m[f'{group}_chord_m'] * 1000:.0f} mm est.)")
+                where = "hover" if group == "lift" else "cruise"
+                mach = float(m.get(f"{prefix}_tip_mach", 0.0))
+                _metrics_row(f"{name} tip speed ({where})",
+                             f"{_f(m.get(f'{prefix}_tip_speed_mps'), '{:.1f}')} m/s  "
+                             f"(Mach {mach:.3f})"
+                             + ("  ⚠ significant noise" if mach > 0.6 else ""))
+            if not vectored:
+                _metrics_row("Cruise prop pitch speed",
+                             f"{_f(m.get('cruise_motor_pitch_speed_mps'), '{:.1f}')} m/s",
+                             "Pitch x RPM: the speed the blade would advance per "
+                             "turn in a solid. Cruise should sit well below it.")
+            _metrics_row("Cruise prop advance ratio J",
+                         _f(m.get("cruise_motor_advance_J"), "{:.3f}"),
+                         "V / (n D). Thrust falls to zero near 1.2 x P/D.")
+            _metrics_row("Lift rotor advance ratio μ",
+                         _f(m.get("point_lift_advance_mu"), "{:.3f}"),
+                         "V / ΩR for the lift rotors at the cruise point; zero "
+                         "once they have stopped.")
+
+            _metrics_add_section("Thermal Estimates")
+            _metrics_row("Lift motor temperature",
+                         f"{m['lift_motor_temp_C']:.1f} °C  (limit {cfg.lift_motor_temp_limit_C:.0f})",
+                         "Steady state in hover, from ambient plus the motor's "
+                         "loss times a lumped thermal resistance.")
+            if not vectored:
+                _metrics_row("Cruise motor temperature",
+                             f"{m['cruise_motor_temp_C']:.1f} °C  (limit {cfg.cruise_motor_temp_limit_C:.0f})")
+            _metrics_row("ESC temperature",
+                         f"{m['esc_temp_est_C']:.1f} °C  (limit {cfg.esc_temp_limit_C:.0f})")
+            _metrics_row("Battery temperature",
+                         f"{m['battery_temp_est_C']:.1f} °C  (limit {cfg.battery.temp_limit_C:.0f})")
+            _metrics_row("Motor thermal headroom", f"{m['motor_thermal_headroom_C']:.1f} °C")
+            _metrics_row("ESC thermal headroom", f"{m['esc_thermal_headroom_C']:.1f} °C")
+            _metrics_row("Battery thermal headroom", f"{m['battery_thermal_headroom_C']:.1f} °C")
+            _metrics_row("Thermal status", str(m["thermal_status"]),
+                         "OK, WARN within 10 °C of a limit, HOT past one. These "
+                         "are steady-state estimates; a mission run integrates "
+                         "them in time instead.")
+
+            _metrics_add_section("Environment")
+            _metrics_row("Field altitude", f"{m['altitude_m']:.0f} m")
+            _metrics_row("Cruise altitude",
+                         "same as field" if m["cruise_altitude_m"] is None
+                         else f"{m['cruise_altitude_m']:.0f} m")
+            _metrics_row("Temperature", f"{m['ambient_temp_C']:.1f} °C"
+                         + ("" if cfg._ambient_temp_C is not None else "  (ISA)"))
+            _metrics_row("Pressure", "from altitude (ISA)" if m["pressure_Pa"] is None
+                         else f"{m['pressure_Pa']:.0f} Pa")
+            _metrics_row("Air density", f"{m['air_density']:.4f} kg/m³  "
+                         f"({(m['density_ratio'] - 1) * 100:+.1f}% vs ISA sea level)")
+            _metrics_row("Density altitude", f"{m['density_altitude_m']:.0f} m  "
+                         f"({m['density_altitude_m'] * 3.281:.0f} ft)")
+            _metrics_row("Speed of sound", f"{m['speed_of_sound_mps']:.1f} m/s")
+
+    def _sweep_speeds(cfg):
+        """The airspeeds the Fixed Speed Plots and their export cover."""
         v_trans = transition_speed_mps(cfg)
-        v_cruise = float(cfg.cruise_speed_mps)
-        # Plot Settings wins when a maximum was entered, so the sweep and the
-        # export cover the same range.
         v_max = (opt("plot_vmax")
-                 or max(v_cruise * 1.6, v_trans * 1.6))
+                 or max(float(cfg.cruise_speed_mps) * 1.6, v_trans * 1.6))
         steps = max(int(v_max / 0.5), 8)
-        speeds = [v_max * i / steps for i in range(1, steps + 1)]
+        return [v_max * i / steps for i in range(1, steps + 1)]
 
-        powers, rotor_W, cruise_W = [], [], []
-        endurance, ranges, share, rotor_N, wing_N = [], [], [], [], []
+    def _sweep_data(cfg):
+        """
+        Everything the sweep panels draw, computed once. The export reads the
+        same dictionary, so a column in the file is a curve on the screen.
+        """
+        speeds = _sweep_speeds(cfg)
         usable_Wh = cfg.battery.usable_Wh
+        v_trans = transition_speed_mps(cfg)
         # The sweep is flown in the same wind as the run. Range is ground
         # distance, so a headwind moves the best-range speed UP — the
         # aircraft has to fly faster to spend less time being pushed back.
         # Plotting still-air range in a wind would hide exactly that.
-        _sweep_head, _sweep_cross = core.wind_components_mps(
+        head, cross = core.wind_components_mps(
             num("wind", 0.0), num("wind_dir", 0.0), num("course_deg", 0.0))
+        data = {k: [] for k in (
+            "speed", "total", "shaft", "rotor_W", "cruise_W", "endurance", "range",
+            "share", "rotor_N", "wing_N", "thrust_req", "thrust_avail", "roc",
+            "drag_induced", "drag_cd0", "drag_stopped", "drag_body", "drag_total",
+            "regime", "tilt")}
         for v in speeds:
             p = power_at_airspeed(cfg, v)
-            total = p["total_power_W"]
-            powers.append(total)
-            rotor_W.append(p["rotor_shaft_W"])
-            cruise_W.append(p["cruise_shaft_W"])
+            total = float(p["total_power_W"])
+            data["speed"].append(v)
+            data["total"].append(total)
+            data["shaft"].append(float(p["shaft_power_W"]))
+            data["rotor_W"].append(float(p["rotor_shaft_W"]))
+            data["cruise_W"].append(float(p["cruise_shaft_W"]))
             # Endurance and range at a STEADY speed, which is what a
             # fixed-speed sweep describes. A real flight also pays for the
             # climb and the transition; the mission run is what prices those.
             mins = usable_Wh / max(total, 1e-9) * 60.0
-            endurance.append(mins)
-            ranges.append(mins * 60.0 * core.groundspeed_along_track_mps(
-                v, _sweep_head, _sweep_cross) / 1000.0)
-            share.append(float(p.get("lift_share_wing",
-                                     1.0 if p.get("regime") == "cruise" else 0.0)))
-            rotor_N.append(float(p.get("rotor_thrust_N", 0.0)))
-            wing_N.append(float(p.get("wing_lift_N", 0.0)))
+            data["endurance"].append(mins)
+            data["range"].append(mins * 60.0 * core.groundspeed_along_track_mps(
+                v, head, cross) / 1000.0)
+            data["share"].append(float(p.get("lift_share_wing",
+                                             1.0 if p.get("regime") == "cruise" else 0.0)))
+            data["rotor_N"].append(float(p.get("rotor_thrust_N", 0.0)))
+            data["wing_N"].append(float(p.get("wing_lift_N", 0.0)))
+            data["thrust_req"].append(float(p.get("cruise_thrust_N", 0.0)))
+            data["thrust_avail"].append(forward_thrust_available_N(cfg, v))
+            data["roc"].append(rate_of_climb_mps(cfg, v) if v >= v_trans else float("nan"))
+            q = 0.5 * cfg.air_density * v * v
+            lift = float(p.get("wing_lift_N", 0.0))
+            cl = lift / max(q * cfg.wing_area_m2, 1e-9)
+            d_i = q * cfg.wing_area_m2 * cfg.induced_drag_factor * cl * cl
+            d_0 = q * cfg.wing_area_m2 * cfg.CD0
+            d_s = (0.0 if uses_vectored_thrust(cfg) else
+                   stopped_rotor_drag_N(cfg, v) * min(max(lift / max(cfg.weight_N, 1e-9), 0.0), 1.0))
+            d_b = body_drag_N(cfg, v)
+            data["drag_induced"].append(d_i)
+            data["drag_cd0"].append(d_0)
+            data["drag_stopped"].append(d_s)
+            data["drag_body"].append(d_b)
+            data["drag_total"].append(d_i + d_0 + d_s + d_b)
+            data["regime"].append(str(p.get("regime", "")))
+            data["tilt"].append(float(p.get("tilt_deg", 0.0)))
+        return data
 
-        best_e = max(range(len(speeds)), key=lambda i: endurance[i])
-        best_r = max(range(len(speeds)), key=lambda i: ranges[i])
+    def make_motor_figure(cfg, m, figsize):
+        """
+        The multicopter's and fixed-wing's motor operating-point figure, once
+        per motor type: electrical power and current, then efficiency and
+        RPM, against thrust per rotor — each with this run's operating point
+        marked, so it is plain how much range the motor has either side.
+        """
+        groups = [("lift", "Lift motor", "hover_lift", "hover")]
+        if not uses_vectored_thrust(cfg):
+            groups.append(("cruise", "Cruise motor", "cruise_motor", "cruise"))
+        fig, axes = core.make_figure(len(groups), 2, figsize=figsize)
+        axes = np.atleast_2d(axes)
+        fig.suptitle("Motor Operating Points", fontsize=12, fontweight="bold")
+        for row, (group, name, prefix, where) in enumerate(groups):
+            g = _group(cfg, group)
+            avail, _src = static_thrust_available_N(cfg, group)
+            per_max = max(avail / max(g["n"], 1),
+                          float(m.get(f"{prefix}_thrust_N", 0.0)) * 1.6, 1.0)
+            thrusts = [per_max * i / 60 for i in range(1, 61)]
+            elec, amps, grams_per_W, rpms, effs = [], [], [], [], []
+            for t in thrusts:
+                if group == "lift":
+                    shaft = rotor_power_W(cfg, t * g["n"], 0.0) / g["n"]
+                    measured = lift_table_covers(cfg, t)
+                else:
+                    shaft = cruise_prop_power_W(cfg, t * g["n"], 0.0) / g["n"]
+                    measured = cruise_table_covers(cfg, t)
+                op = motor_operating_point(cfg, group, t, shaft, 0.0, measured=measured)
+                elec.append(op["elec_W"])
+                amps.append(op["current_A"])
+                grams_per_W.append(t / G0 * 1000.0 / max(op["elec_W"], 1e-9))
+                rpms.append(op["rpm"])
+                effs.append(op["efficiency"] * 100.0)
+            grams = [t / G0 * 1000.0 for t in thrusts]
+            op_g = float(m.get(f"{prefix}_thrust_N", 0.0)) / G0 * 1000.0
 
+            ax = axes[row, 0]
+            h1, = ax.plot(grams, elec, color="#C62828", label="Electrical power (W)")
+            axb = ax.twinx()
+            h2, = axb.plot(grams, amps, color="#1565C0", linestyle="--", label="Current (A)")
+            if op_g > 0:
+                ax.axvline(op_g, color="gray", linestyle=":", linewidth=1.2)
+                ax.plot([op_g], [float(m.get(f"{prefix}_elec_W", 0.0))], "o", color="#C62828")
+            if g["imax"]:
+                axb.axhline(float(g["imax"]), color="#1565C0", linestyle=":", linewidth=0.9)
+            ax.set_xlabel(f"Thrust per rotor (g)")
+            ax.set_ylabel("Power (W)")
+            axb.set_ylabel("Current (A)")
+            ax.set_title(f"{name}: Thrust vs Power & Current ({where} marked)")
+            ax.grid(alpha=0.3)
+            ax.legend([h1, h2], [h1.get_label(), h2.get_label()], fontsize=7, loc="upper left")
+
+            ax = axes[row, 1]
+            h1, = ax.plot(grams, grams_per_W, color="#2E7D32", label="Thrust per watt (g/W)")
+            h3, = ax.plot(grams, [e / 10.0 for e in effs], color="#6A1B9A", linestyle="-.",
+                          label="Motor efficiency (/10 %)")
+            axb = ax.twinx()
+            h2, = axb.plot(grams, rpms, color="#EF6C00", linestyle="--", label="RPM")
+            if op_g > 0:
+                ax.axvline(op_g, color="gray", linestyle=":", linewidth=1.2)
+            if g["max_rpm"]:
+                axb.axhline(float(g["max_rpm"]), color="#EF6C00", linestyle=":", linewidth=0.9)
+            ax.set_xlabel("Thrust per rotor (g)")
+            ax.set_ylabel("g/W  |  efficiency / 10")
+            axb.set_ylabel("RPM")
+            ax.set_title(f"{name}: Thrust vs Efficiency & RPM")
+            ax.grid(alpha=0.3)
+            ax.legend([h1, h3, h2], [h.get_label() for h in (h1, h3, h2)],
+                      fontsize=7, loc="upper right")
+        fig.set_layout_engine("constrained", w_pad=0.06, h_pad=0.06,
+                              wspace=0.08, hspace=0.12)
+        return fig
+
+    _canvas_motor = {"widget": None}
+
+    def draw_plots(cfg, m=None):
+        v_stall = stall_speed_mps(cfg)
+        v_trans = transition_speed_mps(cfg)
+        v_cruise = float(cfg.cruise_speed_mps)
+        d = _sweep_data(cfg)
+        speeds = d["speed"]
+        best_e = max(range(len(speeds)), key=lambda i: d["endurance"][i])
+        best_r = max(range(len(speeds)), key=lambda i: d["range"][i])
+
+        # Four rows of two: the multicopter's and fixed-wing's panels below
+        # the VTOL's own four. Two columns keeps the label layout that was
+        # tuned for the rendered width; the pane scrolls for the extra rows.
         fig, axes = core.make_figure(
-            2, 2, figsize=(_view["plot_w"], _view["plot_h"]))
+            4, 2, figsize=(_view["plot_w"], _view["plot_h"] * 2.0))
         fig.suptitle(f"{cfg.config_type} Performance", fontsize=13,
                      fontweight="bold")
 
@@ -5138,19 +8175,21 @@ def launch_gui(args=None) -> None:
                        alpha=0.8,
                        label=f"stall {v_stall:.1f} m/s" if legend else None)
 
-        # 1. Power required, against the hover figure it has to beat.
+        # 1. Power required, electrical and mechanical, against hover.
         ax1 = axes[0, 0]
-        ax1.plot(speeds, powers, color="#C62828", label="Total")
+        ax1.plot(speeds, d["total"], color="#C62828", label="Total (electrical)")
+        ax1.plot(speeds, d["shaft"], color="#2E7D32", linestyle="--",
+                 label="Shaft (mechanical)")
         ax1.axhline(hover_power_W(cfg)["total_power_W"], color="#1565C0",
                     linestyle="--", label="Hover")
         _marks(ax1, legend=True)
         ax1.set_xlabel("Airspeed (m/s)"); ax1.set_ylabel("Power (W)")
-        ax1.set_title("Power vs Airspeed"); ax1.grid(alpha=0.3)
+        ax1.set_title("Power vs Airspeed — electrical and mechanical"); ax1.grid(alpha=0.3)
         ax1.legend(fontsize=7)
 
         # 2. Where that power is going.
         ax2 = axes[0, 1]
-        ax2.stackplot(speeds, rotor_W, cruise_W,
+        ax2.stackplot(speeds, d["rotor_W"], d["cruise_W"],
                       labels=["Lift rotors", "Cruise prop"],
                       colors=["#90CAF9", "#A5D6A7"])
         _marks(ax2)
@@ -5162,9 +8201,9 @@ def launch_gui(args=None) -> None:
         # is actually planned around, and they are not the same speed.
         ax3 = axes[1, 0]
         ax3b = ax3.twinx()
-        l1, = ax3.plot(speeds, endurance, color="royalblue",
+        l1, = ax3.plot(speeds, d["endurance"], color="royalblue",
                        label="Endurance (min)")
-        l2, = ax3b.plot(speeds, ranges, color="darkorange", linestyle="--",
+        l2, = ax3b.plot(speeds, d["range"], color="darkorange", linestyle="--",
                         label="Range (km)")
         ax3.axvline(speeds[best_e], color="royalblue", linestyle=":", linewidth=1.2)
         ax3b.axvline(speeds[best_r], color="darkorange", linestyle=":", linewidth=1.2)
@@ -5182,12 +8221,12 @@ def launch_gui(args=None) -> None:
         # Handles collected as they are drawn. ax.get_lines() would sweep up
         # the three axvline markers too, and they arrive in the legend as
         # "_child1", "_child2", "_child3".
-        h_share, = ax4.plot(speeds, [sh * 100.0 for sh in share],
+        h_share, = ax4.plot(speeds, [sh * 100.0 for sh in d["share"]],
                             color="#2E7D32", label="Wing share of lift (%)")
         ax4b = ax4.twinx()
-        h_rotor, = ax4b.plot(speeds, rotor_N, color="#1565C0", linestyle="--",
+        h_rotor, = ax4b.plot(speeds, d["rotor_N"], color="#1565C0", linestyle="--",
                              label="Rotor thrust (N)")
-        h_wing, = ax4b.plot(speeds, wing_N, color="#8E24AA", linestyle=":",
+        h_wing, = ax4b.plot(speeds, d["wing_N"], color="#8E24AA", linestyle=":",
                             label="Wing lift (N)")
         _marks(ax4)
         ax4.set_ylim(-2, 105)
@@ -5199,14 +8238,77 @@ def launch_gui(args=None) -> None:
         ax4.legend(handles, [h.get_label() for h in handles], fontsize=7,
                    loc="center right")
 
+        # 5. Forward thrust needed against what the propulsion can give —
+        # the fixed-wing's panel. The gap is what climbing and accelerating
+        # have to work with.
+        ax5 = axes[2, 0]
+        ax5.plot(speeds, d["thrust_req"], color="#C62828", label="Required (drag)")
+        ax5.plot(speeds, d["thrust_avail"], color="#2E7D32", linestyle="--",
+                 label="Available")
+        _marks(ax5)
+        ax5.set_xlabel("Airspeed (m/s)"); ax5.set_ylabel("Forward thrust (N)")
+        ax5.set_title("Thrust Required vs Available"); ax5.grid(alpha=0.3)
+        ax5.legend(fontsize=7)
+
+        # 6. Climb rate, wing-borne, from the thrust in hand.
+        ax6 = axes[2, 1]
+        ax6.plot(speeds, d["roc"], color="#1565C0", label="Rate of climb")
+        finite = [(v, r) for v, r in zip(speeds, d["roc"]) if r == r]
+        if finite:
+            vy, best = max(finite, key=lambda x: x[1])
+            ax6.plot([vy], [best], "o", color="#1565C0")
+            ax6.annotate(f"Vy {vy:.1f} m/s, {best:.1f} m/s", (vy, best),
+                         textcoords="offset points", xytext=(6, -12), fontsize=7)
+        if cfg.min_climb_mps:
+            ax6.axhline(cfg.min_climb_mps, color="#C62828", linestyle=":",
+                        label=f"required {cfg.min_climb_mps:.1f} m/s")
+        ax6.axhline(0, color="gray", linewidth=0.8)
+        _marks(ax6)
+        ax6.set_xlabel("Airspeed (m/s)"); ax6.set_ylabel("Climb rate (m/s)")
+        ax6.set_title("Rate of Climb vs Airspeed (wing-borne)"); ax6.grid(alpha=0.3)
+        ax6.legend(fontsize=7)
+
+        # 7. Drag, split into its parts — the multicopter's and fixed-wing's
+        # drag panels, plus the VTOL's own stopped rotors.
+        ax7 = axes[3, 0]
+        ax7.plot(speeds, d["drag_total"], color="black", label="Total")
+        ax7.plot(speeds, d["drag_induced"], color="#1565C0", linestyle="--", label="Induced")
+        ax7.plot(speeds, d["drag_cd0"], color="#C62828", linestyle="--", label="Parasitic (CD0)")
+        if any(x > 0 for x in d["drag_stopped"]):
+            ax7.plot(speeds, d["drag_stopped"], color="#EF6C00", linestyle=":",
+                     label="Stopped rotors")
+        if any(x > 0 for x in d["drag_body"]):
+            ax7.plot(speeds, d["drag_body"], color="#6A1B9A", linestyle=":",
+                     label="Fuselage / booms")
+        _marks(ax7)
+        ax7.set_xlabel("Airspeed (m/s)"); ax7.set_ylabel("Drag (N)")
+        ax7.set_title("Drag vs Airspeed"); ax7.grid(alpha=0.3)
+        ax7.legend(fontsize=7)
+
+        # 8. The drag polar, with this cruise point on it.
+        ax8 = axes[3, 1]
+        cls = [cfg.CL_max * i / 60 for i in range(61)]
+        ax8.plot([cfg.CD0 + cfg.induced_drag_factor * c * c for c in cls], cls,
+                 color="#1565C0", label="CD = CD0 + k CL²")
+        if m is not None and "cl_cruise" in m:
+            ax8.plot([m["cd_cruise"]], [m["cl_cruise"]], "o", color="#C62828",
+                     label=f"cruise CL {m['cl_cruise']:.2f}")
+        cl_md = math.sqrt(cfg.CD0 / max(cfg.induced_drag_factor, 1e-9))
+        ax8.plot([0, 2 * cfg.CD0 * 1.6], [0, cl_md * 1.6], color="gray",
+                 linestyle=":", label=f"best L/D, CL {cl_md:.2f}")
+        ax8.axhline(cfg.CL_max, color="#C62828", linestyle=":", linewidth=1, label="CL_max")
+        ax8.set_xlabel("CD"); ax8.set_ylabel("CL")
+        ax8.set_title("Drag Polar (CD vs CL)"); ax8.grid(alpha=0.3)
+        ax8.legend(fontsize=7, loc="lower right")
+
         # w_pad keeps the right-hand y-label of one panel clear of the
-        # left-hand y-label of the next: both bottom panels carry a twin
-        # axis, so there are four y-labels competing for two gaps.
+        # left-hand y-label of the next: two panels carry a twin axis, so
+        # there are y-labels competing for the gap between columns.
         # Constrained layout, not tight_layout: the plot pane squashes the
         # figure to its own width (about half the requested 14in), and
         # tight_layout's padding was tuned for the full width — at the real
         # rendered size it clipped the left-hand y-labels off the figure and
-        # ran the twin-axis labels of the two bottom panels into each other.
+        # ran the twin-axis labels of the two panels into each other.
         # Constrained layout measures the labels that are actually there,
         # including the twinx ones it is given, and adapts.
         fig.set_layout_engine("constrained", w_pad=0.06, h_pad=0.06,
@@ -5218,6 +8320,7 @@ def launch_gui(args=None) -> None:
                 old.get_tk_widget().destroy()
             except Exception:
                 pass
+        _destroy_canvas(_canvas_motor)
         # Remove the mission placeholder if one is showing.
         for child in plot_holder.winfo_children():
             child.destroy()
@@ -5225,6 +8328,16 @@ def launch_gui(args=None) -> None:
         canvas.draw()
         canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
         _canvas["widget"] = canvas
+        if m is not None:
+            try:
+                rows = 1 if uses_vectored_thrust(cfg) else 2
+                mfig = make_motor_figure(cfg, m, (_view["plot_w"], _view["plot_h"] * 0.55 * rows))
+                mcanvas = FigureCanvasTkAgg(mfig, master=plot_holder)
+                mcanvas.draw()
+                mcanvas.get_tk_widget().grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+                _canvas_motor["widget"] = mcanvas
+            except Exception:
+                pass
         _refresh_plot_scrollregion()
 
     def clear_fixed_speed_plots():
@@ -5236,6 +8349,7 @@ def launch_gui(args=None) -> None:
             except Exception:
                 pass
             _canvas["widget"] = None
+        _canvas_motor["widget"] = None
         for child in plot_holder.winfo_children():
             child.destroy()
         ttk.Label(plot_holder, foreground="#888888", justify="center",
@@ -5257,13 +8371,13 @@ def launch_gui(args=None) -> None:
         except Exception as exc:
             messagebox.showerror("Error", str(exc))
             return
-        show_metrics(m)
-        draw_plots(cfg)
+        show_metrics(m, cfg)
+        draw_plots(cfg, m)
         update_status(cfg, m)
         update_weight_budget(cfg, m)
         draw_airframe_diagram(cfg)
         update_rotor_loading(cfg, m)
-        _export_state.update(cfg=cfg, from_mission=False, results=None)
+        _export_state.update(cfg=cfg, from_mission=False, results=None, metrics=m)
         update_power_budget(cfg, m)
         clear_mission_plots()
         clear_mission_diagram()
@@ -5288,7 +8402,8 @@ def launch_gui(args=None) -> None:
             f"({m['cruise_endurance_min']:.1f} min, "
             f"{m['cruise_range_km']:.1f} km)\n"
             f"Hover costs {m['hover_to_cruise_power_ratio']:.1f}x cruise — "
-            f"minimise time in hover.\n")
+            f"minimise time in hover.\n"
+            + "\n".join(line.strip() for line in performance_summary_lines(m)) + "\n")
 
     def run_mission():
         path = v_mission.get().strip()
@@ -5314,7 +8429,7 @@ def launch_gui(args=None) -> None:
         worst = totals.get("worst") or {}
         last = totals.get("last") or {}
         if last:
-            show_metrics(last)
+            show_metrics(last, cfg)
         update_status(cfg, last, worst=worst)
         draw_airframe_diagram(cfg)
         update_rotor_loading(cfg, last)
@@ -5329,7 +8444,8 @@ def launch_gui(args=None) -> None:
         _set_scope(True)
         _sens_state.update(cfg=cfg, mission=mission,
                            wind=opt("wind") or 0.0, wind_dir=opt("wind_dir") or 0.0,
-                           accel=opt("accel") or 0.0, regen=opt("regen") or 0.0)
+                           accel=opt("accel") or 0.0, decel=opt("decel") or 0.0,
+                           regen=opt("regen") or 0.0)
         clear_sensitivity("Mission re-run — sensitivity is out of date")
         _cmp.update(cur_mission=True, current={
             "energy_Wh": totals["energy_Wh"], "time_min": totals["time_s"] / 60.0,
@@ -5338,7 +8454,12 @@ def launch_gui(args=None) -> None:
             "cruise_Wh": totals["cruise_Wh"], "remaining_Wh": totals["remaining_Wh"],
             "peak_power_W": worst.get("total_power_W"),
             "peak_current_A": worst.get("pack_current_A"),
-            "reserve_margin_Wh": worst.get("reserve_margin_Wh")})
+            "reserve_margin_Wh": worst.get("reserve_margin_Wh"),
+            "min_soc_pct": worst.get("min_soc_pct"),
+            "peak_lift_current_A": worst.get("lift_motor_current_A"),
+            "peak_motor_temp_C": worst.get("motor_temp_est_C"),
+            "peak_esc_temp_C": worst.get("esc_temp_est_C"),
+            "peak_battery_temp_C": worst.get("battery_temp_est_C")})
         refresh_comparison()
 
         lines = [f"=== Mission: {os.path.basename(path)} ===",
@@ -5356,6 +8477,7 @@ def launch_gui(args=None) -> None:
                      f"cruise {totals['cruise_Wh']:.1f} Wh")
         lines.append(f"Remaining {totals['remaining_Wh']:.1f} Wh "
                      f"(reserve {totals['reserve_Wh']:.1f} Wh)")
+        lines += [line.strip() for line in mission_summary_lines(totals)]
         log("\n".join(lines))
 
     # ---- configuration save / load -----------------------------------
@@ -5399,7 +8521,11 @@ def launch_gui(args=None) -> None:
                 f"That looks like a '{payload.get('schema')}' file, not a VTOL "
                 "configuration. Loading it would silently mis-assign fields.")
             return
-        for key, value in (payload.get("vars") or {}).items():
+        # Older configs carry the avionics power and ESC efficiency under the
+        # Mission/Env keys those fields used to have; map them onto the tab
+        # fields that replaced them, or the loaded aircraft would silently
+        # take the tab defaults instead.
+        for key, value in migrate_legacy_fields(payload.get("vars") or {}).items():
             if key in fields:
                 fields[key].set(str(value))
         chosen = payload.get("config_type")

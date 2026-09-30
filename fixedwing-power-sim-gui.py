@@ -7731,6 +7731,7 @@ def _load_mission_or_exit(path: str) -> "MissionProfile":
 
 
 def main():
+    core.make_console_safe()
     parser = build_arg_parser()
     args   = parser.parse_args()
 

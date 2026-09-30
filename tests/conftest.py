@@ -25,6 +25,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MULTICOPTER = os.path.join(ROOT, "multicopter-power-sim-gui.py")
 FIXEDWING = os.path.join(ROOT, "fixedwing-power-sim-gui.py")
+VTOL = os.path.join(ROOT, "vtol-power-sim-gui.py")
 ROTORWORKS = os.path.join(ROOT, "rotorworks-batch.py")
 DRAGCALC = os.path.join(ROOT, "drag_coefficient_calculator.py")
 EXAMPLES = os.path.join(ROOT, "examples")
@@ -87,6 +88,22 @@ def fw():
     except ImportError:
         _stub_tkinter()
     return _load(FIXEDWING, "rw_fixedwing")
+
+
+@pytest.fixture(scope="session")
+def vtol():
+    """
+    The VTOL simulator module.
+
+    test_vtol.py defines its own fixture of this name, which wins inside
+    that file; this one serves everything else, such as the golden snapshot.
+    Both register the module as "rw_vtol", so they share one copy.
+    """
+    try:
+        import tkinter  # noqa: F401
+    except ImportError:
+        _stub_tkinter()
+    return _load(VTOL, "rw_vtol")
 
 
 @pytest.fixture(scope="session")

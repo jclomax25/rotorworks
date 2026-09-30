@@ -7668,8 +7668,24 @@ def launch_gui():
                 except Exception:
                     return "n/a"
 
+            # Say plainly which orientation ran. Hover evaluates at 0 m/s
+            # whatever the Cruise Speed box holds, so a config that sets a
+            # cruise speed but leaves orientation on hover must not print
+            # that speed as if it had been flown.
+            if orientation == "hover":
+                _orient_line = "Orientation     : HOVER (stationary, airspeed 0 m/s)\n"
+                if abs(speed) > 1e-9:
+                    _orient_line += (
+                        f"  NOTE: Cruise Speed {speed:.1f} m/s is ignored in hover. "
+                        f"Set orientation to 'translating' to fly it.\n")
+                _run_speed = 0.0
+            else:
+                _orient_line = f"Orientation     : TRANSLATING at {speed:.1f} m/s\n"
+                _run_speed = speed
+
             out_print(
-                f"=== Fixed Speed Run @ {speed:.1f} m/s ({orientation}) ===\n"
+                f"=== Fixed Speed Run @ {_run_speed:.1f} m/s ({orientation}) ===\n"
+                f"{_orient_line}"
                 f"Air density     : {drone.air_density:.3f} kg/m³\n"
                 f"Flight time     : {t_min:.2f} min\n"
                 f"Flight distance : {d_km:.2f} km\n"
@@ -8382,6 +8398,7 @@ def _load_mission_or_exit(path: str) -> "MissionProfile":
 
 
 def main():
+    core.make_console_safe()
     parser = build_arg_parser()
     args = parser.parse_args()
 
@@ -8430,9 +8447,13 @@ def main():
             print(f"{name}: {time_min:.1f} min, {dist_km:.2f} km, {status}")
     else:
         be_v, be_min, br_v, br_km = find_optimal_speeds(drone)
-        metrics = _compute_operating_metrics_core(
+        # Same entry point as the GUI's fixed-speed run, so hover is evaluated
+        # stationary here too. Calling the core directly flew hover at --speed
+        # and reported a flight distance for a run that covers no ground.
+        run_speed = 0.0 if orientation == "hover" else float(args.speed)
+        metrics = compute_operating_metrics(
             drone,
-            speed_mps=args.speed,
+            speed_mps=run_speed,
             orientation=orientation,
             wind_mps=args.wind,
             wind_direction_deg=args.wind_direction_deg,
@@ -8468,8 +8489,15 @@ def main():
             t_min = 0.0
         d_km = float(metrics.get("groundspeed_mps", 0.0)) * (t_min * 60.0) / 1000.0
 
-        print(f"Estimated flight time at {args.speed:.2f} m/s ({orientation}): {t_min:.1f} min")
-        print(f"Estimated flight distance at {args.speed:.2f} m/s ({orientation}): {d_km:.2f} km")
+        if orientation == "hover":
+            print("Orientation           : HOVER (stationary, airspeed 0 m/s)")
+            if abs(float(args.speed)) > 1e-9:
+                print(f"  NOTE: --speed {float(args.speed):.2f} m/s is ignored in hover. "
+                      f"Use --orientation translating to fly it.")
+        else:
+            print(f"Orientation           : TRANSLATING at {run_speed:.2f} m/s")
+        print(f"Estimated flight time at {run_speed:.2f} m/s ({orientation}): {t_min:.1f} min")
+        print(f"Estimated flight distance at {run_speed:.2f} m/s ({orientation}): {d_km:.2f} km")
         print(f"SoC / model source    : {metrics.get('soc_percent', 100.0):.1f}% / {metrics.get('soc_model_source', 'linear-fallback')}")
         print(f"Ground speed          : {metrics.get('groundspeed_mps', 0.0):.2f} m/s")
         print(f"Head / Cross wind     : {metrics.get('wind_head_mps', 0.0):+.2f} / {metrics.get('wind_cross_mps', 0.0):+.2f} m/s")
@@ -8486,7 +8514,7 @@ def main():
         print(f"Advance Ratio μ       : {metrics.get('advance_ratio_mu', 0.0):.3f}")
         print(f"Inflow Efficiency η   : {metrics.get('inflow_efficiency', 1.0):.3f}")
         print(f"Inflow Power Mult.    : {metrics.get('inflow_power_multiplier', 1.0):.3f}")
-        print(f"Commanded Airspeed    : {metrics.get('commanded_airspeed_mps', args.speed):.2f} m/s")
+        print(f"Commanded Airspeed    : {metrics.get('commanded_airspeed_mps', run_speed):.2f} m/s")
         print(f"Acceleration          : {metrics.get('accel_mps2', 0.0):+.2f} m/s²")
         print(f"Kinetic Power Term    : {metrics.get('kinetic_power_W', 0.0):+.1f} W")
         print(f"Potential Power Term  : {metrics.get('potential_power_W', 0.0):+.1f} W")

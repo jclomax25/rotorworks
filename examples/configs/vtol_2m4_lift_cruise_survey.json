@@ -25,7 +25,7 @@
     "cruise_kv": "500",
     "cruise_rm": "0.06",
     "cruise_wt": "180",
-    "cruise_eff": "0.75",
+    "cruise_eff": "0.83",
     "chem": "LiPo",
     "cell_cap": "5000",
     "series": "6",
@@ -42,5 +42,6 @@
     "avionics": "25",
     "esc_eff": "0.96",
     "mission": ""
-  }
+  },
+  "_motor_model_migration": "cruise_eff is the PROPELLER's efficiency alone. Before v1.11 the VTOL had no motor electrical model and this field was the combined motor-and-propeller figure (0.75); it was converted by dividing out the motor efficiency the Kv/Rm/I0 model now computes at the cruise point (0.903), so the cruise leg costs what it did before and the motor's loss is now itemised rather than hidden. CD0 was NOT re-tuned."
 }

@@ -710,30 +710,31 @@ GUI_TO_CLI_MULTICOPTER = {
 }
 
 # The VTOL saves its config with short field keys, so the batch driver needs
-# its own map from those to the CLI's argument names — the same job the two
-# maps below do for the other simulators.
-GUI_TO_CLI_VTOL = {
-    "weight": "weight", "payload": "payload_mass_g",
-    "span": "wing_span", "area": "wing_area", "oswald": "oswald",
-    "n_lift": "num_lift_rotors", "lift_d": "lift_prop_diameter",
-    "lift_p": "lift_prop_pitch", "lift_kv": "lift_motor_kv",
-    "lift_rm": "lift_motor_resistance", "lift_wt": "lift_motor_weight",
-    "fom": "lift_figure_of_merit",
-    "n_cruise": "num_cruise_motors", "cruise_d": "cruise_prop_diameter",
-    "cruise_p": "cruise_prop_pitch", "cruise_kv": "cruise_motor_kv",
-    "cruise_rm": "cruise_motor_resistance", "cruise_wt": "cruise_motor_weight",
-    "cruise_eff": "cruise_prop_efficiency",
-    "stopped_area": "stopped_rotor_drag_area",
-    "chem": "battery_chemistry", "cell_cap": "battery_cell_capacity",
-    "series": "battery_series_cells", "parallel": "battery_parallel_cells",
-    "cell_wt": "battery_cell_weight_g", "vmin": "battery_voltage_min",
-    "vnom": "battery_voltage_nominal", "vmax": "battery_voltage_max",
-    "rcell": "battery_resistance_cell", "usable": "battery_usable_percent",
-    "avionics": "avionics_power", "esc_eff": "esc_efficiency",
-    "cruise_v": "cruise_speed", "alt": "altitude", "temp": "temperature",
-    "lift_table": "lift_prop_table", "cruise_table": "cruise_prop_table",
-    "wind": "wind", "wind_dir": "wind_direction",
-}
+# a map from those to the CLI's argument names. It is read from the VTOL
+# simulator itself rather than copied here: the copy that used to live here
+# had no CD0, CL_max or CL cap, so a batch run of any VTOL config silently
+# flew the CLI's default drag instead of the config's.
+_VTOL_FIELD_MAP: Optional[Dict[str, str]] = None
+
+
+def gui_to_cli_vtol() -> Dict[str, str]:
+    """The VTOL simulator's own GUI-key -> CLI-argument map."""
+    global _VTOL_FIELD_MAP
+    if _VTOL_FIELD_MAP is None:
+        import importlib.util
+        path = Path(__file__).resolve().parent / SIM_SCRIPT_DEFAULTS["vtol"]
+        spec = importlib.util.spec_from_file_location("_rw_vtol_fields", str(path))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["_rw_vtol_fields"] = module
+        spec.loader.exec_module(module)
+        mapping = {k: v for k, v in module.FIELD_TO_CLI.items() if v}
+        # Configs saved before the Mission/Env duplicates were removed carry
+        # the old keys; route them to the same arguments as the new ones.
+        for old, new_key in module.LEGACY_FIELD_ALIASES.items():
+            if new_key in mapping:
+                mapping.setdefault(old, mapping[new_key])
+        _VTOL_FIELD_MAP = mapping
+    return _VTOL_FIELD_MAP
 
 
 GUI_TO_CLI_FIXEDWING = {
@@ -831,8 +832,10 @@ def load_gui_config(path: Optional[str], sim: str) -> Dict[str, Any]:
             "For a plain CLI-argument file use --base-args-file instead."
         )
 
-    mapping = {"multicopter": GUI_TO_CLI_MULTICOPTER,
-               "vtol": GUI_TO_CLI_VTOL}.get(sim, GUI_TO_CLI_FIXEDWING)
+    if sim == "vtol":
+        mapping = gui_to_cli_vtol()
+    else:
+        mapping = {"multicopter": GUI_TO_CLI_MULTICOPTER}.get(sim, GUI_TO_CLI_FIXEDWING)
     out: Dict[str, Any] = {}
     for gui_key, raw in (data.get("vars") or {}).items():
         cli_key = mapping.get(gui_key)
@@ -1257,6 +1260,14 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    # The same guard as rotorworks_core.make_console_safe, inline because
+    # this driver does not import the core: on Windows a piped cp1252 stream
+    # cannot encode every symbol a summary prints, and must not crash on one.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
     parser = make_parser()
     args = parser.parse_args()
 

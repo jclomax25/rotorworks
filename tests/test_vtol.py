@@ -137,8 +137,12 @@ def test_hover_thrust_equals_weight_plus_download(vtol, aircraft):
 
 def test_hover_power_matches_momentum_theory(vtol, aircraft):
     """
-    P = T * sqrt(T / 2*rho*A) / FM, plus ESC and avionics, where T is the
-    weight PLUS the download the rotors also have to lift.
+    P = T * sqrt(T / 2*rho*A) / FM, plus the motors' own losses, through the
+    ESC, plus avionics — where T is the weight PLUS the download the rotors
+    also have to lift.
+
+    Kv = 0 switches the motor model off, and the chain is then exactly the
+    one this test pinned before the motor model existed.
     """
     thrust = aircraft.weight_N * (1.0 + vtol.hover_download_fraction(aircraft))
     area = aircraft.lift_disc_area_m2
@@ -147,7 +151,23 @@ def test_hover_power_matches_momentum_theory(vtol, aircraft):
     v_hover = math.sqrt(per_rotor / (2 * aircraft.air_density * disc_per))
     ideal = thrust * v_hover
     shaft = ideal / aircraft.lift_figure_of_merit
-    expected = shaft / aircraft.esc_efficiency + aircraft.avionics_power_W
+
+    no_motor = vtol.VTOLConfig(lift_motor_kv=0, cruise_motor_kv=0)
+    expected = shaft / no_motor.esc_efficiency + no_motor.avionics_power_W
+    assert vtol.hover_power_W(no_motor)["total_power_W"] == pytest.approx(expected, rel=1e-6)
+
+    # With the motor model, each motor adds I0 * V_emf + I^2 * Rm, where the
+    # current is the torque over Kt plus I0 — worked here from the RPM the
+    # model reports, not read back from the loss it reports.
+    op = vtol.hover_power_W(aircraft)["lift_motor"]
+    omega = op["rpm"] * 2 * math.pi / 60.0
+    kt = 60.0 / (2 * math.pi * aircraft.lift_motor_kv)
+    current = (shaft / aircraft.num_lift_rotors) / omega / kt + aircraft.lift_motor_i0_A
+    v_emf = op["rpm"] / aircraft.lift_motor_kv
+    loss = aircraft.lift_motor_i0_A * v_emf + current ** 2 * aircraft.lift_motor_resistance
+    expected = ((shaft + aircraft.num_lift_rotors * loss) / aircraft.esc_efficiency
+                + aircraft.avionics_power_W)
+    assert op["current_A"] == pytest.approx(current, rel=1e-9)
     assert vtol.hover_power_W(aircraft)["total_power_W"] == pytest.approx(expected, rel=1e-6)
 
 
@@ -164,7 +184,13 @@ def test_climbing_costs_more_than_hovering(vtol, aircraft):
     # climbing aircraft moves up against it, so that force does work too.
     thrust = aircraft.weight_N * (1.0 + vtol.hover_download_fraction(aircraft))
     extra = thrust * 2.5 / aircraft.esc_efficiency
-    assert climb - hover == pytest.approx(extra, rel=1e-6)
+    # Without a motor model the extra is exactly that. With one, the climb
+    # work also pays the motors' efficiency, so it costs more.
+    no_motor = vtol.VTOLConfig(lift_motor_kv=0, cruise_motor_kv=0)
+    bare_gap = (vtol.hover_power_W(no_motor, climb_rate_mps=2.5)["total_power_W"]
+                - vtol.hover_power_W(no_motor)["total_power_W"])
+    assert bare_gap == pytest.approx(extra, rel=1e-6)
+    assert climb - hover > extra
 
 
 # ======================================================================
@@ -2588,15 +2614,21 @@ def test_status_checks_survived_the_regrouping(gui):
 @pytest.mark.gui
 def test_a_mission_says_why_the_point_checks_are_empty(gui):
     """
-    A mission fills only the battery group. Three blank tables with no
-    explanation read as a broken run rather than an inapplicable check.
+    A mission fills the groups it has worst-case values for — the battery,
+    and, as on the multicopter, the motors, ESCs and rotors — and every group
+    it has nothing for says why. A blank table with no explanation reads as
+    a broken run rather than an inapplicable check.
     """
     _load_mission(gui)
     assert gui.click("Run Mission") == []
     names = [str(r[0]) for r in gui.status_rows()]
     assert any("Peak pack current" in n for n in names)
-    assert names.count("—") >= 3, \
-        "the non-battery groups were left blank with nothing said"
+    assert any("Peak lift motor current" in n for n in names)
+    assert any("Peak motor temperature" in n for n in names)
+    for tree in gui.trees_exact("metric", "value", "limit", "note"):
+        assert tree.get_children(""), "a Status group was left blank with nothing said"
+    assert names.count("—") >= 1, \
+        "the aerodynamic group has no mission value and must say so"
 
 
 # ---------------------------------------------------------------- item 8
@@ -2943,7 +2975,8 @@ def test_peripheral_current_is_in_the_power_budget_and_balances(vtol):
     rows = vtol.core.build_power_budget(
         total_in_W=float(m["total_power_W"]),
         motor_shaft_W=float(m["shaft_power_W"]),
-        motor_copper_W=0.0,
+        motor_copper_W=float(m["motor_copper_W"]),
+        motor_iron_W=float(m["motor_iron_W"]),
         battery_i2r_W=pack_I ** 2 * cfg.battery.pack_resistance,
         esc_loss_W=float(m["esc_loss_W"]),
         wire_loss_W=float(m.get("wire_loss_W", 0.0)),
@@ -3970,3 +4003,285 @@ def test_status_warns_when_the_course_cannot_be_held(gui):
     rows = {str(r[0]): r for r in gui.status_rows()}
     assert "Crosswind vs airspeed" in rows, list(rows)
     assert "Ground speed" in rows, list(rows)
+
+# ======================================================================
+# THE MOTOR MODEL — Kv, Rm and I0 now drive the numbers
+#
+# Before v1.11 the Kv and Rm fields were stored and never read: motor losses
+# were assumed folded into the ESC efficiency. These pin that they now do
+# what their tooltips say, and that switching the model off (Kv = 0) gives
+# exactly the old chain back.
+# ======================================================================
+
+def test_motor_resistance_now_changes_the_hover_power(vtol):
+    low = vtol.hover_power_W(vtol.VTOLConfig(lift_motor_resistance=0.02))
+    high = vtol.hover_power_W(vtol.VTOLConfig(lift_motor_resistance=0.20))
+    assert high["total_power_W"] > low["total_power_W"], \
+        "Rm is still inert — the copper loss never reaches the pack"
+    assert high["motor_copper_W"] > low["motor_copper_W"]
+
+
+def test_kv_sets_the_throttle_the_motor_needs(vtol):
+    """Same thrust, same RPM; a lower Kv needs more of the pack's voltage."""
+    slow = vtol.hover_power_W(vtol.VTOLConfig(lift_motor_kv=200))["lift_motor"]
+    fast = vtol.hover_power_W(vtol.VTOLConfig(lift_motor_kv=400))["lift_motor"]
+    assert slow["rpm"] == pytest.approx(fast["rpm"], rel=1e-9)
+    assert slow["throttle"] > fast["throttle"]
+    assert slow["current_A"] < fast["current_A"], \
+        "a lower Kv has a higher torque constant, so it needs LESS current"
+
+
+def test_kv_zero_turns_the_motor_model_off(vtol):
+    off = vtol.hover_power_W(vtol.VTOLConfig(lift_motor_kv=0, cruise_motor_kv=0))
+    assert off["motor_loss_W"] == 0.0
+    assert off["drive_efficiency"] == pytest.approx(1.0)
+
+
+def test_the_motor_loss_is_itemised_in_the_power_budget(vtol):
+    cfg = vtol.VTOLConfig()
+    m = vtol.compute_metrics(cfg)
+    assert m["motor_loss_W"] > 0
+    assert m["motor_loss_W"] == pytest.approx(m["motor_copper_W"] + m["motor_iron_W"], rel=1e-9)
+    assert m["total_power_W"] > m["shaft_power_W"] + m["motor_loss_W"] + m["esc_loss_W"] - 1e-9
+
+
+def _write_table(path, thrust_g, power_w, rpm=None):
+    lines = ["Thrust_g,Power_W" + (",RPM" if rpm else "")]
+    for i, (t, p) in enumerate(zip(thrust_g, power_w)):
+        lines.append(f"{t},{p}" + (f",{rpm[i]}" if rpm else ""))
+    path.write_text("\n".join(lines) + "\n")
+    return str(path)
+
+
+def test_a_bench_table_already_contains_the_motor(vtol, tmp_path):
+    """
+    A bench table's power was measured at the ESC input, so the motor's loss
+    is inside it. Where the table covers the thrust, hover must cost exactly
+    what the bench recorded — the motor model reports but must not charge a
+    second copy of the loss.
+    """
+    table = _write_table(tmp_path / "lift.csv",
+                         [500, 1000, 1500, 2000, 2500],
+                         [40, 105, 190, 290, 410],
+                         [2500, 3500, 4300, 5000, 5600])
+    cfg = vtol.VTOLConfig(lift_prop_table_csv=table, hover_download_fraction=0.0,
+                          avionics_power_W=0.0)
+    hover = vtol.hover_power_W(cfg)
+    per_rotor_g = cfg.weight_N / cfg.num_lift_rotors / vtol.G0 * 1000.0
+    bench = float(vtol.core.table_power_for_thrust(cfg.lift_prop_table,
+                                                    cfg.weight_N / cfg.num_lift_rotors))
+    assert 500 < per_rotor_g < 2500
+    assert hover["lift_motor"]["measured"]
+    assert hover["motor_loss_W"] == 0.0
+    assert hover["total_power_W"] == pytest.approx(bench * cfg.num_lift_rotors, rel=1e-6)
+    # The table's RPM column sets the thrust coefficient.
+    assert vtol.prop_coefficients(cfg, "lift")["source"] == "bench table"
+
+
+def test_the_climb_command_adds_its_potential_power(vtol):
+    level = vtol.compute_metrics(vtol.VTOLConfig())
+    climbing = vtol.compute_metrics(vtol.VTOLConfig(climb_rate_mps=2.0))
+    cfg = vtol.VTOLConfig()
+    expected = cfg.weight_N * 2.0 / (cfg.esc_efficiency * level["drive_efficiency"])
+    assert climbing["total_power_W"] - level["total_power_W"] == pytest.approx(expected, rel=1e-6)
+    assert climbing["cruise_endurance_min"] < level["cruise_endurance_min"]
+
+
+def test_esc_resistance_splits_the_loss_without_adding_to_it(vtol):
+    bare = vtol.compute_metrics(vtol.VTOLConfig())
+    rated = vtol.compute_metrics(vtol.VTOLConfig(esc_resistance_ohm=0.004))
+    assert rated["total_power_W"] == pytest.approx(bare["total_power_W"])
+    assert rated["esc_conduction_W"] > 0 and bare["esc_conduction_W"] == 0
+
+
+def test_esc_idle_current_is_a_standby_draw(vtol):
+    bare = vtol.compute_metrics(vtol.VTOLConfig())
+    idle = vtol.compute_metrics(vtol.VTOLConfig(esc_idle_current_A=0.1))
+    cfg = vtol.VTOLConfig()
+    extra = 0.1 * vtol.n_escs(cfg) * cfg.battery.vnom_pack
+    assert idle["total_power_W"] - bare["total_power_W"] == pytest.approx(extra, rel=1e-6)
+
+
+# ======================================================================
+# RESERVE, CURRENT LIMITS AND THE REST OF THE FINDINGS
+# ======================================================================
+
+def test_the_reserve_field_overrides_the_mission_file(vtol):
+    mission = vtol.VTOLMission.from_json(MISSION)
+    _r, own = vtol.simulate_mission(vtol.VTOLConfig(), mission)
+    _r, forced = vtol.simulate_mission(vtol.VTOLConfig(reserve_percent=35.0), mission)
+    assert own["reserve_percent"] == mission.reserve_percent
+    assert forced["reserve_percent"] == 35.0
+    assert forced["reserve_Wh"] == pytest.approx(
+        vtol.VTOLConfig().battery.usable_Wh * 0.35, rel=1e-9)
+
+
+def test_a_fixed_speed_run_reports_a_reserve(vtol):
+    m = vtol.compute_metrics(vtol.VTOLConfig(reserve_percent=30.0))
+    assert m["reserve_target_Wh"] == pytest.approx(m["usable_Wh"] * 0.30, rel=1e-9)
+    assert m["reserve_margin_Wh"] == pytest.approx(m["usable_Wh"] * 0.70, rel=1e-9)
+
+
+@pytest.mark.gui
+def test_motor_current_limits_are_now_checked(gui):
+    """The rated-current fields must produce a checked Status row."""
+    gui.set_field("Lift motor max current (A)", "5")
+    assert gui.click("Fixed Speed Sweep") == []
+    rows = {str(r[0]): r for r in gui.status_rows()}
+    row = rows["Lift motor current in hover"]
+    assert "5.0" in row[2], row
+    assert "Above" in row[3], row
+
+
+@pytest.mark.gui
+def test_the_mission_env_duplicates_are_gone(gui):
+    import tkinter.ttk as ttk
+    gui.use_advanced_inputs()
+    labels = [str(w.cget("text")) for w in gui.widgets() if isinstance(w, ttk.Label)]
+    assert "Avionics power (W)" not in labels
+    assert labels.count("ESC efficiency") == 1
+
+
+def test_legacy_configs_still_load_the_moved_fields(vtol):
+    cfg = vtol.config_from_fields({"avionics": "25", "esc_eff": "0.9"})
+    assert cfg.avionics_power_W == 25.0
+    assert cfg.esc_efficiency == pytest.approx(0.9)
+    # The tab fields win when both are present.
+    cfg = vtol.config_from_fields({"avionics": "25", "avionics_flat": "12"})
+    assert cfg.avionics_power_W == 12.0
+
+
+# ======================================================================
+# ONE BUILDER FOR GUI, CLI AND BATCH
+# ======================================================================
+
+def test_every_field_has_a_cli_flag(vtol):
+    parser = vtol.build_arg_parser()
+    dests = {a.dest for a in parser._actions}
+    missing = [(k, d) for k, d in vtol.FIELD_TO_CLI.items() if d and d not in dests]
+    assert not missing, f"fields with no CLI flag: {missing}"
+
+
+def test_the_cli_reads_a_saved_config_to_the_same_aircraft(vtol):
+    path = os.path.join(ROOT, "examples", "configs", "vtol_trinity_f90_lift_cruise.json")
+    values, ctype = vtol.load_fields_file(path)
+    direct = vtol.compute_metrics(vtol.config_from_fields(values, ctype))
+    args = vtol.build_arg_parser().parse_args(["--config", path])
+    via_cli = vtol.compute_metrics(vtol.config_from_args(args))
+    assert via_cli["total_power_W"] == pytest.approx(direct["total_power_W"], rel=1e-12)
+    # A flag overrides the file.
+    args = vtol.build_arg_parser().parse_args(["--config", path, "--cruise_speed", "20"])
+    assert vtol.config_from_args(args).cruise_speed_mps == 20.0
+
+
+@pytest.mark.gui
+def test_gui_and_cli_agree_on_an_example_config(gui):
+    """Load a config in the GUI and on the command line: same cruise power."""
+    path = os.path.join(ROOT, "examples", "configs", "vtol_2m4_lift_cruise_survey.json")
+    gui.open_with(path)
+    assert gui.click("Load Config") == []
+    assert gui.click("Fixed Speed Sweep") == []
+    shown = {str(r[0]).strip(): str(r[1]) for r in gui.metric_rows()}["Cruise power"]
+    out = subprocess.run([sys.executable, VTOL_SCRIPT, "--config", path],
+                         capture_output=True, text=True, encoding="utf-8",
+                         env={**os.environ, "PYTHONIOENCODING": "utf-8"}, timeout=120)
+    assert out.returncode == 0, out.stderr
+    printed = re.search(r"Cruise power\s*:\s*([\d.]+)\s*W", out.stdout).group(1)
+    assert shown.split()[0] == printed, (shown, printed)
+
+
+# ======================================================================
+# OUTPUTS CARRIED OVER FROM THE MULTICOPTER AND FIXED-WING
+# ======================================================================
+
+EXTENDED_KEYS = ("hover_lift_rpm", "hover_lift_current_A", "hover_lift_throttle",
+                 "hover_lift_tip_mach", "cruise_motor_rpm", "hover_efficiency_gW",
+                 "hover_figure_of_merit", "lift_twr", "ld_cruise", "ld_max",
+                 "cl_cruise", "reynolds_number", "max_roc_mps", "service_ceiling_m",
+                 "takeoff_roll_m", "landing_distance_m", "best_endurance_speed_mps",
+                 "best_range_speed_mps", "glide_ratio", "min_sink_rate_mps",
+                 "motor_temp_est_C", "esc_temp_est_C", "battery_temp_est_C",
+                 "thermal_status", "density_altitude_m", "reserve_target_Wh",
+                 "propulsive_efficiency", "system_efficiency")
+
+
+@pytest.mark.parametrize("config_type", ["lift+cruise", "tiltrotor", "tiltwing", "tailsitter"])
+def test_every_configuration_reports_the_extended_metrics(vtol, config_type):
+    m = vtol.compute_metrics(vtol.VTOLConfig(config_type=config_type))
+    missing = [k for k in EXTENDED_KEYS if k not in m]
+    assert not missing, missing
+    for key in EXTENDED_KEYS:
+        if key in ("thermal_status", "service_ceiling_m", "takeoff_roll_m"):
+            continue
+        assert math.isfinite(float(m[key])), f"{key} = {m[key]}"
+
+
+def test_a_turn_raises_the_stall_speed_and_the_power(vtol):
+    straight = vtol.compute_metrics(vtol.VTOLConfig())
+    banked = vtol.compute_metrics(vtol.VTOLConfig(bank_deg=40.0))
+    assert banked["load_factor"] == pytest.approx(1.0 / math.cos(math.radians(40.0)))
+    assert banked["turn_stall_speed_mps"] > straight["stall_speed_mps"]
+    assert banked["turn_power_W"] > straight["total_power_W"]
+
+
+def test_every_mission_series_is_the_same_length(vtol):
+    _r, totals = vtol.simulate_mission(vtol.VTOLConfig(), vtol.VTOLMission.from_json(MISSION))
+    series = totals["series"]
+    n = len(series["t_s"])
+    assert n > 10
+    uneven = {k: len(v) for k, v in series.items() if len(v) != n}
+    assert not uneven, uneven
+    for key in ("groundspeed_mps", "lift_motor_current_A", "motor_temp_est_C",
+                "battery_voltage_V", "cl_wing"):
+        assert key in series
+
+
+def test_mission_temperatures_rise_from_ambient(vtol):
+    cfg = vtol.VTOLConfig()
+    _r, totals = vtol.simulate_mission(cfg, vtol.VTOLMission.from_json(MISSION))
+    assert totals["worst"]["motor_temp_est_C"] > cfg.ambient_temp_C
+    assert totals["series"]["motor_temp_est_C"][0] >= cfg.ambient_temp_C
+
+
+def test_simple_view_carries_the_other_simulators_simple_inputs(vtol):
+    """
+    Every input the multicopter or fixed-wing shows in Simple view has a
+    VTOL counterpart that is also in Simple view.
+    """
+    expected = {
+        "mass_mode", "structure_mass", "avionics_mass", "plot_vmax", "payload",
+        "oswald", "mu_roll", "mu_brake", "cl_takeoff", "cruise_eff", "cruise_eff_model",
+        "unit_mode", "vmin", "vnom", "vmax", "pack_cap", "pack_wt",
+        "cells_s_per_pack", "cells_p_per_pack", "usable", "rcell", "c_cont",
+        "a_cont", "soc_model", "lift_rm", "cruise_rm", "lift_i0", "cruise_i0",
+        "lift_imax", "cruise_imax", "lift_pmax", "cruise_pmax", "esc_cont",
+        "esc_imax", "esc_wt", "avionics_flat", "periph_current", "lift_blades",
+        "cruise_blades", "lift_max_thrust", "cruise_max_thrust", "lift_table",
+        "cruise_table", "lift_prop_wt", "cruise_prop_wt", "reserve_percent",
+        "course_deg", "cruise_altitude", "accel", "decel", "bank_deg",
+        "lift_layout", "coax_spacing", "max_tilt", "drag_model_mode",
+        "parasite_drag", "parasite_area", "profile_drag", "profile_area",
+        "body_length_m", "body_width_m", "body_height_m", "arm_length_m",
+        "arm_width_m"}
+    assert not expected - vtol.VTOL_SIMPLE_FIELDS, expected - vtol.VTOL_SIMPLE_FIELDS
+
+
+@pytest.mark.gui
+def test_the_metrics_tab_carries_the_carried_over_sections(gui):
+    assert gui.click("Fixed Speed Sweep") == []
+    sections = gui.metric_sections()
+    for expected in ("Thrust & Power", "Climb & Glide", "Turning Flight",
+                     "Conventional Take-off / Landing", "Lift Motor (hover)",
+                     "Cruise Motor (at cruise)", "Propellers & Rotors",
+                     "Thermal Estimates", "Environment"):
+        assert expected in sections, f"{expected!r} missing: {sections}"
+
+
+@pytest.mark.gui
+def test_the_sweep_carries_the_fixed_wing_panels(gui):
+    assert gui.click("Fixed Speed Sweep") == []
+    fig = _current_sweep_figure(gui)
+    titles = " | ".join(ax.get_title() for ax in fig.axes)
+    for expected in ("Thrust Required vs Available", "Rate of Climb",
+                     "Drag vs Airspeed", "Drag Polar"):
+        assert expected in titles, titles

@@ -2,8 +2,8 @@
 Golden-output regression.
 
 A refactor must not change a single number. This module computes a broad set
-of metrics from fixed configurations and compares them against a stored
-snapshot, so any behavioural drift during the shared-core extraction shows up
+of metrics from fixed configurations — multicopter, fixed-wing and VTOL —
+and compares them against a stored snapshot, so any behavioural drift during the shared-core extraction shows up
 immediately and precisely ("flight_time_min moved by 0.3") rather than as a
 vague downstream failure.
 
@@ -42,6 +42,26 @@ FW_KEYS = [
     "glide_distance_m", "takeoff_dist_m", "landing_dist_m",
     "reynolds_number", "specific_range_m_per_Wh",
 ]
+
+# The VTOL: the flight regime and the power chain, the motor model, and the
+# figures carried over from the other two simulators.
+VTOL_KEYS = [
+    "total_power_W", "shaft_power_W", "rotor_shaft_W", "cruise_shaft_W",
+    "motor_loss_W", "esc_loss_W", "pack_current_A", "v_load_V",
+    "rotor_thrust_N", "wing_lift_N", "cruise_thrust_N", "tilt_deg",
+    "lift_share_wing", "hover_power_W", "hover_endurance_min",
+    "cruise_endurance_min", "cruise_range_km", "stall_speed_mps",
+    "transition_speed_mps", "hover_lift_rpm", "hover_lift_current_A",
+    "hover_lift_throttle", "cruise_motor_rpm", "cruise_motor_current_A",
+    "hover_efficiency_gW", "hover_figure_of_merit", "lift_twr",
+    "ld_cruise", "max_roc_mps", "best_endurance_speed_mps",
+    "best_range_speed_mps", "takeoff_roll_m", "landing_distance_m",
+    "motor_temp_est_C", "esc_temp_est_C", "reserve_margin_Wh",
+]
+
+VTOL_EXAMPLES = ["vtol_2m4_lift_cruise_survey.json",
+                 "vtol_trinity_f90_lift_cruise.json",
+                 "vtol_wingtraone_gen2_tailsitter.json"]
 
 
 def _build_multicopter(mc):
@@ -154,9 +174,61 @@ def _build_fixedwing(fw):
     return out
 
 
-def _collect(mc, fw):
+def _vtol_row(vtol, metrics):
+    row = {}
+    for key in VTOL_KEYS:
+        val = metrics.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            if math.isfinite(float(val)):
+                row[key] = round(float(val), 6)
+    return row
+
+
+def _collect_vtol(vtol):
+    """
+    Every VTOL configuration across its speed range, the three example
+    aircraft at their own cruise speed, and one whole mission.
+    """
+    snap = {}
+    for config_type in vtol.CONFIG_TYPES:
+        cfg = vtol.VTOLConfig(config_type=config_type)
+        for speed in (0.0, 8.0, 14.0, 22.0):
+            snap[f"vtol/{config_type}/@{speed}"] = _vtol_row(
+                vtol, vtol.compute_metrics(cfg, speed))
+
+    examples = os.path.join(os.path.dirname(HERE), "examples")
+    for name in VTOL_EXAMPLES:
+        values, config_type = vtol.load_fields_file(
+            os.path.join(examples, "configs", name))
+        cfg = vtol.config_from_fields(values, config_type)
+        snap[f"vtol/example/{name[:-5]}"] = _vtol_row(vtol, vtol.compute_metrics(cfg))
+
+    mission = vtol.VTOLMission.from_json(
+        os.path.join(examples, "missions", "vtol_01_lift_cruise_survey.json"))
+    _results, totals = vtol.simulate_mission(vtol.VTOLConfig(), mission,
+                                             wind_mps=4.0, wind_direction_deg=30.0,
+                                             max_accel_mps2=2.0)
+    worst = totals["worst"]
+    snap["vtol/mission/vtol_01_wind4"] = {
+        "time_s": round(totals["time_s"], 6),
+        "distance_m": round(totals["distance_m"], 6),
+        "energy_Wh": round(totals["energy_Wh"], 6),
+        "hover_Wh": round(totals["hover_Wh"], 6),
+        "transition_Wh": round(totals["transition_Wh"], 6),
+        "cruise_Wh": round(totals["cruise_Wh"], 6),
+        "peak_power_W": round(worst["total_power_W"], 6),
+        "peak_lift_current_A": round(worst["lift_motor_current_A"], 6),
+        "min_soc_pct": round(worst["min_soc_pct"], 6),
+        "peak_motor_temp_C": round(worst["motor_temp_est_C"], 6),
+    }
+    return snap
+
+
+def _collect(mc, fw, vtol=None):
     """Compute the full snapshot dictionary."""
     snap = {}
+    if vtol is not None:
+        snap.update(_collect_vtol(vtol))
 
     for name, drone in _build_multicopter(mc).items():
         for speed, orientation in [(0.0, "hover"), (5.0, "forward"),
@@ -226,7 +298,7 @@ def _collect(mc, fw):
     return snap
 
 
-def test_outputs_match_golden_snapshot(mc, fw):
+def test_outputs_match_golden_snapshot(mc, fw, vtol):
     """
     Every stored value must still be produced exactly.
 
@@ -239,7 +311,7 @@ def test_outputs_match_golden_snapshot(mc, fw):
 
     with open(SNAPSHOT, encoding="utf-8") as handle:
         expected = json.load(handle)
-    actual = _collect(mc, fw)
+    actual = _collect(mc, fw, vtol)
 
     missing = sorted(set(expected) - set(actual))
     assert not missing, f"snapshot cases no longer produced: {missing[:5]}"
@@ -272,7 +344,7 @@ if __name__ == "__main__":
     # repository root has to be importable when running this file directly.
     sys.path.insert(0, HERE)
     sys.path.insert(0, os.path.dirname(HERE))
-    from conftest import FIXEDWING, MULTICOPTER, _load, _stub_tkinter
+    from conftest import FIXEDWING, MULTICOPTER, VTOL, _load, _stub_tkinter
 
     try:
         import tkinter  # noqa: F401
@@ -281,7 +353,8 @@ if __name__ == "__main__":
 
     mc_mod = _load(MULTICOPTER, "rw_multicopter")
     fw_mod = _load(FIXEDWING, "rw_fixedwing")
-    data = _collect(mc_mod, fw_mod)
+    vtol_mod = _load(VTOL, "rw_vtol")
+    data = _collect(mc_mod, fw_mod, vtol_mod)
 
     with open(SNAPSHOT, "w", encoding="utf-8") as handle:
         json.dump(data, handle, indent=2, sort_keys=True)
