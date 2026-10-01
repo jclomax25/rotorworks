@@ -708,7 +708,7 @@ Aerodynamic.
 | **ESC** | Voltage rating (**in S cells, not volts**), continuous/max current, resistance |
 | **Avionics** | Voltage rails: V, A, converter efficiency |
 | **Prop** | Diameter, pitch, blades, limits, optional CSV test table |
-| **Wiring** | Wire run length and gauge, connector ratings for battery / ESC / motor |
+| **Wiring** | Main lead length, gauge (or measured Ω/m) and insulation temperature limit; connector type, current and voltage ratings for battery / ESC / motor |
 | **Mission / Env** | Speed, wind, altitude, temperature, reserves, or a mission JSON |
 
 The VTOL splits the Motor and Prop tabs into **Lift Rotors** and **Cruise**,
@@ -866,7 +866,8 @@ the same answer through each. `--help` lists every flag.
 | `--max_accel`, `--max_decel` | m/s² | 0 ignores transients |
 | `--regen_eff` | 0–1 | Braking energy recovered; 0 is the honest default |
 | `--wire_length`, `--wire_awg`, `--wire_ohm_per_m` | m, AWG, Ω/m | Main battery lead |
-| `--connector_batt_cont` and friends | amps | Connector ratings, checked at hover |
+| `--wire_temp_limit` | °C | Lead insulation limit for the temperature check; default 150 |
+| `--connector_batt_cont`, `_max`, `_volt` (and `esc_`, `motor_`) | A, A, V | Connector ratings, checked at hover |
 | `--battery_c_cont`, `--battery_c_max` | C | Pack discharge ratings |
 | `--lift_motor_kv`, `--lift_motor_resistance`, `--lift_motor_i0` (and `cruise_…`) | rpm/V, Ω, A | The motor model; Kv 0 turns it off |
 | `--lift_motor_max_current`, `--esc_cont_current`, `--esc_max_current` | A | Checked on Status |
@@ -1318,9 +1319,8 @@ sudo apt install python3-tk
 
 You are running an older copy of the script. Check with **Help → About /
 Version** — the current VTOL is **v1.11.0**, and the current multicopter and
-fixed-wing report **v2.41.0** (the v2.42.0 wiring release below did not bump
-their version constant). The version also appears in the window title bar and
-at the top of the Output pane on startup.
+fixed-wing are **v2.42.0**. The version also appears in the window title bar
+and at the top of the Output pane on startup.
 
 From a terminal:
 
@@ -1488,6 +1488,21 @@ fine. Open the file and check the values are numeric.
   golden snapshot gained 694 VTOL values; 26 new VTOL tests. The multicopter
   CLI now evaluates hover stationary, as its GUI does, and both say which
   orientation ran.
+- **Inputs a dropdown makes irrelevant are greyed out**, as on the multicopter
+  and fixed-wing: in cell mode the pack fields (cells in series and parallel
+  per pack, pack capacity and weight), in pack mode the cell fields; whichever
+  mass the Mass Entry Mode calculates; the cruise motor and propeller on the
+  vectored types; coaxial spacing on a flat layout; the drag fields the drag
+  mode does not use; and the SoC curve on the linear model. Greying out
+  changes no result.
+- **"derive structure" / "enter structure" are now "derive airframe" /
+  "enter airframe"**, the weight field reads "All-up weight without payload"
+  and the structure field "Airframe mass". Configs saved with the old names,
+  and the old `--mass_mode` values, still load.
+- **Wiring shares the multicopter's and fixed-wing's model**: the new wire
+  temperature limit and connector voltage inputs, the same Status rows (voltage
+  drop, wire temperature, connector current and voltage, at hover), and the
+  motor throttle judged at the voltage left after the lead's drop.
 
 **VTOL v1.10.0** — the other simulators' tabs and inputs
 *Reconstructed from the tests added with it; the release's own notes were
@@ -1789,11 +1804,21 @@ that would have been confidently wrong.
   easiest way to make wiring look harmless.
   The loss is solved INSIDE the power fixed-point loop, because more loss
   draws more current which costs more loss. The ESC and motor also see the
-  pack voltage minus `I·R`, so a long thin lead costs thrust as well as watts.
+  pack voltage minus `I·R`, so a long thin lead costs thrust as well as watts:
+  the ESC loss, the motor current and the throttle are all worked out at the
+  voltage that actually reaches the ESC.
 - **Wire loss gets its own Power Budget row**, not folded into ESC losses: it
   is the one loss a user can halve with a thicker cable, so it has to be
-  visible to be actionable. On a 450 quad with 2 m of 16 AWG it is 3.6 W,
-  2.6% of the total.
+  visible to be actionable. On a 1.8 kg 4S quad with 2 m of 16 AWG it is
+  3.5 W at hover, 2.6% of the total.
+- **Wire temperature** is estimated on Status: the steady temperature of the
+  lead in still air, with copper's resistance rising as it heats. Amber within
+  20 °C of the insulation limit (default 150 °C, editable), red above it; a
+  lead that cannot shed its own heat reports "above 400 °C" rather than a
+  number. Still air is the conservative case — a lead in the prop wash runs
+  cooler.
+- **Voltage drop** is checked too: green up to 3% of the full pack voltage,
+  amber to 5%, red beyond.
 - **Connector ratings** for the battery, ESC and motor links. Twelve types
   (XT30/60/90, AS150, EC3/EC5, Deans, bullets 3.5-8 mm) pre-fill typical
   continuous and burst figures, both editable — burst ratings vary too much
@@ -1804,6 +1829,18 @@ that would have been confidently wrong.
   connector phase current (about 1.15x the DC current). Green under the
   continuous rating, amber between, red above the burst — the same dual-limit
   treatment as the battery C-rate rows.
+- **Connector voltage ratings**: each connector also takes a rated voltage,
+  checked against the pack's FULL-charge voltage. Picking an Amass type (XT30,
+  XT60, XT90, AS150) fills in its published 500 V DC; the others publish none,
+  so the field stays blank and the check reads "Not Specified".
+- **Metrics** gains a Wiring section (lead resistance, loss, drop, ESC input
+  voltage and temperature), and the Output pane and CLI print a "Main lead"
+  line whenever a lead is entered.
+- The wiring model lives in `rotorworks_core`, and the GUI and CLI build it
+  through the same function, so they give the same answer. The VTOL uses it
+  too. The CLI flags are the VTOL's: `--wire_length`, `--wire_awg`,
+  `--wire_ohm_per_m`, `--wire_temp_limit` and `--connector_{batt,esc,motor}_{cont,max,volt}`;
+  the batch driver maps the saved GUI fields onto them.
 
 **v2.41.0** — Mission Diagram tab
 - **New Mission Diagram tab** in both simulators, drawn after a mission run.

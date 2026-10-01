@@ -541,6 +541,12 @@ def choose_best_result(
 # perturb an inflow-map breakpoint or a SoC curve and wonder why the answers
 # moved.  Use "advanced" to unlock everything.
 
+SIMPLE_WIRING_ARGS = (
+    "wire_length", "wire_awg",
+    *(f"connector_{name}_{rating}" for name in ("batt", "esc", "motor")
+      for rating in ("cont", "max", "volt")),
+)
+
 SIMPLE_ARGS_MULTICOPTER = {
     # Airframe
     "num_motors", "weight", "payload_mass_g", "speed", "area",
@@ -572,6 +578,9 @@ SIMPLE_ARGS_MULTICOPTER = {
     # Mission / environment
     "mission", "orientation", "altitude", "temperature",
     "wind", "wind_direction_deg", "course_deg", "reserve_percent",
+    # Wiring: the lead, and the connector ratings the GUI's Simple view fills
+    # in from the connector type it shows
+    *SIMPLE_WIRING_ARGS,
 }
 
 SIMPLE_ARGS_FIXEDWING = {
@@ -603,6 +612,9 @@ SIMPLE_ARGS_FIXEDWING = {
     # Mission / environment
     "mission", "altitude", "temperature",
     "wind", "wind_direction_deg", "course_deg", "bank_deg", "reserve_percent",
+    # Wiring: the lead, and the connector ratings the GUI's Simple view fills
+    # in from the connector type it shows
+    *SIMPLE_WIRING_ARGS,
 }
 
 
@@ -795,6 +807,19 @@ GUI_TO_CLI_FIXEDWING = {
     "rth_reserve_Wh": "rth_reserve_Wh",
     "diversion_reserve_Wh": "diversion_reserve_Wh",
 }
+
+
+# The Wiring tab, identical on both simulators (and on the VTOL, which reads
+# its map straight from the simulator). The connector-type dropdowns have no
+# flag: they only fill in the ratings, which are saved alongside them.
+WIRING_GUI_TO_CLI = {
+    "wire_len": "wire_length", "wire_awg": "wire_awg",
+    "wire_ohm_m": "wire_ohm_per_m", "wire_temp_limit": "wire_temp_limit",
+    **{f"conn_{name}_{rating}": f"connector_{name}_{rating}"
+       for name in ("batt", "esc", "motor") for rating in ("cont", "max", "volt")},
+}
+GUI_TO_CLI_MULTICOPTER.update(WIRING_GUI_TO_CLI)
+GUI_TO_CLI_FIXEDWING.update(WIRING_GUI_TO_CLI)
 
 
 def _avionics_rows_to_string(rows) -> Optional[str]:

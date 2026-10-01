@@ -88,7 +88,7 @@ ramp_speed = core.ramp_speed
 
 # Build identifier. Shown in the title bar, the Output pane and Help > About
 # so you can always tell which copy of the script you are running.
-SIM_VERSION = "2.41.0"
+SIM_VERSION = "2.42.0"
 SIM_BUILD_NOTE = "Table-path inflow double-count fixed; table range warnings"
 import matplotlib.pyplot as plt
 
@@ -530,7 +530,15 @@ def total_power_with_esc(config: "DroneConfig",
                          periph_power_W: float,
                          iters: int = 6,
                          soc: Optional[float] = None) -> tuple[float, float, float, str, float]:
-    """Iteratively solve pack voltage/current while accounting for ESC loss.
+    """Iteratively solve pack voltage/current while accounting for ESC loss
+    and the main wire run.
+
+    The wire's I^2 R loss is solved inside the loop, because the loss draws
+    more current and more current costs more loss. The ESCs also see the
+    pack voltage MINUS the wire's I*R drop, so a long thin lead raises the
+    current each ESC carries for the same power — it costs thrust headroom
+    as well as watts. With no wiring entered the resistance is zero and this
+    is exactly the ESC-only loop it replaced.
 
     Returns:
       (total_power_W, v_load_V, pack_current_A, esc_note, motor_current_per_esc_A)
@@ -540,14 +548,19 @@ def total_power_with_esc(config: "DroneConfig",
     pack_current = total_power / max(v_load, 1e-9)
     esc_note = ""
     i_motor = 0.0
+    wiring = getattr(config, "wiring", None)
+    r_wire = wiring.resistance_ohm if wiring is not None else 0.0
 
-    # Fixed-point iteration (ESC loss depends on v_load)
+    # Fixed-point iteration (ESC and wire losses depend on v_load and I)
     for _ in range(max(int(iters), 1)):
         v_load, pack_current = solve_pack_voltage_and_current(
             config.battery, total_power, soc=soc
         )
-        esc_loss_W, esc_note, i_motor = esc_loss_and_checks(config, v_load, motor_power_W)
-        total_power = float(motor_power_W) + float(periph_power_W) + float(esc_loss_W)
+        v_esc = max(v_load - pack_current * r_wire, 1e-3)
+        esc_loss_W, esc_note, i_motor = esc_loss_and_checks(config, v_esc, motor_power_W)
+        wire_loss = pack_current * pack_current * r_wire
+        total_power = (float(motor_power_W) + float(periph_power_W)
+                       + float(esc_loss_W) + wire_loss)
 
     return float(total_power), float(v_load), float(pack_current), esc_note, float(i_motor)
 
@@ -1776,7 +1789,14 @@ def _compute_operating_metrics_core(drone: DroneConfig,
     total_thrust_N     = thrust_required(drone, airspeed, orientation,
                                          load_factor=load_factor)
     thrust_per_motor_N = total_thrust_N / max(int(drone.num_motors), 1)
-    esc_loss_W  = max(0.0, float(total_power_W) - float(motor_power_W) - float(periph_power_W))
+    # The main wire run, at the current it actually carries. Its loss is
+    # already inside total_power_W; it is taken out of the ESC figure here
+    # so each loss is reported once and in its own row.
+    _wiring = getattr(drone, "wiring", None)
+    wire = (_wiring.summary(pack_current_A, ambient_temp_C) if _wiring is not None
+            else core.wiring_summary(0.0, 0.0, ambient_C=ambient_temp_C))
+    esc_loss_W  = max(0.0, float(total_power_W) - float(motor_power_W)
+                      - float(periph_power_W) - float(wire["loss_W"]))
     rpm_est     = None
     if drone.propeller.TConst and drone.propeller.PConst:
         try:
@@ -1922,6 +1942,12 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         "periph_power_W":      float(periph_power_W),
         "total_power_W":       float(total_power_W),
         "v_load_V":            float(v_load),
+        # Main wire run and the voltage the ESCs actually receive.
+        "wire_resistance_ohm": float(wire["resistance_ohm"]),
+        "wire_loss_W":         float(wire["loss_W"]),
+        "wire_drop_V":         float(wire["drop_V"]),
+        "wire_temp_C":         float(wire["temp_C"]),
+        "esc_input_voltage_V": float(v_load) - float(wire["drop_V"]),
         "pack_current_A":      float(pack_current_A),
         "esc_loss_W":          float(esc_loss_W),
 
@@ -2295,9 +2321,12 @@ def simulate_mission(config: DroneConfig,
         for k in ("pack_current_A", "total_power_W", "motor_power_W", "periph_power_W",
                   "esc_loss_W", "motor_I_per_esc_A", "thrust_total_N", "thrust_per_motor_N",
                   "motor_temp_est_C", "esc_temp_est_C", "battery_temp_est_C",
-                  "accel_mps2", "commanded_airspeed_mps", "advance_ratio_mu"):
+                  "accel_mps2", "commanded_airspeed_mps", "advance_ratio_mu",
+                  "wire_loss_W", "wire_drop_V", "wire_temp_C"):
             worst[k] = max(float(worst.get(k, 0.0)), float(m.get(k, 0.0)))
         worst["v_load_V"] = min(float(worst.get("v_load_V", 1e9)), float(m.get("v_load_V", 1e9)))
+        worst["esc_input_voltage_V"] = min(float(worst.get("esc_input_voltage_V", 1e9)),
+                                           float(m.get("esc_input_voltage_V", 1e9)))
         worst["reserve_margin_Wh"] = min(float(worst.get("reserve_margin_Wh", 1e9)),
                                          float(m.get("reserve_margin_Wh", 1e9)))
         if worst.get("prop_rpm") is None:
@@ -3196,6 +3225,7 @@ def build_drone_from_args(args) -> DroneConfig:
         temperature_C=args.temperature,
         pressure_Pa=args.pressure,
     )
+    drone.wiring = core.wiring_from_args(args)
     return drone
 
 
@@ -3516,6 +3546,39 @@ def _generate_pdf_report(path: str, report_title: str,
 # first drone, not someone who already knows what an Oswald factor is.
 # ------------------------------------------------------------------
 MC_FIELD_HELP = {
+    # Wiring tab
+    "wire_len": ('One-way length of the main lead from the battery to the ESCs or power board. Both conductors are counted — current comes back too — so the loss is for twice this length.',
+        '0.1-0.5 m; blank ignores wiring entirely'),
+    "wire_awg": ('Gauge of the main lead, copper at 20 °C. A HIGHER number is THINNER wire, with more loss and a hotter run.',
+        '10-14 AWG for most packs; 8 AWG for large lifters'),
+    "wire_ohm_m": ('Measured resistance of one conductor per metre, from your own spool. Overrides the gauge when given.',
+        'leave blank to use the gauge'),
+    "wire_temp_limit": ("Temperature the lead's insulation may reach. Status checks the estimated wire temperature against it.",
+        '150 °C for silicone (rated 200 °C); 90 °C for PVC'),
+    "conn_batt": ('Connector type between the pack and the aircraft. Picking one fills in typical ratings below; edit them to match your parts.',
+        'XT60 or XT90 for most, AS150 for large packs'),
+    "conn_esc": ("Connector type at each ESC's power input, if any.",
+        'often soldered — leave blank'),
+    "conn_motor": ('Connector type on the three motor phase leads.',
+        '3.5-5.5 mm bullets'),
+    "conn_batt_cont": ('Continuous current rating of the battery connector, which carries the whole pack current.',
+        'filled in by the connector type'),
+    "conn_batt_max": ('Burst current rating of the battery connector, which carries the whole pack current.',
+        'filled in by the connector type; varies by maker'),
+    "conn_batt_volt": ('Rated voltage of the connector. Status checks the full-charge pack voltage against it.',
+        '500 V for Amass XT/AS; most others publish none'),
+    "conn_esc_cont": ("Continuous current rating of one ESC connector, which carries one motor's share.",
+        'filled in by the connector type'),
+    "conn_esc_max": ("Burst current rating of one ESC connector, which carries one motor's share.",
+        'filled in by the connector type; varies by maker'),
+    "conn_esc_volt": ('Rated voltage of the connector. Status checks the full-charge pack voltage against it.',
+        '500 V for Amass XT/AS; most others publish none'),
+    "conn_motor_cont": ("Continuous current rating of one motor phase connector, about 1.15x the ESC's DC current.",
+        'filled in by the connector type'),
+    "conn_motor_max": ("Burst current rating of one motor phase connector, about 1.15x the ESC's DC current.",
+        'filled in by the connector type; varies by maker'),
+    "conn_motor_volt": ('Rated voltage of the connector. Status checks the full-charge pack voltage against it.',
+        '500 V for Amass XT/AS; most others publish none'),
     # ---- Drone ----
     "num_motors": ("How many motors the aircraft has.",
                    "4 = quad, 6 = hex, 8 = octo. Coaxial X8 counts all 8."),
@@ -3853,6 +3916,9 @@ MC_FIELD_HELP = {
 # honest endurance number, and it is a common beginner mistake to omit it.
 # ------------------------------------------------------------------
 MC_SIMPLE_FIELDS = {
+    # Wiring: the lead and the connector types; the ratings they fill in and
+    # the measured resistance stay in Advanced.
+    "wire_len", "wire_awg", "conn_batt", "conn_esc", "conn_motor",
     "mass_mode", "airframe_mass",
     "avionics_mass", "max_speed_plot",
     # Drone
@@ -4300,6 +4366,14 @@ def launch_gui():
     v_div_reserve_Wh    = sv(0)
     v_transient_dt_s    = sv(0.5)
     v_max_accel_mps2    = sv(2.0)
+    # Wiring tab: the main lead and the three connector ratings. All blank by
+    # default, which leaves every result exactly as it was without them.
+    v_wiring = {key: sv("") for key in (
+        "wire_len", "wire_awg", "wire_ohm_m",
+        "conn_batt", "conn_batt_cont", "conn_batt_max", "conn_batt_volt",
+        "conn_esc", "conn_esc_cont", "conn_esc_max", "conn_esc_volt",
+        "conn_motor", "conn_motor_cont", "conn_motor_max", "conn_motor_volt")}
+    v_wiring["wire_temp_limit"] = sv(core.WIRE_TEMP_LIMIT_C)
     v_max_decel_mps2    = sv(2.5)
     v_decel_regen_eff   = sv(0.0)
     v_inflow_map_enabled = sv("1")
@@ -4422,6 +4496,7 @@ def launch_gui():
     tab_batt     = make_scrollable_tab(input_nb, "Battery")
     tab_motor    = make_scrollable_tab(input_nb, "Motor")
     tab_esc      = make_scrollable_tab(input_nb, "ESC")
+    tab_wiring   = make_scrollable_tab(input_nb, "Wiring")
     tab_avionics = make_scrollable_tab(input_nb, "Avionics")
     tab_prop     = make_scrollable_tab(input_nb, "Propeller")
     tab_mission  = make_scrollable_tab(input_nb, "Mission/Environment")
@@ -4996,6 +5071,61 @@ def launch_gui():
     add_row(tab_mission, r, "Inflow mu breakpoints",      v_inflow_mu_bp, key="inflow_mu_bp");    r += 1
     add_row(tab_mission, r, "Inflow eta breakpoints",     v_inflow_eff_bp, key="inflow_eff_bp");   r += 1
 
+
+    # ===== WIRING TAB =====
+    # The same inputs as the VTOL's Wiring tab, feeding the same core model:
+    # the lead's loss and voltage drop are solved inside the power loop, and
+    # Status checks the wire temperature and every connector's current and
+    # voltage ratings.
+    r = 0
+    ttk.Label(tab_wiring, text="Main battery-to-ESC wire run and connector ratings. "
+              "Blank ignores wiring entirely.", wraplength=320, justify="left",
+              foreground="#555555").grid(row=r, column=0, columnspan=3,
+                                         sticky="w", padx=6, pady=(4, 6)); r += 1
+    add_row(tab_wiring, r, "Wire length one-way (m)", v_wiring["wire_len"], key="wire_len"); r += 1
+
+    def _choice_row(r, label, key, values):
+        """A dropdown row, registered like add_row's so Simple mode reaches it."""
+        lbl = ttk.Label(tab_wiring, text=label)
+        lbl.grid(row=r, column=0, sticky="w", padx=6, pady=3)
+        box = ttk.Combobox(tab_wiring, textvariable=v_wiring[key], state="readonly",
+                           width=14, values=values)
+        box.grid(row=r, column=1, sticky="w", padx=6, pady=3)
+        what, typical = MC_FIELD_HELP[key]
+        marker = ttk.Label(tab_wiring, text=" ? ", foreground="#0B6BCB",
+                           cursor="question_arrow", font=("TkDefaultFont", 9, "bold"))
+        marker.grid(row=r, column=2, sticky="w", padx=(0, 6))
+        _Tooltip(marker, f"{what}\n\nTypical: {typical}")
+        _Tooltip(lbl, f"{what}\n\nTypical: {typical}")
+        _register_row(key, [lbl, box, marker], tab_wiring, r)
+
+    _choice_row(r, "Wire gauge (AWG)", "wire_awg",
+                [""] + [str(g) for g in sorted(core.AWG_OHM_PER_M)]); r += 1
+    add_row(tab_wiring, r, "Wire resistance (\u03a9/m)", v_wiring["wire_ohm_m"], key="wire_ohm_m"); r += 1
+    add_row(tab_wiring, r, "Wire temp limit (\u00b0C)", v_wiring["wire_temp_limit"], key="wire_temp_limit"); r += 1
+    ttk.Label(tab_wiring, text="Connector ratings \u2014 pick a type to fill typical "
+              "figures, then edit to match your parts.", wraplength=320,
+              justify="left", foreground="#555555").grid(
+        row=r, column=0, columnspan=3, sticky="w", padx=6, pady=(10, 4)); r += 1
+    for _label, _prefix in (("Battery connector", "conn_batt"),
+                            ("ESC connector", "conn_esc"),
+                            ("Motor connector", "conn_motor")):
+        _choice_row(r, _label, _prefix, [""] + sorted(core.CONNECTOR_RATINGS)); r += 1
+        add_row(tab_wiring, r, "   continuous (A)", v_wiring[f"{_prefix}_cont"], key=f"{_prefix}_cont"); r += 1
+        add_row(tab_wiring, r, "   max / burst (A)", v_wiring[f"{_prefix}_max"], key=f"{_prefix}_max"); r += 1
+        add_row(tab_wiring, r, "   rated voltage (V)", v_wiring[f"{_prefix}_volt"], key=f"{_prefix}_volt"); r += 1
+
+        def _fill(*_a, _p=_prefix):
+            # Convenience, not a lock: ratings stay editable, because burst
+            # figures vary widely between manufacturers.
+            amps = core.connector_defaults(v_wiring[_p].get())
+            if amps:
+                v_wiring[f"{_p}_cont"].set(f"{amps[0]:g}")
+                v_wiring[f"{_p}_max"].set(f"{amps[1]:g}")
+                volts = core.connector_voltage_default(v_wiring[_p].get())
+                v_wiring[f"{_p}_volt"].set(f"{volts:g}" if volts else "")
+        v_wiring[_prefix].trace_add("write", _fill)
+
     # ------------------------------------------------------------------ #
     #  Collect config_vars for save/load                                  #
     # ------------------------------------------------------------------ #
@@ -5060,6 +5190,13 @@ def launch_gui():
         "inflow_eff_bp": v_inflow_eff_bp,
         "orientation": v_orientation,
         "max_speed_plot": v_max_speed_plot,
+        # Wiring: each connector type before its ratings, so loading a config
+        # fills the preset first and the saved ratings then overwrite it.
+        **{key: v_wiring[key] for key in (
+            "wire_len", "wire_awg", "wire_ohm_m", "wire_temp_limit",
+            "conn_batt", "conn_batt_cont", "conn_batt_max", "conn_batt_volt",
+            "conn_esc", "conn_esc_cont", "conn_esc_max", "conn_esc_volt",
+            "conn_motor", "conn_motor_cont", "conn_motor_max", "conn_motor_volt")},
     }
 
     # ================================================================== #
@@ -5201,6 +5338,7 @@ def launch_gui():
             motor_copper_W=copper_W,
             battery_i2r_W=float(metrics.get("battery_i2r_loss_W", 0.0) or 0.0),
             esc_loss_W=float(metrics.get("esc_loss_W", 0.0) or 0.0),
+            wire_loss_W=float(metrics.get("wire_loss_W", 0.0) or 0.0),
             # Valued at NOMINAL pack voltage, matching how the model
             # charges it. Using the loaded voltage here disagreed with
             # the model by the sag, which showed up as "Unaccounted".
@@ -6599,6 +6737,16 @@ def launch_gui():
                 f"profile losses climb. More blades means more solidity — the "
                 f"range is scaled accordingly.")
 
+        # ---- Wiring and connectors -------------------------------------
+        # The shared rows all three simulators show: the lead's voltage drop
+        # and temperature, and each connector against the current through
+        # IT and the pack's full-charge voltage.
+        for _group, _name, _val, _lim, _tag, _note in core.wiring_status_rows(
+                getattr(config, "wiring", None), Ipack, Iesc,
+                float(batt.vmax_pack), float(metrics.get("ambient_temp_C", 25.0))):
+            _insert_status_row(batt_table if _group == "battery" else motor_table,
+                               _name, _val, _lim, _tag, _note)
+
     # ---- Metrics panel ----
     metrics_container = ttk.Frame(tab_metrics_out, padding=4)
     metrics_container.grid(row=0, column=0, sticky="nsew")
@@ -6737,9 +6885,11 @@ def launch_gui():
         #     V_winding = V_emf + I_winding * Rm
         # eliminating I_winding gives a quadratic in V_winding:
         #     V^2 - V_emf*V - P_elec*Rm = 0
-        P_elec_motor = (I_motor * v_load) if (I_motor == I_motor and v_load == v_load) else float("nan")
+        # The ESCs see the pack voltage minus the main lead's drop.
+        v_supply = float(metrics.get("esc_input_voltage_V", v_load) or v_load)
+        P_elec_motor = (I_motor * v_supply) if (I_motor == I_motor and v_supply == v_supply) else float("nan")
 
-        V_motor = v_load
+        V_motor = v_supply
         I_winding = I_motor
         if V_emf == V_emf and P_elec_motor == P_elec_motor and P_elec_motor > 0:
             V_motor = 0.5 * (V_emf + math.sqrt(V_emf * V_emf + 4.0 * P_elec_motor * Rm))
@@ -6748,7 +6898,7 @@ def launch_gui():
         elif V_emf == V_emf and I_motor == I_motor:
             V_motor = V_emf + I_motor * Rm
 
-        throttle_linear = (V_motor / v_load) if (v_load == v_load and v_load > 1e-6 and V_motor == V_motor) else float("nan")
+        throttle_linear = (V_motor / v_supply) if (v_supply == v_supply and v_supply > 1e-6 and V_motor == V_motor) else float("nan")
         if throttle_linear == throttle_linear:
             throttle_linear = max(0.0, min(1.2, throttle_linear))
         throttle_log = float("nan")
@@ -6959,6 +7109,24 @@ def launch_gui():
                      f"{fmt(p2w_Wkg,1)} W/kg   (total electrical power / all-up mass)")
         if P_total > 0:
             pass
+
+        # ── Wiring ────────────────────────────────────────────────────────
+        _wiring = getattr(drone, "wiring", None)
+        if _wiring is not None and _wiring.resistance_ohm > 0:
+            _metrics_add_section("Wiring")
+            _metrics_add("Main lead resistance",
+                         f"{_wiring.resistance_ohm * 1000:.1f} mΩ  (round trip, "
+                         f"{_wiring.length_m:.2f} m one way)")
+            _metrics_add("Main lead loss", f"{fmt(metrics.get('wire_loss_W', 0.0), 2)} W")
+            _metrics_add("Main lead voltage drop",
+                         f"{fmt(metrics.get('wire_drop_V', 0.0), 3)} V",
+                         "I x R along the lead; the ESCs see the pack minus this.")
+            _metrics_add("ESC input voltage",
+                         f"{fmt(metrics.get('esc_input_voltage_V', 0.0), 2)} V")
+            _metrics_add("Main lead temperature (est)",
+                         f"{fmf(metrics.get('wire_temp_C', float('nan')), 0)} °C  "
+                         f"(limit {_wiring.temp_limit_C:.0f} °C)",
+                         "Steady, still air — conservative.")
 
         # ── Propeller & Rotor ─────────────────────────────────────────────
         _metrics_add_section("Propeller & Rotor")
@@ -7526,6 +7694,9 @@ def launch_gui():
             temperature_C = float(temp) if temp else None,
             pressure_Pa   = float(pres) if pres else None,
         )
+        # The same core builder the CLI uses, so the two agree on the lead.
+        drone.wiring = core.wiring_from_fields(
+            {key: var.get() for key, var in v_wiring.items()})
         return drone
 
     # ================================================================== #
@@ -7705,6 +7876,10 @@ def launch_gui():
                 f"Thermal M/ESC/B : {_fmt_out(metrics.get('motor_temp_est_C', float('nan')),1)} / {_fmt_out(metrics.get('esc_temp_est_C', float('nan')),1)} / {_fmt_out(metrics.get('battery_temp_est_C', float('nan')),1)} °C\n"
                 f"Hover wind max  : {_fmt_out(metrics.get('hover_wind_resistance_mps', float('nan')),2)} m/s\n"
                 f"Prop solidity σ : {_fmt_out(metrics.get('prop_solidity_sigma', float('nan')),3)}\n"
+                + (f"Main lead       : {_fmt_out(metrics.get('wire_loss_W', 0.0),1)} W, "
+                   f"{_fmt_out(metrics.get('wire_drop_V', 0.0),2)} V drop, "
+                   f"{_fmt_out(metrics.get('wire_temp_C', float('nan')),0)} °C\n"
+                   if float(metrics.get("wire_resistance_ohm", 0.0) or 0.0) > 0 else "")
             )
         except Exception as e:
             messagebox.showerror("Error", str(e))
@@ -8324,6 +8499,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--orientation", type=str, default="translating",
                         choices=["hover", "translating", "forward"])
     parser.add_argument("--plot", action="store_true", help="Show matplotlib window with performance curves (CLI only)")
+    core.add_wiring_arguments(parser)
 
     return parser
 
@@ -8530,6 +8706,11 @@ def main():
                     else f"{float(_hwr):.2f} m/s")
         print(f"Hover Wind Resistance : {_hwr_txt}")
         print(f"Prop Solidity σ       : {metrics.get('prop_solidity_sigma', 0.0):.3f}")
+        m = metrics
+        _lead = (f"Main lead: {m['wire_loss_W']:.1f} W lost, {m['wire_drop_V']:.2f} V drop, "
+                 f"{m['wire_temp_C']:.0f} C" if float(m.get('wire_resistance_ohm', 0.0) or 0.0) > 0 else "")
+        if _lead:
+            print(_lead)
 
     if args.plot:
         plot_performance(drone)

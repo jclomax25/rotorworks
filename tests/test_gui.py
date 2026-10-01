@@ -645,3 +645,60 @@ def test_running_with_a_measured_table_loaded(request, which, paths):
 # capability to the harness is the prerequisite, and it would also unlock
 # mission coverage for the Status, Metrics and Power Budget tabs, none of
 # which are exercised on the mission path either.
+
+
+# ----------------------------------------------------------------------
+# Wiring tab
+# ----------------------------------------------------------------------
+
+def _all_tree_text(gui):
+    """Every cell of every Treeview, flattened — Status, Metrics and the rest."""
+    out = []
+    for widget in gui.refresh():
+        if isinstance(widget, ttk.Treeview):
+            def walk(parent=""):
+                for item in widget.get_children(parent):
+                    out.append(str(widget.item(item, "text")))
+                    out.extend(str(v) for v in widget.item(item, "values"))
+                    walk(item)
+            walk()
+    return " | ".join(out)
+
+
+@pytest.mark.parametrize("which", ["mc", "fw"])
+def test_wiring_tab_exists(request, which):
+    gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
+    tabs = [str(nb.tab(t, "text")) for nb in gui.widgets
+            if isinstance(nb, ttk.Notebook) for t in nb.tabs()]
+    assert "Wiring" in tabs, f"no Wiring tab among {tabs}"
+
+
+@pytest.mark.parametrize("which", ["mc", "fw"])
+def test_a_wired_config_round_trips_and_reaches_status(request, which, tmp_path):
+    """
+    Save a config, add a lead and a connector to it, load it back and run:
+    the wiring must survive the file and show up in Status and Metrics.
+    """
+    import json
+    gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
+    dest = str(tmp_path / "wired.json")
+    gui.set_save_dialog(dest)
+    assert not gui.click("Save Config")
+    with open(dest, encoding="utf-8") as f:
+        data = json.load(f)
+    assert "wire_len" in data["vars"], "the Wiring tab is not saved with the config"
+    data["vars"].update({"wire_len": "0.5", "wire_awg": "18", "wire_temp_limit": "105",
+                         "conn_batt": "XT60", "conn_batt_cont": "60",
+                         "conn_batt_max": "120", "conn_batt_volt": "500"})
+    with open(dest, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    gui.set_open_dialog(dest)
+    assert not gui.click("Load Config")
+    errs = gui.click("Fixed Speed Sweep")
+    assert not errs, errs[0][:300]
+    text = _all_tree_text(gui)
+    for row in ("Main wire voltage drop", "Wire temperature (est)",
+                "Battery connector current", "Battery connector voltage",
+                "Main lead loss"):
+        assert row in text, f"{row!r} missing after a wired run"

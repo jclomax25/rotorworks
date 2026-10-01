@@ -1264,6 +1264,19 @@ def drive_chain(cfg: VTOLConfig,
 
     base = motor_in + esc_loss + avionics_input_power_W(cfg) + peripheral_power_W(cfg)
     wire = wire_loss_W(cfg, base)
+    # The ESCs sit at the far end of the main lead, so the voltage they can
+    # put across a motor is the pack's less the lead's I*R drop. The power
+    # is already right — the lead's I^2 R is in `wire` — but the throttle
+    # each motor needs, and whether it runs out of voltage, are judged
+    # against what actually arrives. No wiring entered leaves them as they were.
+    r_wire = float(getattr(cfg, "wire_resistance_ohm", 0.0) or 0.0)
+    if r_wire > 0:
+        v_pack = max(float(cfg.battery.vnom_pack), 1e-9)
+        supply = max(v_pack - (base + wire) / v_pack * r_wire, 1e-9)
+        for op in {id(lift): lift, id(cruise): cruise}.values():
+            if op.get("v_term_V", 0.0) > 0 and math.isfinite(op.get("throttle", float("nan"))):
+                op["throttle"] = op["v_term_V"] / supply
+                op["saturated"] = op["v_term_V"] > supply
     return {
         "total_power_W": base + wire,
         "motor_input_W": motor_in,
@@ -3337,10 +3350,8 @@ FIELD_TO_CLI: Dict[str, Optional[str]] = {
     # avionics and wiring
     "avionics_flat": "avionics_power", "periph_current": "peripheral_current",
     "avionics_rails": "avionics_rails",
-    "wire_len": "wire_length", "wire_awg": "wire_awg", "wire_ohm_m": "wire_ohm_per_m",
-    "conn_batt_cont": "connector_batt_cont", "conn_batt_max": "connector_batt_max",
-    "conn_esc_cont": "connector_esc_cont", "conn_esc_max": "connector_esc_max",
-    "conn_motor_cont": "connector_motor_cont", "conn_motor_max": "connector_motor_max",
+    # wiring: the core's mapping, so all three simulators share the flags
+    **{key: flag for key, flag in core.WIRING_FIELD_TO_CLI.items()},
     # mission and environment
     "cruise_v": "cruise_speed", "alt": "altitude", "cruise_altitude": "cruise_altitude",
     "temp": "temperature", "pressure": "pressure", "mission": "mission",
@@ -3361,12 +3372,24 @@ FIELD_TO_CLI: Dict[str, Optional[str]] = {
 LEGACY_FIELD_ALIASES = {"avionics": "avionics_flat", "esc_eff": "esc_eff_tab"}
 
 
+# Dropdown values that were renamed, to match the other two simulators.
+LEGACY_FIELD_VALUES = {"mass_mode": {"derive structure": "derive airframe",
+                                     "enter structure": "enter airframe"}}
+
+
 def migrate_legacy_fields(values: dict) -> dict:
-    """Copy each legacy key onto its new name when the new one is blank."""
+    """
+    Copy each legacy key onto its new name when the new one is blank, and
+    translate renamed dropdown values.
+    """
     out = dict(values)
     for old, new in LEGACY_FIELD_ALIASES.items():
         if str(out.get(old, "")).strip() and not str(out.get(new, "")).strip():
             out[new] = out[old]
+    for key, renames in LEGACY_FIELD_VALUES.items():
+        value = str(out.get(key, "")).strip()
+        if value in renames:
+            out[key] = renames[value]
     return out
 
 
@@ -3461,10 +3484,11 @@ def config_from_fields(values: dict, config_type: str = "lift+cruise") -> VTOLCo
 
     n_lift = int(num("n_lift", 4))
     n_cruise = int(num("n_cruise", 1))
-    # "enter structure" runs the weight the other way: the frame is known and
-    # the airframe weight is that plus the itemised parts.
+    # "enter airframe" runs the weight the other way: the frame is known and
+    # the all-up weight is that plus the itemised parts. "enter structure" is
+    # the name older configs saved it under.
     weight = num("weight", 6000)
-    if text("mass_mode", "derive structure") == "enter structure":
+    if text("mass_mode", "derive airframe").lower().startswith("enter"):
         vectored = str(config_type).strip().lower() in ("tiltrotor", "tiltwing", "tailsitter")
         n_esc = n_lift + (0 if vectored else n_cruise)
         weight = ((opt("structure_mass") or 0.0)
@@ -3476,13 +3500,9 @@ def config_from_fields(values: dict, config_type: str = "lift+cruise") -> VTOLCo
                   + (opt("avionics_mass") or 0.0))
 
     temp = opt("temp")
-    connectors = {}
-    for name, prefix in (("Battery", "conn_batt"), ("ESC", "conn_esc"),
-                         ("Motor", "conn_motor")):
-        cont, mx = opt(f"{prefix}_cont") or 0.0, opt(f"{prefix}_max") or 0.0
-        if cont > 0 or mx > 0:
-            connectors[name] = (cont, mx)
-    awg = opt("wire_awg")
+    # The Wiring tab goes through the same core builder as the multicopter's
+    # and fixed-wing's, so a lead costs the same in all three.
+    wiring = core.wiring_from_fields(values)
 
     cfg = VTOLConfig(
         config_type=config_type,
@@ -3516,10 +3536,9 @@ def config_from_fields(values: dict, config_type: str = "lift+cruise") -> VTOLCo
         air_density=core.air_density(num("alt", 0), temp, opt("pressure")),
         cruise_speed_mps=num("cruise_v", 22),
         reference_altitude_m=num("alt", 0),
-        wire_resistance_ohm=core.wire_resistance_ohm(
-            opt("wire_len") or 0.0, awg=int(awg) if awg else None,
-            ohm_per_m=opt("wire_ohm_m")),
-        connectors=connectors,
+        wire_resistance_ohm=wiring.resistance_ohm if wiring is not None else 0.0,
+        connectors={name: (rating[0] or 0.0, rating[1] or 0.0)
+                    for name, rating in (wiring.connectors if wiring else {}).items()},
         hover_download_fraction=opt("download"),
         lift_motor_max_power_W=opt("lift_pmax"),
         lift_motor_max_current_A=opt("lift_imax"),
@@ -3587,6 +3606,7 @@ def config_from_fields(values: dict, config_type: str = "lift+cruise") -> VTOLCo
         ambient_temp_C=temp,
         pressure_Pa=opt("pressure"),
     )
+    cfg.wiring = wiring
     return cfg
 
 
@@ -3642,11 +3662,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         p.add_argument(f"--{name}", type=kind, default=None, help=help_text, **kw)
 
     # ---- airframe, mass and drag -------------------------------------
-    add("weight", help_text="Airframe weight (g), everything but the payload.")
+    add("weight", help_text="All-up weight without payload (g).")
     add("payload_mass_g")
-    add("mass_mode", str, "derive structure | enter structure",
-        choices=["derive structure", "enter structure"])
-    add("structure_mass", help_text="Bare structure (g); 'enter structure' mode only.")
+    add("mass_mode", str, "derive airframe | enter airframe",
+        choices=["derive airframe", "enter airframe",
+                 "derive structure", "enter structure"])
+    add("structure_mass", help_text="Airframe mass (g), bare frame; 'enter airframe' mode only.")
     add("avionics_mass", help_text="Avionics mass (g), for the weight budget.")
     add("wing_span"); add("wing_area"); add("CD0"); add("oswald"); add("CL_max")
     add("CL_cruise_max", help_text="CL cap used during transition; below CL_max for margin.")
@@ -3754,9 +3775,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add("wire_length", help_text="One-way battery lead length (m).")
     add("wire_awg", int, "Wire gauge (AWG).")
     add("wire_ohm_per_m", help_text="Measured wire resistance (ohm/m).")
+    add("wire_temp_limit",
+        help_text=f"Wire insulation temperature limit (C); default {core.WIRE_TEMP_LIMIT_C:g}.")
     for _name in ("batt", "esc", "motor"):
         add(f"connector_{_name}_cont", help_text=f"{_name} connector continuous rating (A).")
         add(f"connector_{_name}_max", help_text=f"{_name} connector burst rating (A).")
+        add(f"connector_{_name}_volt", help_text=f"{_name} connector rated voltage (V).")
 
     # ---- flight and environment ----------------------------------------
     add("cruise_speed"); add("altitude")
@@ -4275,10 +4299,12 @@ def launch_gui(args=None) -> None:
         return row + 2
 
     r = 0
-    r = add_row(tab_airframe, r, "Airframe weight (g)", "weight", 6000,
-                "Everything except the payload, including battery and motors.")
+    r = add_row(tab_airframe, r, "All-up weight without payload (g)", "weight", 6000,
+                "Everything except the payload, including battery and motors. "
+                "Entered in 'derive airframe' mode; calculated, and greyed "
+                "out, in 'enter airframe' mode.")
     r = add_row(tab_airframe, r, "Payload mass (g)", "payload", 0,
-                "Added on top of the airframe weight.")
+                "Added on top of the all-up weight without payload.")
     r = add_section(tab_airframe, "Wing Geometry", ("span", "area"), row=r)
     r = add_row(tab_airframe, r, "Wing span (m)", "span", 2.4, "Tip to tip.")
     r = add_row(tab_airframe, r, "Wing area (m²)", "area", 0.60,
@@ -4503,33 +4529,36 @@ def launch_gui(args=None) -> None:
     # behaves exactly as before, and Status says a check has nothing to test
     # against rather than inventing a limit.
 
-    # Mass entry mode, as the other two have. Structure is normally the
-    # residual once the itemised parts come out of the airframe weight; this
-    # lets you work the other way when you know the structure and want the
-    # all-up weight derived.
+    # Mass entry mode, named and behaving as on the other two simulators.
+    # The airframe is normally the residual once the itemised parts come out
+    # of the all-up weight; this lets you work the other way when you know
+    # the frame and want the all-up weight derived.
     _mass_row = tab_airframe.grid_size()[1]
     ttk.Label(tab_airframe, text="Mass Entry Mode").grid(
         row=_mass_row, column=0, sticky="w", pady=2)
-    v_mass_mode = tk.StringVar(value="derive structure")
+    v_mass_mode = tk.StringVar(value="derive airframe")
     fields["mass_mode"] = v_mass_mode
     ttk.Combobox(tab_airframe, textvariable=v_mass_mode, state="readonly",
-                 width=18, values=("derive structure", "enter structure")).grid(
+                 width=18, values=("derive airframe", "enter airframe")).grid(
         row=_mass_row, column=1, sticky="w", padx=(8, 4))
     _mm = ttk.Label(tab_airframe, text="?", foreground="#0B6BCB",
                     cursor="question_arrow")
     _mm.grid(row=_mass_row, column=2, sticky="w")
     core.Tooltip(_mm,
-                 "derive structure: you enter the airframe weight, and the "
-                 "Weight Budget shows structure as whatever is left after the "
-                 "battery, motors, propellers and avionics.\n\n"
-                 "enter structure: you enter the structure mass below, and "
-                 "the airframe weight is the sum of that plus the itemised "
-                 "parts. Useful when you know the frame but are still "
-                 "choosing components.")
-    _append_row(tab_airframe, "Structure mass (g)", "structure_mass", "",
+                 "derive airframe: you enter the all-up weight without "
+                 "payload, and the Weight Budget shows the airframe as "
+                 "whatever is left after the battery, motors, propellers, "
+                 "ESCs and avionics.\n\n"
+                 "enter airframe: you enter the airframe mass below, and the "
+                 "all-up weight is the sum of that plus the itemised parts. "
+                 "Useful when you know the frame but are still choosing "
+                 "components.\n\n"
+                 "Whichever of the two is calculated is greyed out.")
+    _append_row(tab_airframe, "Airframe mass (g)", "structure_mass", "",
                 "Bare frame, booms, skins and fasteners — everything that is "
-                "not a component listed elsewhere. Used only in "
-                "'enter structure' mode.")
+                "not a component listed elsewhere. Entered in 'enter "
+                "airframe' mode; greyed out in 'derive airframe' mode, where "
+                "it is the Weight Budget's residual.")
 
     _append_row(tab_airframe, "Avionics mass (g)", "avionics_mass", "",
                 "Autopilot, radios, GPS and payload electronics. Shown as its "
@@ -4554,12 +4583,12 @@ def launch_gui(args=None) -> None:
     _append_row(tab_lift, "Hover download fraction", "download", "",
                 "Extra hover thrust needed because the rotor wash strikes the "
                 "airframe below, as a fraction of weight.\n"
-                "Blank uses the type default: tiltrotor 0.10, tiltwing 0.02, "
-                "tailsitter 0.02. Typical published values, not measurements — "
-                "override with test data if you have it.\n\n"
-                "Not modelled for lift+cruise: its hover and transition are "
-                "computed by separate branches, so a download applied to one "
-                "and not the other would put a step at zero airspeed.")
+                "Blank uses the type default: lift+cruise 0.04, tiltrotor "
+                "0.10, tiltwing 0.02, tailsitter 0.02. Typical published "
+                "values, not measurements — override with test data if you "
+                "have it.\n\n"
+                "It fades as the wing takes over, so hover and cruise meet "
+                "without a step.")
     add_section(tab_cruise, "Optional Detail",
                 ("cruise_prop_wt", "cruise_pmax", "cruise_imax",
                  "cruise_table"))
@@ -4580,7 +4609,8 @@ def launch_gui(args=None) -> None:
     # a bench test says nothing about thrusts it never produced.
     def _table_picker(parent, label, key, help_text):
         row = parent.grid_size()[1]
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=2)
+        lbl = ttk.Label(parent, text=label)
+        lbl.grid(row=row, column=0, sticky="w", pady=2)
         var = tk.StringVar(value="")
         fields[key] = var
         holder = ttk.Frame(parent)
@@ -4597,6 +4627,9 @@ def launch_gui(args=None) -> None:
                            cursor="question_arrow")
         marker.grid(row=row, column=2, sticky="w")
         core.Tooltip(marker, help_text)
+        # Registered like any other row, so Simple mode and the greying-out
+        # below reach the pickers too.
+        _field_rows.append({"key": key, "widgets": [lbl, holder, marker]})
 
     _table_picker(tab_lift, "Lift rotor table (CSV)", "lift_table",
                   "Measured thrust/power bench data for one lift rotor.\n\n"
@@ -4956,6 +4989,12 @@ def launch_gui(args=None) -> None:
                 "Copper at 20 C. Higher AWG is THINNER wire and loses more.")
     _append_row(tab_wiring, "Wire resistance (ohm/m)", "wire_ohm_m", "",
                 "Measured from your own spool. Overrides the gauge if given.")
+    _append_row(tab_wiring, "Wire temperature limit (°C)", "wire_temp_limit", "",
+                f"What the insulation is rated for. Blank uses "
+                f"{core.WIRE_TEMP_LIMIT_C:g} °C, typical of silicone hookup wire; "
+                f"PVC is often 80-105 °C. Status estimates the lead's steady "
+                f"temperature at hover current in still air — conservative, "
+                f"since the lead usually sits in some airflow.")
     ttk.Label(tab_wiring, text="Connector ratings — pick a type to fill "
               "typical figures, then edit to match your parts.",
               wraplength=300, justify="left", foreground="#555555"
@@ -4974,6 +5013,9 @@ def launch_gui(args=None) -> None:
             row=_row, column=1, sticky="w", padx=(8, 4))
         _append_row(tab_wiring, "   continuous (A)", f"{_prefix}_cont", "")
         _append_row(tab_wiring, "   max / burst (A)", f"{_prefix}_max", "")
+        _append_row(tab_wiring, "   rated voltage (V)", f"{_prefix}_volt", "",
+                    "Checked against the pack's FULL-charge voltage. Blank "
+                    "skips the check; most hobby connectors publish no figure.")
 
         def _fill(*_a, _t=_type_var, _p=_prefix):
             # Convenience, not a lock: ratings stay editable, because burst
@@ -4982,6 +5024,8 @@ def launch_gui(args=None) -> None:
             if defaults:
                 fields[f"{_p}_cont"].set(f"{defaults[0]:g}")
                 fields[f"{_p}_max"].set(f"{defaults[1]:g}")
+                volt = core.connector_voltage_default(_t.get())
+                fields[f"{_p}_volt"].set(f"{volt:g}" if volt else "")
         _type_var.trace_add("write", _fill)
 
     # ==================================================================
@@ -5228,6 +5272,76 @@ def launch_gui(args=None) -> None:
                 "too heavy to lift off vertically.")
     _append_row(tab_env, "Landing distance available (m)", "field_landing", "",
                 "Runway for a conventional landing.")
+
+    # ==================================================================
+    # GREY OUT WHAT A DROPDOWN MAKES IRRELEVANT
+    # ==================================================================
+    # As on the multicopter and fixed-wing: an input the current selection
+    # does not use is greyed out rather than left looking live, so it is
+    # never possible to type a number that silently does nothing. Greyed
+    # fields keep their values — switching back restores them — and nothing
+    # here changes a result, because the model already ignores these inputs.
+    _CRUISE_HARDWARE = (
+        "n_cruise", "cruise_d", "cruise_p", "cruise_blades", "cruise_kv",
+        "cruise_rm", "cruise_i0", "cruise_v0", "cruise_wt", "cruise_imax",
+        "cruise_pmax", "cruise_prop_wt", "cruise_max_thrust", "cruise_table",
+        "cruise_max_time", "cruise_temp_limit", "cruise_v_unit", "cruise_s_min",
+        "cruise_s_max", "cruise_poles", "cruise_size", "cruise_max_rpm",
+        "cruise_tconst", "cruise_pconst")
+
+    def _set_enabled(widget, enabled):
+        """ttk's state flag works the same for labels, entries and dropdowns."""
+        try:
+            widget.state(["!disabled"] if enabled else ["disabled"])
+        except (AttributeError, tk.TclError):
+            try:
+                widget.configure(state="normal" if enabled else "disabled")
+            except tk.TclError:
+                pass
+        for child in widget.winfo_children():
+            _set_enabled(child, enabled)
+
+    def _enable_fields(keys, enabled):
+        wanted = set(keys)
+        for row in _field_rows:
+            if row["key"] in wanted:
+                for widget in row["widgets"]:
+                    _set_enabled(widget, enabled)
+
+    def _apply_dependencies(*_a):
+        pack = fields["unit_mode"].get().strip().lower() == "pack"
+        _enable_fields(("cell_cap", "cell_wt"), not pack)
+        _enable_fields(("cells_s_per_pack", "cells_p_per_pack", "pack_cap", "pack_wt"), pack)
+
+        entering = fields["mass_mode"].get().strip().lower().startswith("enter")
+        _enable_fields(("weight",), not entering)
+        _enable_fields(("structure_mass",), entering)
+
+        vectored = v_config_type.get() in ("tiltrotor", "tiltwing", "tailsitter")
+        _enable_fields(_CRUISE_HARDWARE, not vectored)
+        # Stopped-rotor drag belongs to a lift+cruise only: the vectored
+        # types' rotors never stop.
+        _enable_fields(("stopped_area",), not vectored)
+
+        _enable_fields(("coax_spacing",), fields["lift_layout"].get() == "coaxial")
+
+        mode = fields["drag_model_mode"].get().strip().lower()
+        _enable_fields(("body_length_m", "body_width_m", "body_height_m",
+                        "arm_length_m", "arm_width_m"), mode != "manual")
+        _enable_fields(("parasite_drag", "parasite_area", "profile_drag",
+                        "profile_area"), mode != "geometry")
+
+        _enable_fields(("inflow_mu_bp", "inflow_eff_bp"),
+                       fields["inflow_map_enabled"].get().strip() == "1")
+
+        _enable_fields(("soc_curve", "soc_bp", "ocv_cell_bp", "r_scale_bp"),
+                       fields["soc_model"].get().strip().lower() != "linear")
+
+    for _var in (fields["unit_mode"], fields["mass_mode"], v_config_type,
+                 fields["lift_layout"], fields["drag_model_mode"],
+                 fields["inflow_map_enabled"], fields["soc_model"]):
+        _var.trace_add("write", _apply_dependencies)
+    _apply_dependencies()
 
     # One notebook-level wheel binding, attached after every input tab exists.
     # It routes the scroll to whichever canvas belongs to the selected tab,
@@ -6113,27 +6227,16 @@ def launch_gui(args=None) -> None:
                      "Forward thrust in hand at the cruise speed, for climbing "
                      "and accelerating.")
 
-        conns = dict(getattr(cfg, "connectors", {}) or {})
-        if conns:
-            # Checked at hover, the largest steady current a VTOL draws.
-            n_esc = max(cfg.num_lift_rotors, 1)
-            seen = {"Battery": hover_I, "ESC": hover_I / n_esc,
-                    "Motor": hover_I / n_esc * 1.15}
-            for name, (c_cont, c_max) in conns.items():
-                if name in seen:
-                    # The battery connector carries the whole pack current, so
-                    # it is a battery-side check; the other two sit on a motor
-                    # channel.
-                    _dual(batt_status_tv if name == "Battery" else motor_status_tv,
-                          f"{name} connector (hover)", seen[name],
-                          c_cont or None, c_max or None, "A")
-
-        drop = float(m.get("wire_drop_V", 0.0))
-        if drop > 0:
-            _row(batt_status_tv, "Main wire voltage drop", f"{drop:.2f} V",
-                 "—", "na",
-                 f"Lost along the battery lead at cruise; "
-                 f"{float(m.get('wire_loss_W', 0.0)):.1f} W as heat.")
+        # Wiring and connectors: the shared rows all three simulators show,
+        # checked at hover, the largest steady current a VTOL draws. The
+        # battery connector carries the whole pack current; each ESC and
+        # motor connector one lift rotor's share.
+        _wiring = getattr(cfg, "wiring", None)
+        for _group, _name, _val, _lim, _tag, _note in core.wiring_status_rows(
+                _wiring, hover_I, hover_I / max(cfg.num_lift_rotors, 1),
+                float(batt.vmax_pack), float(cfg.ambient_temp_C), where="hover"):
+            _row(batt_status_tv if _group == "battery" else motor_status_tv,
+                 _name, _val, _lim, _tag, _note)
 
         # Wind checks: whether the course can be held at all, and whether
         # holding station is affordable. Both only say anything once a wind
@@ -6404,9 +6507,9 @@ def launch_gui(args=None) -> None:
             wb_tv.insert("", "end", values=(name, f"{float(each):.0f}", qty,
                                             f"{total:.0f}", f"{total / auw * 100:.1f}%"))
         structure = cfg.aircraft_weight_g - parts
-        chart.append(("Airframe / structure", structure))
+        chart.append(("Airframe", structure))
         wb_tv.insert("", "end", tags=(("bad",) if structure < 0 else ()),
-                     values=("Airframe / structure", "", "", f"{structure:.0f}",
+                     values=("Airframe", "", "", f"{structure:.0f}",
                              f"{structure / auw * 100:.1f}%"))
         if cfg.payload_mass_g > 0:
             chart.append(("Payload", cfg.payload_mass_g))
@@ -6426,12 +6529,13 @@ def launch_gui(args=None) -> None:
         wb_note.configure(
             foreground="#B71C1C" if structure < 0 else "#555555",
             text=(f"The itemised parts weigh {parts:.0f} g — more than the "
-                  f"{cfg.aircraft_weight_g:.0f} g airframe weight. That leaves a "
-                  f"negative structure mass, which is impossible: raise the "
-                  f"airframe weight or correct a part."
+                  f"{cfg.aircraft_weight_g:.0f} g all-up weight without payload. "
+                  f"That leaves a negative airframe mass, which is impossible: "
+                  f"raise the weight or correct a part."
                   if structure < 0 else
-                  "Airframe weight includes the battery and motors; structure is "
-                  "what remains after the itemised parts."))
+                  "The all-up weight without payload includes the battery and "
+                  "motors; the airframe is what remains after the itemised "
+                  "parts."))
 
     # ---- Power Budget --------------------------------------------------
     tab_pb = _tab("Power Budget")
@@ -7837,6 +7941,20 @@ def launch_gui(args=None) -> None:
                          "Conduction is I²R from the ESC resistance, if entered; "
                          "the rest of the under-load loss is switching.")
             _metrics_row("Wire loss", f"{m['wire_loss_W']:.1f} W")
+            _wiring = getattr(cfg, "wiring", None)
+            if _wiring is not None and _wiring.resistance_ohm > 0:
+                _metrics_row("  Main lead resistance",
+                             f"{_wiring.resistance_ohm * 1000:.1f} mΩ  (round trip, "
+                             f"{_wiring.length_m:.2f} m one way)")
+                _metrics_row("  Main lead voltage drop", f"{m.get('wire_drop_V', 0.0):.3f} V",
+                             "I x R along the lead; the ESCs see the pack minus this.")
+                _hover = _wiring.summary(float(m.get("hover_pack_current_A", 0.0)),
+                                         cfg.ambient_temp_C)
+                _t = float(_hover["temp_C"])
+                _metrics_row("  Main lead temperature at hover (est)",
+                             ("above 400" if not math.isfinite(_t) or _t > 400 else f"{_t:.0f}")
+                             + f" °C  (limit {_wiring.temp_limit_C:.0f} °C)",
+                             "Steady, still air — conservative.")
             _metrics_row("Drive efficiency", f"{m['drive_efficiency'] * 100:.1f} %",
                          "Shaft power over motor input — the motors' share of the losses.")
             _metrics_row("System efficiency", f"{m['system_efficiency'] * 100:.1f} %",

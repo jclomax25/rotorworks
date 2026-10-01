@@ -88,6 +88,11 @@ __all__ = [
     # wiring and connectors
     "AWG_OHM_PER_M", "CONNECTOR_RATINGS", "wire_resistance_ohm",
     "wire_loss_W", "wire_voltage_drop_V", "connector_defaults",
+    "CONNECTOR_VOLTAGE_V", "connector_voltage_default", "wire_ohm_per_m",
+    "wire_temperature_C", "wiring_summary", "WIRE_TEMP_LIMIT_C",
+    "WiringConfig", "CONNECTOR_POSITIONS", "connector_currents_A",
+    "wiring_from_fields", "WIRING_FIELD_TO_CLI", "wiring_status_rows",
+    "add_wiring_arguments", "wiring_from_args",
     # exports
     "export_csv", "export_excel",
     # power budget
@@ -1627,6 +1632,297 @@ def wire_voltage_drop_V(current_A: float, resistance_ohm: float) -> float:
     measurable fraction of the headroom.
     """
     return max(float(current_A), 0.0) * max(float(resistance_ohm), 0.0)
+
+
+# Rated voltage, volts DC, only where the maker publishes one: Amass rates
+# its XT and AS series at 500 V DC. EC3/EC5, Deans and bullet connectors are
+# sold without a voltage rating, so they are left out rather than guessed —
+# Status then says "Not Specified" and the user can enter a figure.
+CONNECTOR_VOLTAGE_V: Dict[str, float] = {
+    "XT30": 500.0, "XT60": 500.0, "XT90": 500.0, "AS150": 500.0,
+}
+
+COPPER_RESISTIVITY_OHM_M = 1.724e-8      # at 20 C
+COPPER_ALPHA_PER_C = 0.00393             # resistance rise per degree
+WIRE_TEMP_LIMIT_C = 150.0                # default: margin below silicone's 200 C
+
+
+def connector_voltage_default(name: Optional[str]) -> Optional[float]:
+    """Published rated voltage for a named connector, or None."""
+    if not name:
+        return None
+    folded = str(name).strip().lower().replace(" ", "")
+    for known, volts in CONNECTOR_VOLTAGE_V.items():
+        if known.lower().replace(" ", "") == folded:
+            return volts
+    return None
+
+
+def wire_ohm_per_m(awg: Optional[int] = None,
+                   ohm_per_m: Optional[float] = None) -> Optional[float]:
+    """Resistance per metre of ONE conductor, or None if neither is given."""
+    if ohm_per_m is not None and float(ohm_per_m) > 0:
+        return float(ohm_per_m)
+    if awg is not None and int(awg) in AWG_OHM_PER_M:
+        return AWG_OHM_PER_M[int(awg)]
+    return None
+
+
+def wire_temperature_C(current_A: float, ohm_per_m: Optional[float],
+                       ambient_C: float, insulation_mm: float = 0.5,
+                       h_W_m2K: float = 12.0) -> float:
+    """
+    Steady temperature of a wire carrying `current_A`, in still air.
+
+    Per metre, the wire makes I^2 R' of heat and sheds h * pi * D * (T - Ta)
+    from its surface. The conductor diameter follows from R' and copper's
+    resistivity, and the insulation adds `insulation_mm` a side (about right
+    for silicone hook-up wire, 10-20 AWG). Copper's resistance rises with
+    temperature, R'(T) = R'20 (1 + alpha (T - 20)), which solved together
+    with the heat balance gives
+
+        T - Ta = I^2 R'20 (1 + alpha (Ta - 20)) / (h pi D - I^2 R'20 alpha)
+
+    When the denominator reaches zero the wire cannot shed the extra heat
+    its own rising resistance makes — thermal runaway — and this returns
+    infinity. `h` of 12 W/m^2K is natural convection plus radiation; a wire
+    in the propeller wash runs cooler, so this is the conservative case.
+    Returns ambient when there is no wire or no current.
+    """
+    if not ohm_per_m or ohm_per_m <= 0 or current_A <= 0:
+        return float(ambient_C)
+    r20 = float(ohm_per_m)
+    d = math.sqrt(4.0 * COPPER_RESISTIVITY_OHM_M / (math.pi * r20))
+    outer = d + 2.0 * max(float(insulation_mm), 0.0) / 1000.0
+    i2r = float(current_A) ** 2 * r20
+    shed = h_W_m2K * math.pi * outer - i2r * COPPER_ALPHA_PER_C
+    if shed <= 0:
+        return float("inf")
+    return float(ambient_C) + i2r * (1.0 + COPPER_ALPHA_PER_C * (float(ambient_C) - 20.0)) / shed
+
+
+def wiring_summary(current_A: float, length_m: float, awg: Optional[int] = None,
+                   ohm_per_m: Optional[float] = None,
+                   ambient_C: float = 20.0) -> Dict[str, float]:
+    """
+    Everything Status and Metrics report about the main wire run, at one
+    current: resistance of the round trip, loss, voltage drop, and the
+    steady wire temperature. All zero (temperature ambient) with no run.
+    """
+    per_m = wire_ohm_per_m(awg, ohm_per_m)
+    r = wire_resistance_ohm(length_m, awg=awg, ohm_per_m=ohm_per_m)
+    have = r > 0 and per_m is not None
+    return {
+        "resistance_ohm": r,
+        "ohm_per_m": per_m or 0.0,
+        "loss_W": wire_loss_W(current_A, r),
+        "drop_V": wire_voltage_drop_V(current_A, r),
+        "temp_C": wire_temperature_C(current_A, per_m, ambient_C) if have else float(ambient_C),
+        "present": have,
+    }
+
+
+# Where the three connectors sit, and so which current each one carries.
+CONNECTOR_POSITIONS = ("Battery", "ESC", "Motor")
+
+
+class WiringConfig:
+    """
+    The main battery lead and the three connector ratings, shared by the
+    multicopter and fixed-wing (the VTOL keeps the same inputs on its own
+    config). Attached to an aircraft as `.wiring`; absent or empty, every
+    result is exactly what it was without it.
+
+    `connectors` maps "Battery" / "ESC" / "Motor" to (continuous A, burst A,
+    rated V), any of which may be None when not entered.
+    """
+
+    def __init__(self, length_m: float = 0.0, awg: Optional[int] = None,
+                 ohm_per_m: Optional[float] = None,
+                 temp_limit_C: Optional[float] = None,
+                 connectors: Optional[Dict[str, Tuple]] = None):
+        self.length_m = max(float(length_m or 0.0), 0.0)
+        self.awg = int(awg) if awg not in (None, "") else None
+        self.ohm_per_m = (float(ohm_per_m) if ohm_per_m not in (None, "")
+                          and float(ohm_per_m) > 0 else None)
+        self.temp_limit_C = float(temp_limit_C) if temp_limit_C else WIRE_TEMP_LIMIT_C
+        self.connectors = {k: tuple(v) for k, v in (connectors or {}).items()
+                           if any(x for x in v)}
+
+    @property
+    def resistance_ohm(self) -> float:
+        """Round-trip resistance of the run, both conductors."""
+        return wire_resistance_ohm(self.length_m, awg=self.awg, ohm_per_m=self.ohm_per_m)
+
+    def summary(self, current_A: float, ambient_C: float) -> Dict[str, float]:
+        return wiring_summary(current_A, self.length_m, self.awg, self.ohm_per_m, ambient_C)
+
+
+# The Wiring tab's field keys (the same on all three simulators) and the CLI
+# argument each maps to.
+WIRING_FIELD_TO_CLI = {
+    "wire_len": "wire_length", "wire_awg": "wire_awg",
+    "wire_ohm_m": "wire_ohm_per_m", "wire_temp_limit": "wire_temp_limit",
+    "conn_batt_cont": "connector_batt_cont", "conn_batt_max": "connector_batt_max",
+    "conn_batt_volt": "connector_batt_volt",
+    "conn_esc_cont": "connector_esc_cont", "conn_esc_max": "connector_esc_max",
+    "conn_esc_volt": "connector_esc_volt",
+    "conn_motor_cont": "connector_motor_cont", "conn_motor_max": "connector_motor_max",
+    "conn_motor_volt": "connector_motor_volt",
+}
+
+
+def add_wiring_arguments(parser) -> None:
+    """The Wiring tab's CLI flags, identical on every simulator."""
+    group = parser.add_argument_group("wiring and connectors")
+    group.add_argument("--wire_length", type=float, default=None,
+                       help="Main battery lead, one-way length (m); both conductors are counted.")
+    group.add_argument("--wire_awg", type=int, default=None,
+                       help="Main lead gauge (AWG). Higher is thinner.")
+    group.add_argument("--wire_ohm_per_m", type=float, default=None,
+                       help="Measured resistance of one conductor (ohm/m); overrides the gauge.")
+    group.add_argument("--wire_temp_limit", type=float, default=None,
+                       help=f"Insulation temperature limit (C); default {WIRE_TEMP_LIMIT_C:g}.")
+    for name in ("batt", "esc", "motor"):
+        group.add_argument(f"--connector_{name}_cont", type=float, default=None,
+                           help=f"{name} connector continuous rating (A).")
+        group.add_argument(f"--connector_{name}_max", type=float, default=None,
+                           help=f"{name} connector burst rating (A).")
+        group.add_argument(f"--connector_{name}_volt", type=float, default=None,
+                           help=f"{name} connector rated voltage (V).")
+
+
+def wiring_from_args(args) -> Optional["WiringConfig"]:
+    """The CLI's wiring flags, through the same builder as the GUI."""
+    return wiring_from_fields({key: getattr(args, dest, None)
+                               for key, dest in WIRING_FIELD_TO_CLI.items()})
+
+
+def wiring_from_fields(values: dict) -> Optional["WiringConfig"]:
+    """
+    Build a WiringConfig from Wiring-tab values keyed as above — the GUI's
+    field text, or the CLI's arguments mapped onto the same keys, so the two
+    cannot disagree about what a wire run costs. None when nothing is set.
+    """
+    def num(key):
+        raw = values.get(key)
+        s_ = "" if raw is None else str(raw).strip()
+        if s_ == "":
+            return None
+        try:
+            return float(s_)
+        except ValueError:
+            raise ValueError(f"'{s_}' is not a number (field: {key})")
+
+    connectors = {}
+    for name, prefix in (("Battery", "conn_batt"), ("ESC", "conn_esc"),
+                         ("Motor", "conn_motor")):
+        rating = (num(f"{prefix}_cont"), num(f"{prefix}_max"), num(f"{prefix}_volt"))
+        if any(x for x in rating):
+            connectors[name] = rating
+    awg = num("wire_awg")
+    wiring = WiringConfig(length_m=num("wire_len") or 0.0,
+                          awg=int(awg) if awg else None,
+                          ohm_per_m=num("wire_ohm_m"),
+                          temp_limit_C=num("wire_temp_limit"),
+                          connectors=connectors)
+    if wiring.resistance_ohm <= 0 and not wiring.connectors:
+        return None
+    return wiring
+
+
+def connector_currents_A(pack_current_A: float, per_esc_current_A: float) -> Dict[str, float]:
+    """
+    The current through each connector, which is not the same number in
+    each position: the battery connector carries the whole pack current,
+    an ESC connector one motor's share, and a motor connector the phase
+    current, about 1.15x the ESC's DC input.
+    """
+    return {"Battery": max(float(pack_current_A), 0.0),
+            "ESC": max(float(per_esc_current_A), 0.0),
+            "Motor": max(float(per_esc_current_A), 0.0) * 1.15}
+
+
+def _dual_limit(value: float, cont: Optional[float], mx: Optional[float],
+                unit: str) -> Tuple[str, str, str]:
+    """(limit text, tag, note) for a value with a continuous and a burst limit."""
+    if not cont and not mx:
+        return ("Not Specified", "na",
+                "No rating entered, so there is nothing to check against.")
+    limit = " / ".join(x for x in (f"cont {cont:.0f} {unit}" if cont else "",
+                                   f"max {mx:.0f} {unit}" if mx else "") if x)
+    if mx and value > mx:
+        return limit, "bad", f"Above the burst rating of {mx:.0f} {unit}."
+    if cont and value > cont:
+        return limit, "warn", (f"Above the continuous rating of {cont:.0f} {unit}; "
+                               f"acceptable only briefly.")
+    ref = cont or mx
+    if value > 0.95 * ref:
+        return limit, "edge", f"Within 5% of the {ref:.0f} {unit} rating — no margin left."
+    return limit, "ok", "Within the continuous rating."
+
+
+def wiring_status_rows(wiring: Optional["WiringConfig"], pack_current_A: float,
+                       per_esc_current_A: float, pack_voltage_full_V: float,
+                       ambient_C: float, where: str = "") -> List[Tuple]:
+    """
+    The Status rows for the main wire run and the three connectors, for any
+    of the three simulators: (group, metric, value, limit, tag, note), where
+    group is "battery" (the wire and the battery connector) or "motor" (the
+    ESC and motor connectors) and tag is ok / edge / warn / bad / na.
+
+    `where` names the operating point ("hover", "cruise") in the labels.
+
+    Connector voltage is checked against the FULL-charge pack voltage, the
+    highest the connector will ever see. The wire temperature is the steady
+    still-air figure from wire_temperature_C, so it is conservative.
+    """
+    if wiring is None:
+        return []
+    rows: List[Tuple] = []
+    at = f" ({where})" if where else ""
+    w = wiring.summary(pack_current_A, ambient_C)
+    if w["present"]:
+        frac = w["drop_V"] / max(float(pack_voltage_full_V), 1e-9)
+        tag = "ok" if frac <= 0.03 else ("warn" if frac <= 0.05 else "bad")
+        rows.append(("battery", f"Main wire voltage drop{at}",
+                     f"{w['drop_V']:.2f} V ({frac * 100:.1f}%)", "<= 3% of pack", tag,
+                     f"{w['loss_W']:.1f} W lost as heat in the {w['resistance_ohm'] * 1000:.1f} mΩ "
+                     f"round trip. The ESCs see the pack voltage minus this drop, so it "
+                     f"costs thrust headroom as well as watts. Above about 5% use a "
+                     f"thicker or shorter lead."))
+        temp, limit = w["temp_C"], wiring.temp_limit_C
+        shown = "above 400 °C" if (not math.isfinite(temp) or temp > 400) else f"{temp:.0f} °C"
+        tag = "bad" if temp > limit else ("warn" if temp > limit - 20.0 else "ok")
+        rows.append(("battery", f"Wire temperature (est){at}", shown, f"<= {limit:.0f} °C", tag,
+                     f"Steady temperature of the main lead at {pack_current_A:.1f} A in still "
+                     f"air — conservative, since a lead in the propeller wash runs cooler. "
+                     f"Silicone insulation is rated about 200 °C, PVC about 105 °C."))
+    currents = connector_currents_A(pack_current_A, per_esc_current_A)
+    for name in CONNECTOR_POSITIONS:
+        if name not in wiring.connectors:
+            continue
+        cont, mx, volts = (list(wiring.connectors[name]) + [None, None, None])[:3]
+        group = "battery" if name == "Battery" else "motor"
+        amps = currents[name]
+        limit, tag, note = _dual_limit(amps, cont, mx, "A")
+        what = {"Battery": "the whole pack current",
+                "ESC": "one ESC's share of the current",
+                "Motor": "the motor phase current, about 1.15x the ESC's DC input"}[name]
+        rows.append((group, f"{name} connector current{at}", f"{amps:.1f} A", limit, tag,
+                     f"Carries {what}. {note}"))
+        if volts:
+            ok = pack_voltage_full_V <= volts
+            rows.append((group, f"{name} connector voltage", f"{pack_voltage_full_V:.1f} V",
+                         f"<= {volts:.0f} V", "ok" if ok else "bad",
+                         "Full-charge pack voltage against the connector's rating."
+                         if ok else "The pack exceeds the connector's rated voltage."))
+        else:
+            rows.append((group, f"{name} connector voltage", f"{pack_voltage_full_V:.1f} V",
+                         "Not Specified", "na",
+                         "No voltage rating entered. Amass rates its XT and AS series at "
+                         "500 V DC; most others publish none."))
+    return rows
 
 
 def connector_defaults(name: Optional[str]) -> Optional[Tuple[float, float]]:

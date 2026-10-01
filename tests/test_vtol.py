@@ -1064,13 +1064,14 @@ def test_sensitivity_clears_when_a_new_run_makes_it_stale(gui):
 @pytest.mark.gui
 def test_weight_budget_flags_an_impossible_structure_mass(gui):
     """
-    Airframe weight includes the battery and motors, so structure is the
-    residual. If the itemised parts exceed it the residual is negative — an
-    impossible aircraft — and that must be visible, not hidden.
+    The all-up weight without payload includes the battery and motors, so
+    the airframe is the residual. If the itemised parts exceed it the
+    residual is negative — an impossible aircraft — and that must be
+    visible, not hidden.
     """
     gui.set_field("Lift motor weight (g)", "2000")
     gui.click("Fixed Speed Sweep")
-    structure = [r for r in gui.rows("item", 5) if "structure" in r[0]]
+    structure = [r for r in gui.rows("item", 5) if r[0] == "Airframe"]
     assert structure and float(structure[0][3]) < 0
     assert gui.label_matching("impossible"), "no explanation of the negative mass"
 
@@ -2112,8 +2113,8 @@ def test_plot_settings_changes_the_sweep_range(gui):
 @pytest.mark.gui
 def test_entering_a_structure_mass_derives_the_airframe_weight(gui):
     """
-    "enter structure" runs the weight sum the other way: the user gives the
-    frame mass and the airframe weight follows from it plus the itemised
+    "enter airframe" runs the weight sum the other way: the user gives the
+    frame mass and the all-up weight follows from it plus the itemised
     parts. Useful when the frame is known and components are still being
     chosen.
     """
@@ -2123,14 +2124,14 @@ def test_entering_a_structure_mass_derives_the_airframe_weight(gui):
 
     import tkinter.ttk as ttk
     for w in gui.widgets():
-        if isinstance(w, ttk.Combobox) and "enter structure" in str(w.cget("values")):
-            w.set("enter structure")
+        if isinstance(w, ttk.Combobox) and "enter airframe" in str(w.cget("values")):
+            w.set("enter airframe")
             gui.pump()
             break
     else:
         pytest.fail("mass entry mode dropdown not found")
 
-    gui.set_field("Structure mass (g)", "2500")
+    gui.set_field("Airframe mass (g)", "2500")
     assert gui.click("Fixed Speed Sweep") == []
     entered = {r[0]: r[1] for r in gui.rows("metric", 4)}
     assert entered != derived, "entering a structure mass changed nothing"
@@ -2554,7 +2555,7 @@ def test_the_weight_chart_drops_a_negative_structure_mass(gui):
     either raise or silently draw a wedge for an impossible quantity.
     """
     gui.use_advanced_inputs()
-    gui.set_field("Airframe weight (g)", "200")     # far below the parts
+    gui.set_field("All-up weight without payload (g)", "200")  # far below the parts
     assert gui.click("Fixed Speed Sweep") == [], "a negative structure raised"
     assert _has_figure(gui, "Weight Budget"), \
         "the chart vanished instead of dropping the impossible slice"
@@ -4285,3 +4286,101 @@ def test_the_sweep_carries_the_fixed_wing_panels(gui):
     for expected in ("Thrust Required vs Available", "Rate of Climb",
                      "Drag vs Airspeed", "Drag Polar"):
         assert expected in titles, titles
+
+
+# ======================================================================
+# GREYED-OUT INPUTS AND THE AIRFRAME NAMING
+#
+# As on the multicopter and fixed-wing, an input the current dropdown
+# selection does not use is greyed out, so a number cannot be typed that
+# silently does nothing.
+# ======================================================================
+
+def _field_widget(gui, label):
+    """The entry or picker beside a label, even while it is hidden."""
+    import tkinter.ttk as ttk
+    gui.use_advanced_inputs()
+    for w in gui.widgets():
+        if isinstance(w, ttk.Label) and str(w.cget("text")) == label:
+            row = w.grid_info().get("row")
+            for sib in w.master.winfo_children():
+                if (sib is not w and not isinstance(sib, ttk.Label)
+                        and sib.grid_info().get("row") == row):
+                    return sib
+    raise AssertionError(f"no field labelled {label!r}")
+
+
+def _disabled(gui, label):
+    return _field_widget(gui, label).instate(["disabled"])
+
+
+@pytest.mark.gui
+def test_cell_mode_greys_out_the_pack_fields_and_back(gui):
+    pack_fields = ("Cells in series per pack", "Cells in parallel per pack",
+                   "Pack capacity (mAh)", "Pack weight (g)")
+    assert all(_disabled(gui, f) for f in pack_fields), "pack fields live in cell mode"
+    assert not _disabled(gui, "Cell capacity (mAh)")
+    gui.set_choice("Entry mode", "pack")
+    assert not any(_disabled(gui, f) for f in pack_fields), "pack mode left them grey"
+    assert _disabled(gui, "Cell capacity (mAh)") and _disabled(gui, "Cell weight (g)")
+
+
+@pytest.mark.gui
+def test_mass_mode_greys_out_whichever_mass_is_calculated(gui):
+    weight, frame = "All-up weight without payload (g)", "Airframe mass (g)"
+    assert not _disabled(gui, weight) and _disabled(gui, frame)
+    gui.set_choice("Mass Entry Mode", "enter airframe")
+    assert _disabled(gui, weight) and not _disabled(gui, frame)
+
+
+@pytest.mark.gui
+def test_a_vectored_type_greys_out_the_cruise_motor(gui):
+    assert not _disabled(gui, "Cruise motor Kv")
+    gui.set_type("tailsitter")
+    assert _disabled(gui, "Cruise motor Kv")
+    assert _disabled(gui, "Cruise prop table (CSV)")
+    assert not _disabled(gui, "Cruise prop efficiency"), \
+        "the vectored types still use the propeller efficiency"
+
+
+@pytest.mark.gui
+def test_greying_out_changes_no_result(gui):
+    """Greyed inputs keep their values and the model already ignores them."""
+    assert gui.click("Fixed Speed Sweep") == []
+    before = {r[0]: r[1] for r in gui.metric_rows()}
+    gui.set_choice("Entry mode", "pack")
+    gui.set_choice("Entry mode", "cell")
+    assert gui.click("Fixed Speed Sweep") == []
+    assert {r[0]: r[1] for r in gui.metric_rows()} == before
+
+
+def test_old_structure_mode_names_still_load(vtol):
+    values = vtol.migrate_legacy_fields({"mass_mode": "enter structure"})
+    assert values["mass_mode"] == "enter airframe"
+    cfg = vtol.config_from_fields({"mass_mode": "enter structure",
+                                   "structure_mass": "1000", "cell_wt": "0",
+                                   "lift_wt": "0", "cruise_wt": "0"})
+    assert cfg.aircraft_weight_g == pytest.approx(1000.0)
+
+
+@pytest.mark.gui
+def test_wiring_tab_has_temperature_and_voltage_ratings(gui):
+    for label in ("Wire temperature limit (°C)", "   rated voltage (V)"):
+        assert _field_widget(gui, label) is not None, f"no {label!r} field"
+
+
+@pytest.mark.gui
+def test_wiring_reaches_the_shared_status_checks(gui):
+    """The lead and the connectors get the same Status rows as the other two."""
+    gui.use_advanced_inputs()
+    gui.set_field("Wire length one-way (m)", "0.5")
+    gui.set_field("Wire gauge (AWG)", "16")
+    gui.set_field("Wire temperature limit (°C)", "105")
+    gui.set_field("   continuous (A)", "60")
+    gui.set_field("   rated voltage (V)", "12")
+    assert gui.click("Fixed Speed Sweep") == []
+    rows = {r[0]: r for r in gui.status_rows()}
+    for name in ("Main wire voltage drop (hover)", "Wire temperature (est) (hover)",
+                 "Battery connector current (hover)", "Battery connector voltage"):
+        assert name in rows, f"{name!r} missing from Status; have {sorted(rows)}"
+    assert rows["Battery connector voltage"][2] == "<= 12 V"

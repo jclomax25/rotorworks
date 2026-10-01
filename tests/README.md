@@ -1,8 +1,8 @@
 # Test suite
 
-752 tests covering the shared core, physics, the CLI, the GUI, the batch
+790 tests covering the shared core, physics, the CLI, the GUI, the batch
 driver, the VTOL simulator, and a full config/mission coverage matrix. The
-whole suite was last run clean on Windows (752 passed).
+whole suite was last run clean on Windows (790 passed).
 
 Almost every test here corresponds to a bug that was actually shipped. The
 docstrings say which one, so a future failure reads as "the pack capacity
@@ -51,10 +51,11 @@ safe to run.
 | `test_golden.py` | 1 | ~3 s | 1042 stored numeric outputs across all three simulators |
 | `test_core.py` | 90 | ~1 s | `rotorworks_core`: SoC, wind, inflow, sensitivity, comparison, propeller coefficients, power budget, airframe geometry |
 | `test_physics.py` | 136 | ~5 s | Battery topology, atmosphere, rotor inflow, prop efficiency, drag, turns, translation direction, thresholds, figure leaks |
-| `test_vtol.py` | 250 | ~6 min | All four VTOL types: vectored-thrust force balance, tilt, download, continuity, missions, the motor electrical model, the ported GUI tabs, window-chrome parity, output-tab presentation, the battery and peripheral-load model, unit conversions, plot panels, input sections and tab order, and GUI/CLI/batch parity of the config builder |
+| `test_vtol.py` | 257 | ~6 min | All four VTOL types: vectored-thrust force balance, tilt, download, continuity, missions, the motor electrical model, the ported GUI tabs, window-chrome parity, output-tab presentation, the battery and peripheral-load model, unit conversions, plot panels, input sections and tab order, and GUI/CLI/batch parity of the config builder |
 | `test_cli.py` | 70 | ~5 min | Real subprocess runs: every argument path, every example mission, edge cases, malformed input |
-| `test_gui.py` | 46 | ~4 min | Real Tk window: hover events, mode toggle, config load, missions, exports, diagram, sensitivity, comparison |
+| `test_gui.py` | 50 | ~4 min | Real Tk window: hover events, mode toggle, config load, missions, exports, diagram, sensitivity, comparison, the Wiring tab |
 | `test_matrix.py` | 108 | ~8 min | Every config and mission x GUI and CLI x with and without a propeller table; the VTOL through its CLI |
+| `test_wiring.py` | 27 | ~40 s | The shared wiring model: lead resistance, loss, drop and temperature; connector current and voltage checks; each simulator paying for the lead, and a blank Wiring tab changing nothing; one set of CLI flags and field names everywhere |
 | `test_drag_calculator.py` | 31 | ~1 s | Shoelace geometry, self-intersection detection, pixel scaling, ISA density, ArduPilot BCOEF and MCOEF |
 | `test_batch.py` | 20 | ~2.5 min | Sweeps, sizing, mode enforcement, GUI-config translation, GUI↔CLI consistency |
 

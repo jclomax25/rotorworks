@@ -13,12 +13,54 @@ GUI tests only:      pytest -m gui
 
 from __future__ import annotations
 
+import gc
 import importlib.util
 import os
 import sys
+import time
 import types
 
 import pytest
+
+
+def _retry_tk_startup() -> None:
+    """
+    Retry a Tk window that fails to start by reading its own library.
+
+    On some Windows machines, creating many Tk interpreters in one process
+    occasionally fails with "Can't find a usable init.tcl", "... usable
+    tk.tcl ... couldn't read file .../scrlbar.tcl: no such file or
+    directory" — for files that are there — or 'invalid command name
+    "tcl_findLibrary"' when init.tcl half-loaded. It is a transient read
+    failure of Python's own Tcl library, not anything the simulators do. When it hit a fixture's display probe the test was reported as
+    SKIPPED for lack of a display, quietly dropping coverage from a green
+    run. Collecting the dead windows of earlier tests and retrying with a
+    growing pause makes it disappear. A missing display is raised at once,
+    so a headless machine still skips promptly.
+    """
+    try:
+        import tkinter
+    except ImportError:
+        return
+    original = tkinter.Tk.__init__
+    if getattr(original, "_rw_retry", False):
+        return
+
+    def patched(self, *args, **kwargs):
+        for attempt in range(8):
+            try:
+                return original(self, *args, **kwargs)
+            except tkinter.TclError as exc:
+                if "display" in str(exc).lower() or attempt == 7:
+                    raise
+                gc.collect()
+                time.sleep(0.25 * (attempt + 1))
+
+    patched._rw_retry = True
+    tkinter.Tk.__init__ = patched
+
+
+_retry_tk_startup()
 
 # Repository root = parent of tests/
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
