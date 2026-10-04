@@ -653,6 +653,43 @@ def test_motor_operating_point_figure_builds_from_a_table(mc):
     assert len(figure.axes) >= 2
 
 
+def _curve_at(line, x):
+    """A drawn line's value at x, between its plotted points."""
+    xs, ys = (list(map(float, d)) for d in (line.get_xdata(), line.get_ydata()))
+    for (x0, y0), (x1, y1) in zip(zip(xs, ys), zip(xs[1:], ys[1:])):
+        if x0 <= x <= x1:
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+    raise AssertionError(f"{x} is outside the drawn curve {xs[0]}-{xs[-1]}")
+
+
+@pytest.mark.parametrize("layout,speed,orientation",
+                         [("coaxial", 0.0, "hover"), ("flat", 8.0, "translating")])
+def test_multicopter_motor_marker_sits_where_the_model_runs(mc, layout, speed, orientation):
+    """
+    Regression: the operating point was read straight off the static bench
+    table, while the run's power applies the table's efficiency to the
+    forward-flight ideal power and adds the coaxial penalty: 116 W marked
+    against 75 W charged at 8 m/s, and against 137 W in a coaxial hover.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    drone = _quad_with_table(mc)
+    drone.motor_configuration = layout
+    metrics = mc.compute_operating_metrics(drone, speed, orientation)
+    per_motor_W = metrics["motor_power_W"] / drone.num_motors
+    bench_W = mc.interpolate_motor_power(drone, metrics["thrust_per_motor_N"])
+    assert abs(per_motor_W / bench_W - 1.0) > 0.1, "not the case this guards"
+
+    figure = mc.make_motor_operating_point_figure(drone, metrics, figsize=(10, 5))
+    power_ax = figure.axes[0]
+    star = next(l for l in power_ax.get_lines() if l.get_marker() == "*")
+    assert star.get_ydata()[0] == pytest.approx(per_motor_W, rel=1e-9)
+    curve = power_ax.get_lines()[0]
+    assert _curve_at(curve, float(star.get_xdata()[0])) == pytest.approx(per_motor_W, rel=0.02)
+    # The bench data stays behind it, faint, as the 0 m/s reference.
+    assert any(l.get_alpha() for l in power_ax.get_lines())
+
+
 # ======================================================================
 # MULTI-MOTOR FIXED-WING
 # ======================================================================
@@ -988,6 +1025,33 @@ def test_operating_curve_flags_extrapolation(fw):
     df = config.propeller.table
     if thrust_g < float(df["Thrust_g"].min()):
         assert "EXTRAPOLATED" in title, f"no extrapolation warning in: {title}"
+
+
+@pytest.mark.parametrize("n_motors", [1, 2])
+def test_fixed_wing_motor_marker_is_the_cruise_power_per_motor(fw, n_motors):
+    """
+    Regression: the operating point was the STATIC table power at the TOTAL
+    thrust. At 22 m/s that marked 71 W where the model charged 401 W, and a
+    twin looked its whole thrust up in a one-motor table.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    config = _fw_table_config(fw, _FW_TABLE_CSV)
+    config.airframe.num_motors = n_motors
+    config.num_motors = n_motors
+    metrics = fw.compute_metrics(config, 22.0)
+    per_motor_W = metrics["motor_power_W"] / n_motors
+    per_motor_g = metrics["thrust_required_N"] / n_motors * 1000.0 / 9.80665
+
+    figure = fw.make_motor_operating_point_figure(config, metrics, figsize=(12, 5))
+    power_ax = figure.axes[0]
+    dot = next(l for l in power_ax.get_lines() if l.get_marker() == "o")
+    assert dot.get_xdata()[0] == pytest.approx(per_motor_g, rel=1e-9)
+    assert dot.get_ydata()[0] == pytest.approx(per_motor_W, rel=1e-9)
+    curve = power_ax.get_lines()[0]
+    assert _curve_at(curve, per_motor_g) == pytest.approx(per_motor_W, rel=0.02)
+    assert any(l.get_alpha() for l in power_ax.get_lines())
+    assert "22.0 m/s" in figure._suptitle.get_text()
 
 
 def test_multicopter_below_range_values_stay_positive(mc):

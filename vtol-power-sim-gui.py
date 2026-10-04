@@ -46,6 +46,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from matplotlib.lines import Line2D as _Line2D
 from matplotlib.patches import Circle as _Circle, Rectangle as _Rectangle
 
 # ------------------------------------------------------------------
@@ -958,9 +959,12 @@ def motor_operating_point(cfg: VTOLConfig, group: str, thrust_per_rotor_N: float
 
     `measured` is True where a bench table covers this thrust: the table's
     power was taken at the ESC input, so it already contains the motor's
-    losses, and the figure of merit derived from it absorbs them. Adding the
-    model's loss on top would count the motor twice, so it is reported but
-    not charged.
+    losses, and the figure of merit derived from it absorbs them. What is
+    handed in as `shaft_per_rotor_W` is then the power the motor DRAWS, not
+    what it delivers, and the model splits that measured input into shaft
+    output and loss. Adding the model's loss on top instead counted the motor
+    twice: the plots and Metrics showed 14-29% more power than the bench
+    recorded. The split loss is reported but not charged.
     """
     g = _group(cfg, group)
     shaft = max(float(shaft_per_rotor_W), 0.0)
@@ -993,12 +997,24 @@ def motor_operating_point(cfg: VTOLConfig, group: str, thrust_per_rotor_N: float
     i0 = float(g["i0"] or 0.0)
     if g["v0"]:
         i0 *= math.sqrt(max(v_emf, 0.0) / max(float(g["v0"]), 1e-9))
-    current = torque / kt + i0
-    copper = current * current * float(g["rm"] or 0.0)
+    rm = float(g["rm"] or 0.0)
+    if measured:
+        # P_in = I * V_term = I * (V_emf + I * Rm), solved for I in the form
+        # that stays finite at Rm = 0. Whatever the motor does not lose is
+        # the shaft output; a table that measured less than the model's own
+        # no-load draw leaves none.
+        elec = shaft
+        current = 2.0 * elec / (v_emf + math.sqrt(v_emf * v_emf + 4.0 * rm * elec))
+        torque = max(current - i0, 0.0) * kt
+        shaft = torque * omega
+    else:
+        current = torque / kt + i0
+        elec = shaft + current * current * rm + i0 * v_emf
+    copper = current * current * rm
     iron = i0 * v_emf
-    v_term = v_emf + current * float(g["rm"] or 0.0)
-    elec = shaft + copper + iron
+    v_term = v_emf + current * rm
     out.update({
+        "shaft_W": shaft, "torque_Nm": torque,
         "current_A": current, "v_emf_V": v_emf, "v_term_V": v_term,
         "elec_W": elec, "copper_W": copper, "iron_W": iron,
         "loss_W": 0.0 if measured else copper + iron,
@@ -1019,6 +1035,41 @@ def cruise_table_covers(cfg: VTOLConfig, thrust_per_motor_N: float) -> bool:
     """True where the cruise bench table measures this thrust."""
     return measured_cruise_efficiency(cfg, thrust_per_motor_N,
                                       cfg.cruise_disc_area_m2) is not None
+
+
+def motor_operating_curve(cfg: VTOLConfig, group: str, thrusts_per_rotor_N,
+                          airspeed_mps: float = 0.0) -> Dict[str, list]:
+    """
+    One motor across a range of thrusts at a single airspeed, through the
+    same chain drive_chain() uses, so a run's operating point lies on the
+    curve drawn at that run's airspeed.
+
+    The lift rotors meet the freestream edgewise with no axial flow; the
+    cruise propeller of a lift+cruise meets it head-on, so the airspeed is
+    also its axial speed and sets both its power and its RPM.
+    """
+    g = _group(cfg, group)
+    n = max(int(g["n"]), 1)
+    v = max(float(airspeed_mps), 0.0)
+    out = {"thrust_N": [], "elec_W": [], "current_A": [], "g_per_W": [],
+           "rpm": [], "efficiency": []}
+    for t in thrusts_per_rotor_N:
+        t = float(t)
+        if group == "lift":
+            shaft = rotor_power_W(cfg, t * n, v) / n
+            op = motor_operating_point(cfg, group, t, shaft, 0.0,
+                                       measured=lift_table_covers(cfg, t))
+        else:
+            shaft = cruise_prop_power_W(cfg, t * n, v) / n
+            op = motor_operating_point(cfg, group, t, shaft, v,
+                                       measured=cruise_table_covers(cfg, t))
+        out["thrust_N"].append(t)
+        out["elec_W"].append(op["elec_W"])
+        out["current_A"].append(op["current_A"])
+        out["g_per_W"].append(t / G0 * 1000.0 / max(op["elec_W"], 1e-9))
+        out["rpm"].append(op["rpm"])
+        out["efficiency"].append(op["efficiency"])
+    return out
 
 
 def coaxial_power_multiplier(cfg: VTOLConfig, thrust_per_rotor_N: float,
@@ -2113,6 +2164,101 @@ def hover_rotor_thrusts(cfg: VTOLConfig, wind_mps: float = 0.0,
         drag_height_above_cg_m=cfg.drag_cg_offset_m)
 
 
+def make_motor_figure(cfg: VTOLConfig, m: dict, figsize):
+    """
+    The multicopter's and fixed-wing's motor operating-point figure, once
+    per motor type: electrical power and current, then efficiency and
+    RPM, against thrust per rotor — each with this run's operating point
+    marked, so it is plain how much range the motor has either side.
+
+    The cruise motor is marked at the run's airspeed, where its propeller
+    meets the freestream head-on and needs several times its static power
+    for the same thrust. Drawn only at 0 m/s, its marker sat far off its
+    own curve (348 W against 96 W on the default aircraft). Its curve is
+    now drawn at the marker's airspeed, stopping at the thrust the
+    propeller can make there, with the 0 m/s curve kept faint behind it
+    for comparison with a static bench table.
+    """
+    groups = [("lift", "Lift motor", "hover_lift", "hover")]
+    if not uses_vectored_thrust(cfg):
+        groups.append(("cruise", "Cruise motor", "cruise_motor", "cruise"))
+    fig, axes = core.make_figure(len(groups), 2, figsize=figsize)
+    axes = np.atleast_2d(axes)
+    fig.suptitle("Motor Operating Points", fontsize=12, fontweight="bold")
+    faint = {"alpha": 0.35, "linewidth": 1.0}
+    for row, (group, name, prefix, where) in enumerate(groups):
+        g = _group(cfg, group)
+        n = max(int(g["n"]), 1)
+        op_N = float(m.get(f"{prefix}_thrust_N", 0.0))
+        avail, _src = static_thrust_available_N(cfg, group)
+        per_max = max(avail / n, op_N * 1.6, 1.0)
+        static = motor_operating_curve(
+            cfg, group, [per_max * i / 60 for i in range(1, 61)])
+        speed = float(m.get("airspeed_mps", 0.0)) if group == "cruise" else 0.0
+        if speed > 0:
+            top = max(forward_thrust_available_N(cfg, speed) / n if avail > 0
+                      else per_max, op_N)
+            main = motor_operating_curve(
+                cfg, group, [top * i / 60 for i in range(1, 61)], speed)
+            where = f"{where} {speed:.1f} m/s"
+        else:
+            main, static = static, None
+        grams = [t / G0 * 1000.0 for t in main["thrust_N"]]
+        op_g = op_N / G0 * 1000.0
+        ref = None
+        if static is not None:
+            s_grams = [t / G0 * 1000.0 for t in static["thrust_N"]]
+            ref = _Line2D([], [], color="gray", label="Faint: 0 m/s (static)", **faint)
+
+        ax = axes[row, 0]
+        h1, = ax.plot(grams, main["elec_W"], color="#C62828", label="Electrical power (W)")
+        axb = ax.twinx()
+        h2, = axb.plot(grams, main["current_A"], color="#1565C0", linestyle="--",
+                       label="Current (A)")
+        if static is not None:
+            ax.plot(s_grams, static["elec_W"], color="#C62828", **faint)
+            axb.plot(s_grams, static["current_A"], color="#1565C0", linestyle="--", **faint)
+        if op_g > 0:
+            ax.axvline(op_g, color="gray", linestyle=":", linewidth=1.2)
+            ax.plot([op_g], [float(m.get(f"{prefix}_elec_W", 0.0))], "o", color="#C62828")
+        if g["imax"]:
+            axb.axhline(float(g["imax"]), color="#1565C0", linestyle=":", linewidth=0.9)
+        ax.set_xlabel(f"Thrust per rotor (g)")
+        ax.set_ylabel("Power (W)")
+        axb.set_ylabel("Current (A)")
+        ax.set_title(f"{name}: Thrust vs Power & Current ({where} marked)")
+        ax.grid(alpha=0.3)
+        handles = [h for h in (h1, h2, ref) if h is not None]
+        ax.legend(handles, [h.get_label() for h in handles], fontsize=7, loc="upper left")
+
+        ax = axes[row, 1]
+        h1, = ax.plot(grams, main["g_per_W"], color="#2E7D32", label="Thrust per watt (g/W)")
+        h3, = ax.plot(grams, [e * 10.0 for e in main["efficiency"]], color="#6A1B9A",
+                      linestyle="-.", label="Motor efficiency (/10 %)")
+        axb = ax.twinx()
+        h2, = axb.plot(grams, main["rpm"], color="#EF6C00", linestyle="--", label="RPM")
+        if static is not None:
+            ax.plot(s_grams, static["g_per_W"], color="#2E7D32", **faint)
+            ax.plot(s_grams, [e * 10.0 for e in static["efficiency"]], color="#6A1B9A",
+                    linestyle="-.", **faint)
+            axb.plot(s_grams, static["rpm"], color="#EF6C00", linestyle="--", **faint)
+        if op_g > 0:
+            ax.axvline(op_g, color="gray", linestyle=":", linewidth=1.2)
+        if g["max_rpm"]:
+            axb.axhline(float(g["max_rpm"]), color="#EF6C00", linestyle=":", linewidth=0.9)
+        ax.set_xlabel("Thrust per rotor (g)")
+        ax.set_ylabel("g/W  |  efficiency / 10")
+        axb.set_ylabel("RPM")
+        ax.set_title(f"{name}: Thrust vs Efficiency & RPM")
+        ax.grid(alpha=0.3)
+        handles = [h for h in (h1, h3, h2, ref) if h is not None]
+        ax.legend(handles, [h.get_label() for h in handles],
+                  fontsize=7, loc="upper right")
+    fig.set_layout_engine("constrained", w_pad=0.06, h_pad=0.06,
+                          wspace=0.08, hspace=0.12)
+    return fig
+
+
 def make_airframe_diagram_figure(cfg: VTOLConfig, figsize=(9, 7.5)):
     """
     Plan view of the aircraft, to scale, drawn from the numbers entered.
@@ -3143,12 +3289,16 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
                 lift_op = point.get("lift_motor") or {}
                 n_l = max(cfg.num_lift_rotors, 1)
                 if lift_op.get("thrust_N", 0.0) > 0:
+                    # A measured point was handed the motor's INPUT (the
+                    # bench table already contains the motor), so the climb
+                    # work adds to that, as it always has. Either way elec_W
+                    # is the motor input the drive chain charges.
+                    measured = lift_op.get("measured", False)
+                    base_W = lift_op["elec_W"] if measured else lift_op["shaft_W"]
                     climbing = motor_operating_point(
                         cfg, "lift", lift_op["thrust_N"],
-                        lift_op["shaft_W"] + climb_W / n_l, climb_rate,
-                        measured=lift_op.get("measured", False))
-                    extra_in = n_l * ((climbing["shaft_W"] + climbing["loss_W"])
-                                      - (lift_op["shaft_W"] + lift_op["loss_W"]))
+                        base_W + climb_W / n_l, climb_rate, measured=measured)
+                    extra_in = n_l * (climbing["elec_W"] - lift_op["elec_W"])
                     point = dict(point)
                     point["lift_motor"] = climbing
                     if uses_vectored_thrust(cfg):
@@ -8189,79 +8339,6 @@ def launch_gui(args=None) -> None:
             data["regime"].append(str(p.get("regime", "")))
             data["tilt"].append(float(p.get("tilt_deg", 0.0)))
         return data
-
-    def make_motor_figure(cfg, m, figsize):
-        """
-        The multicopter's and fixed-wing's motor operating-point figure, once
-        per motor type: electrical power and current, then efficiency and
-        RPM, against thrust per rotor — each with this run's operating point
-        marked, so it is plain how much range the motor has either side.
-        """
-        groups = [("lift", "Lift motor", "hover_lift", "hover")]
-        if not uses_vectored_thrust(cfg):
-            groups.append(("cruise", "Cruise motor", "cruise_motor", "cruise"))
-        fig, axes = core.make_figure(len(groups), 2, figsize=figsize)
-        axes = np.atleast_2d(axes)
-        fig.suptitle("Motor Operating Points", fontsize=12, fontweight="bold")
-        for row, (group, name, prefix, where) in enumerate(groups):
-            g = _group(cfg, group)
-            avail, _src = static_thrust_available_N(cfg, group)
-            per_max = max(avail / max(g["n"], 1),
-                          float(m.get(f"{prefix}_thrust_N", 0.0)) * 1.6, 1.0)
-            thrusts = [per_max * i / 60 for i in range(1, 61)]
-            elec, amps, grams_per_W, rpms, effs = [], [], [], [], []
-            for t in thrusts:
-                if group == "lift":
-                    shaft = rotor_power_W(cfg, t * g["n"], 0.0) / g["n"]
-                    measured = lift_table_covers(cfg, t)
-                else:
-                    shaft = cruise_prop_power_W(cfg, t * g["n"], 0.0) / g["n"]
-                    measured = cruise_table_covers(cfg, t)
-                op = motor_operating_point(cfg, group, t, shaft, 0.0, measured=measured)
-                elec.append(op["elec_W"])
-                amps.append(op["current_A"])
-                grams_per_W.append(t / G0 * 1000.0 / max(op["elec_W"], 1e-9))
-                rpms.append(op["rpm"])
-                effs.append(op["efficiency"] * 100.0)
-            grams = [t / G0 * 1000.0 for t in thrusts]
-            op_g = float(m.get(f"{prefix}_thrust_N", 0.0)) / G0 * 1000.0
-
-            ax = axes[row, 0]
-            h1, = ax.plot(grams, elec, color="#C62828", label="Electrical power (W)")
-            axb = ax.twinx()
-            h2, = axb.plot(grams, amps, color="#1565C0", linestyle="--", label="Current (A)")
-            if op_g > 0:
-                ax.axvline(op_g, color="gray", linestyle=":", linewidth=1.2)
-                ax.plot([op_g], [float(m.get(f"{prefix}_elec_W", 0.0))], "o", color="#C62828")
-            if g["imax"]:
-                axb.axhline(float(g["imax"]), color="#1565C0", linestyle=":", linewidth=0.9)
-            ax.set_xlabel(f"Thrust per rotor (g)")
-            ax.set_ylabel("Power (W)")
-            axb.set_ylabel("Current (A)")
-            ax.set_title(f"{name}: Thrust vs Power & Current ({where} marked)")
-            ax.grid(alpha=0.3)
-            ax.legend([h1, h2], [h1.get_label(), h2.get_label()], fontsize=7, loc="upper left")
-
-            ax = axes[row, 1]
-            h1, = ax.plot(grams, grams_per_W, color="#2E7D32", label="Thrust per watt (g/W)")
-            h3, = ax.plot(grams, [e / 10.0 for e in effs], color="#6A1B9A", linestyle="-.",
-                          label="Motor efficiency (/10 %)")
-            axb = ax.twinx()
-            h2, = axb.plot(grams, rpms, color="#EF6C00", linestyle="--", label="RPM")
-            if op_g > 0:
-                ax.axvline(op_g, color="gray", linestyle=":", linewidth=1.2)
-            if g["max_rpm"]:
-                axb.axhline(float(g["max_rpm"]), color="#EF6C00", linestyle=":", linewidth=0.9)
-            ax.set_xlabel("Thrust per rotor (g)")
-            ax.set_ylabel("g/W  |  efficiency / 10")
-            axb.set_ylabel("RPM")
-            ax.set_title(f"{name}: Thrust vs Efficiency & RPM")
-            ax.grid(alpha=0.3)
-            ax.legend([h1, h3, h2], [h.get_label() for h in (h1, h3, h2)],
-                      fontsize=7, loc="upper right")
-        fig.set_layout_engine("constrained", w_pad=0.06, h_pad=0.06,
-                              wspace=0.08, hspace=0.12)
-        return fig
 
     _canvas_motor = {"widget": None}
 

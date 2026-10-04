@@ -4079,6 +4079,80 @@ def test_a_bench_table_already_contains_the_motor(vtol, tmp_path):
     assert vtol.prop_coefficients(cfg, "lift")["source"] == "bench table"
 
 
+def test_a_bench_table_motor_draws_what_the_bench_recorded(vtol, tmp_path):
+    """
+    Regression: inside a bench table's range the motor model ADDED its copper
+    and iron loss to the measured input, which already contains them. The
+    pack was charged correctly, but the motor plots, Metrics and Status
+    showed 14-29% more power and current than the bench recorded. The
+    measured input is now split into shaft output and loss instead.
+    """
+    table = _write_table(tmp_path / "lift.csv",
+                         [500, 1000, 1500, 2000, 2500],
+                         [40, 105, 190, 290, 410],
+                         [2500, 3500, 4300, 5000, 5600])
+    cfg = vtol.VTOLConfig(lift_prop_table_csv=table, hover_download_fraction=0.0,
+                          avionics_power_W=0.0)
+    t = cfg.weight_N / cfg.num_lift_rotors
+    op = vtol.hover_power_W(cfg)["lift_motor"]
+    bench = float(vtol.core.table_power_for_thrust(cfg.lift_prop_table, t))
+    assert op["measured"]
+    # What the motor draws is the bench's ESC-input power less the ESC loss.
+    assert op["elec_W"] == pytest.approx(bench * cfg.esc_efficiency, rel=1e-6)
+    assert op["shaft_W"] + op["copper_W"] + op["iron_W"] == pytest.approx(op["elec_W"], rel=1e-9)
+    assert op["current_A"] * op["v_term_V"] == pytest.approx(op["elec_W"], rel=1e-9)
+    assert 0.0 < op["efficiency"] < 1.0
+    # A mission climb puts extra work through the same point and is charged
+    # exactly that work, as it was before the split.
+    climbing = vtol.motor_operating_point(cfg, "lift", t, op["elec_W"] + 25.0, 2.0,
+                                          measured=True)
+    assert climbing["elec_W"] - op["elec_W"] == pytest.approx(25.0, rel=1e-9)
+
+
+@pytest.mark.parametrize("overrides", [{}, {"cruise_prop_eff_model": "curve"},
+                                       {"cruise_motor_kv": 0}])
+def test_the_cruise_motor_is_marked_on_its_own_curve(vtol, overrides):
+    """
+    Regression: the cruise motor's curves were drawn at 0 m/s and its marker
+    at the cruise airspeed, where the propeller needs several times the
+    power for the same thrust: 348 W marked against 96 W on the curve.
+    """
+    cfg = vtol.VTOLConfig(**overrides)
+    m = vtol.compute_metrics(cfg)
+    t = m["cruise_motor_thrust_N"]
+    at_speed = vtol.motor_operating_curve(cfg, "cruise", [t], m["airspeed_mps"])
+    static = vtol.motor_operating_curve(cfg, "cruise", [t])
+    assert at_speed["elec_W"][0] == pytest.approx(m["cruise_motor_elec_W"], rel=1e-9)
+    assert at_speed["current_A"][0] == pytest.approx(m["cruise_motor_current_A"], rel=1e-9)
+    assert abs(static["elec_W"][0] / m["cruise_motor_elec_W"] - 1.0) > 0.2
+    hover = vtol.motor_operating_curve(cfg, "lift", [m["hover_lift_thrust_N"]])
+    assert hover["elec_W"][0] == pytest.approx(m["hover_lift_elec_W"], rel=1e-9)
+
+
+def test_the_motor_figure_keeps_a_static_reference_for_the_cruise_motor(vtol):
+    """The 0 m/s curve stays, faint, behind the cruise motor's for bench comparison."""
+    cfg = vtol.VTOLConfig()
+    m = vtol.compute_metrics(cfg)
+    fig = vtol.make_motor_figure(cfg, m, (10, 7))
+    by_title = {ax.get_title(): ax for ax in fig.axes if ax.get_title()}
+    cruise = next(ax for title, ax in by_title.items()
+                  if title.startswith("Cruise motor: Thrust vs Power"))
+    lift = next(ax for title, ax in by_title.items()
+                if title.startswith("Lift motor: Thrust vs Power"))
+    assert f"{m['airspeed_mps']:.1f} m/s" in cruise.get_title()
+    assert any("0 m/s" in t.get_text() for t in cruise.get_legend().get_texts())
+    assert not any("0 m/s" in t.get_text() for t in lift.get_legend().get_texts())
+    assert any(line.get_alpha() for line in cruise.get_lines())
+    marker = next(line for line in cruise.get_lines() if line.get_marker() == "o")
+    assert marker.get_ydata()[0] == pytest.approx(m["cruise_motor_elec_W"], rel=1e-9)
+
+    # A vectored type has one set of rotors and one row, at hover.
+    tilt = vtol.VTOLConfig(config_type="tiltrotor")
+    fig = vtol.make_motor_figure(tilt, vtol.compute_metrics(tilt), (10, 4))
+    titles = [ax.get_title() for ax in fig.axes if ax.get_title()]
+    assert titles and all(t.startswith("Lift motor") for t in titles)
+
+
 def test_the_climb_command_adds_its_potential_power(vtol):
     level = vtol.compute_metrics(vtol.VTOLConfig())
     climbing = vtol.compute_metrics(vtol.VTOLConfig(climb_rate_mps=2.0))

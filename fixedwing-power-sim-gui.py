@@ -101,6 +101,7 @@ SIM_BUILD_NOTE = "Table-path inflow double-count fixed; table range warnings"
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
 # FigureCanvasTkAgg is imported lazily inside launch_gui() so that
 # the physics engine can be used on headless / no-Tkinter systems.
 
@@ -2413,6 +2414,17 @@ def make_motor_operating_point_figure(config: FixedWingConfig, metrics: dict, fi
     Two subplots:
       1. Thrust vs Power (left), Thrust vs Current (right) on same plot
       2. Thrust vs Efficiency g/W (left), Thrust vs RPM (right) on same plot
+
+    The bench table is STATIC data, and in cruise the model does not read
+    power from it: it applies the table's measured efficiency to the
+    forward-flight ideal power (see motor_shaft_power_from_thrust). Marked
+    on the table, the operating point showed 71 W where the model charged
+    401 W at 22 m/s, and a twin looked its TOTAL thrust up in a one-motor
+    table. Power, current and g/W are therefore drawn per motor through the
+    model at the run's airspeed, stopping at the thrust the propeller can
+    make there, with the operating point on them and the bench data faint
+    behind as the 0 m/s reference. RPM has no forward-flight model, so it
+    is the table's.
     """
     if config.propeller.table is None:
         # Return empty figure if no propeller table
@@ -2423,92 +2435,97 @@ def make_motor_operating_point_figure(config: FixedWingConfig, metrics: dict, fi
         return fig
     
     df = config.propeller.table
-    thrust_N = float(metrics.get("thrust_required_N", 0.0))
+    n_motors = max(int(getattr(config, "num_motors", 1) or 1), 1)
+    thrust_N = float(metrics.get("thrust_required_N", 0.0)) / n_motors
+    speed = max(float(metrics.get("airspeed_mps", 0.0) or 0.0), 0.0)
+    v_esc = float(metrics.get("esc_input_voltage_V", 0.0) or 0.0)
+    if v_esc <= 0:
+        v_esc = float(config.battery.vnom_pack)
+
+    def power_per_motor(t_N):
+        return motor_shaft_power_from_thrust(config, t_N * n_motors, speed) / n_motors
     
     fig, (ax1, ax2) = core.make_figure(1, 2, figsize=figsize)
+    faint = {"alpha": 0.35, "linewidth": 1.5}
+    bench = Line2D([], [], color="gray", label="Faint: bench table (0 m/s)", **faint)
     
     # Get data from propeller table
     thrust_g = df["Thrust_g"].values if "Thrust_g" in df.columns else []
+
+    # The model at the run's airspeed, from half the lower of the table's
+    # first row and the operating point, up to the thrust available there.
+    t_lo_N = float(df["Thrust_g"].min()) * G0 / 1000.0 if len(thrust_g) else 0.0
+    lo_N = 0.5 * (min(t_lo_N, thrust_N) if thrust_N > 0 else t_lo_N)
+    top_N = max(thrust_available_N(config, speed) / n_motors, thrust_N)
+    sweep_N = ([lo_N + (top_N - lo_N) * i / 59 for i in range(60)]
+               if top_N > lo_N > 0 else [])
+    sweep_g = [t * 1000.0 / G0 for t in sweep_N]
+    sweep_W = [power_per_motor(t) for t in sweep_N]
     
     # Subplot 1: Thrust vs Power & Thrust vs Current
+    ax1_2 = ax1.twinx()
+    ax1.plot(sweep_g, sweep_W, "b-", linewidth=2, label="Power")
+    ax1_2.plot(sweep_g, [p / v_esc for p in sweep_W], "r--", linewidth=2, label="Current")
     if "Power_W" in df.columns and len(thrust_g) > 0:
-        power_W = df["Power_W"].values
-        ax1_1 = ax1
-        ax1_1.plot(thrust_g, power_W, "b-", linewidth=2, label="Power")
-        ax1_1.set_xlabel("Thrust (gf)", fontsize=10)
-        ax1_1.set_ylabel("Power (W)", fontsize=10, color="b")
-        ax1_1.tick_params(axis="y", labelcolor="b")
-        ax1_1.grid(True, alpha=0.3)
-    
+        ax1.plot(thrust_g, df["Power_W"].values, "b-", **faint)
     if "Current_A" in df.columns and len(thrust_g) > 0:
-        current_A = df["Current_A"].values
-        ax1_2 = ax1.twinx()
-        ax1_2.plot(thrust_g, current_A, "r--", linewidth=2, label="Current")
-        ax1_2.set_ylabel("Current (A)", fontsize=10, color="r")
-        ax1_2.tick_params(axis="y", labelcolor="r")
+        ax1_2.plot(thrust_g, df["Current_A"].values, "r--", **faint)
+    ax1.set_xlabel("Thrust per motor (gf)", fontsize=10)
+    ax1.set_ylabel("Power (W)", fontsize=10, color="b")
+    ax1.tick_params(axis="y", labelcolor="b")
+    ax1.grid(True, alpha=0.3)
+    ax1_2.set_ylabel(f"Current at {v_esc:.1f} V (A)", fontsize=10, color="r")
+    ax1_2.tick_params(axis="y", labelcolor="r")
     
-    # Mark operating point on subplot 1
-    thrust_g_op = thrust_N * 1000.0 / 9.81
-    if "Power_W" in df.columns and len(thrust_g) > 1:
-        try:
-            # Use the SAME lookup the model uses, rather than a second
-            # hand-rolled interpolation. The local version here walked the
-            # bracketing pair and extrapolated linearly off the end of the
-            # table, which produced a negative operating power (-12.7 W) and
-            # an impossible efficiency whenever the aircraft cruised below the
-            # lowest measured thrust.
-            power_op = _table_power_for_thrust(df, thrust_N, config.propeller)
-            if power_op is not None and power_op > 0:
-                ax1.plot(thrust_g_op, power_op, "go", markersize=10,
-                         label=f"Operating ({power_op:.1f} W)",
-                         markeredgewidth=2, markeredgecolor="darkgreen")
-        except Exception:
-            pass
+    # Mark operating point on subplot 1, from the same model as the curves
+    # so it lies on them.
+    thrust_g_op = thrust_N * 1000.0 / G0
+    power_op = power_per_motor(thrust_N) if thrust_N > 0 else 0.0
+    if power_op > 0:
+        ax1.plot(thrust_g_op, power_op, "go", markersize=10,
+                 label=f"Operating ({power_op:.1f} W)",
+                 markeredgewidth=2, markeredgecolor="darkgreen")
+        ax1_2.plot(thrust_g_op, power_op / v_esc, "o", markersize=8, color="salmon",
+                   label=f"Operating ({power_op / v_esc:.2f} A)",
+                   markeredgewidth=1.5, markeredgecolor="darkred")
     
     ax1.set_title("Thrust vs Power & Current", fontsize=11, fontweight="bold")
-    ax1.legend(loc="upper left", fontsize=9)
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax1_2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2 + [bench], labels1 + labels2 + [bench.get_label()],
+               loc="upper left", fontsize=9)
     
     # Subplot 2: Thrust vs Efficiency & Thrust vs RPM
+    ax2.plot(sweep_g, [g / max(p, 1e-9) for g, p in zip(sweep_g, sweep_W)],
+             "g-", linewidth=2, label="Efficiency")
     if "Efficiency_gW" in df.columns and len(thrust_g) > 0:
-        eff_gW = df["Efficiency_gW"].values
-        ax2_1 = ax2
-        ax2_1.plot(thrust_g, eff_gW, "g-", linewidth=2, label="Efficiency")
-        ax2_1.set_xlabel("Thrust (gf)", fontsize=10)
-        ax2_1.set_ylabel("Efficiency (g/W)", fontsize=10, color="g")
-        ax2_1.tick_params(axis="y", labelcolor="g")
-        ax2_1.grid(True, alpha=0.3)
+        ax2.plot(thrust_g, df["Efficiency_gW"].values, "g-", **faint)
+    ax2.set_xlabel("Thrust per motor (gf)", fontsize=10)
+    ax2.set_ylabel("Efficiency (g/W)", fontsize=10, color="g")
+    ax2.tick_params(axis="y", labelcolor="g")
+    ax2.grid(True, alpha=0.3)
     
+    ax2_2 = None
     if "RPM" in df.columns and len(thrust_g) > 0:
         rpm = df["RPM"].values
         ax2_2 = ax2.twinx()
-        ax2_2.plot(thrust_g, rpm, "m--", linewidth=2, label="RPM")
+        ax2_2.plot(thrust_g, rpm, "m--", linewidth=2, label="RPM (bench)")
         ax2_2.set_ylabel("RPM", fontsize=10, color="m")
         ax2_2.tick_params(axis="y", labelcolor="m")
     
-    # Mark operating point on subplot 2
-    if "Efficiency_gW" in df.columns and len(thrust_g) > 1:
-        try:
-            eff_gW = df["Efficiency_gW"].values
-            idx = 0
-            for i in range(len(thrust_g) - 1):
-                if thrust_g[i] <= thrust_g_op <= thrust_g[i + 1]:
-                    idx = i
-                    break
-            frac = (thrust_g_op - thrust_g[idx]) / (thrust_g[idx + 1] - thrust_g[idx]) if thrust_g[idx + 1] != thrust_g[idx] else 0
-            eff_op = eff_gW[idx] + frac * (eff_gW[idx + 1] - eff_gW[idx])
-            # Efficiency is derived from the power above so the two markers
-            # can never disagree.
-            _p = _table_power_for_thrust(df, thrust_N, config.propeller)
-            if _p and _p > 0:
-                eff_op = thrust_g_op / _p
-                ax2.plot(thrust_g_op, eff_op, "o", markersize=10, color="cyan",
-                         label=f"Operating ({eff_op:.2f} g/W)",
-                         markeredgewidth=2, markeredgecolor="teal")
-        except:
-            pass
+    # Mark operating point on subplot 2. Efficiency is derived from the power
+    # above so the two markers can never disagree.
+    if power_op > 0:
+        eff_op = thrust_g_op / power_op
+        ax2.plot(thrust_g_op, eff_op, "o", markersize=10, color="cyan",
+                 label=f"Operating ({eff_op:.2f} g/W)",
+                 markeredgewidth=2, markeredgecolor="teal")
     
     ax2.set_title("Thrust vs Efficiency & RPM", fontsize=11, fontweight="bold")
-    ax2.legend(loc="upper left", fontsize=9)
+    lines1, labels1 = ax2.get_legend_handles_labels()
+    lines2, labels2 = (ax2_2.get_legend_handles_labels() if ax2_2 else ([], []))
+    ax2.legend(lines1 + lines2 + [bench], labels1 + labels2 + [bench.get_label()],
+               loc="upper left", fontsize=9)
     
     # Say plainly when the operating point sits outside the measured data.
     # Anything outside the table is an extrapolation, and a reader deserves to
@@ -2522,7 +2539,8 @@ def make_motor_operating_point_figure(config: FixedWingConfig, metrics: dict, fi
         _where = "below" if thrust_g_op < _t_lo else "above"
         _range_note = (f"   —  EXTRAPOLATED, {_where} the measured "
                        f"{_t_lo:.0f}-{_t_hi:.0f} g range")
-    fig.suptitle(f"Motor/Propeller Operating Curves (Thrust: {thrust_g_op:.0f}g)"
+    fig.suptitle(f"Motor/Propeller Operating Curves (at {speed:.1f} m/s, "
+                 f"Thrust/Motor: {thrust_g_op:.0f}g)"
                  + _range_note,
                  color=("#C62828" if _outside else "black"), 
                  fontsize=12, fontweight="bold")
