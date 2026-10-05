@@ -681,11 +681,24 @@ def thermal_step(temp_C: float, ambient_C: float, power_loss_W: float,
 
     A single capacity with one resistance to ambient: crude, but adequate for
     flagging a motor that is heading for trouble.
+
+    Solved exactly for a loss held constant over the step:
+
+        T(dt) = T_ss + (T - T_ss) * exp(-dt / tau),
+        T_ss  = T_ambient + P_loss * R_th,    tau = R_th * C_th
+
+    The explicit-Euler update this replaced is unstable once dt > 2*tau. The
+    fixed-wing mission advances a whole phase as one step, and a 900 s phase
+    is eleven time constants of the motor, so its temperatures diverged to
+    thousands of degrees either side of zero. The exact form cannot overshoot,
+    settles on T_ss for a long step, and agrees with Euler to O(dt^2) at the
+    0.5 s steps the multicopter and VTOL use.
     """
     r_th = max(float(thermal_resistance_C_per_W), 1e-9)
     c_th = max(float(thermal_mass_J_per_C), 1e-9)
-    dissipated = (float(temp_C) - float(ambient_C)) / r_th
-    return float(temp_C) + (float(power_loss_W) - dissipated) / c_th * float(dt_s)
+    dt = max(float(dt_s), 0.0)
+    t_ss = float(ambient_C) + float(power_loss_W) * r_th
+    return t_ss + (float(temp_C) - t_ss) * math.exp(-dt / (r_th * c_th))
 
 
 # ============================================================

@@ -378,6 +378,31 @@ def test_thermal_equilibrium_is_stable(core):
     assert stepped == pytest.approx(equilibrium, abs=1e-9)
 
 
+def test_long_thermal_step_settles_without_overshoot(core):
+    """Audit F1: explicit Euler overshot, then diverged, once dt > 2*tau.
+    tau here is R*C = 100 s; T_ss = 25 + 10*2 = 45 C."""
+    t_ss = 45.0
+    for dt in (150.0, 250.0, 900.0, 10_000.0):
+        t = core.thermal_step(25.0, 25.0, 10.0, 2.0, 50.0, dt)
+        assert 25.0 < t <= t_ss + 1e-9, dt
+    assert core.thermal_step(25.0, 25.0, 10.0, 2.0, 50.0, 10_000.0) == pytest.approx(t_ss)
+    # Cooling from above never undershoots ambient either.
+    assert 25.0 <= core.thermal_step(300.0, 25.0, 0.0, 2.0, 50.0, 900.0) < 300.0
+
+
+def test_thermal_step_is_the_exact_first_order_solution(core):
+    import math
+    t = core.thermal_step(25.0, 25.0, 10.0, 2.0, 50.0, 100.0)   # one tau
+    assert t == pytest.approx(45.0 - 20.0 * math.exp(-1.0))
+
+
+def test_short_thermal_step_matches_euler(core):
+    """At the 0.5 s step the multicopter and VTOL use, the exact solution
+    and the old Euler update agree to well under a millidegree."""
+    euler = 25.0 + (10.0 - 0.0) / 50.0 * 0.5
+    assert core.thermal_step(25.0, 25.0, 10.0, 2.0, 50.0, 0.5) == pytest.approx(euler, abs=1e-3)
+
+
 # ======================================================================
 # Propeller curve fitting
 # ======================================================================

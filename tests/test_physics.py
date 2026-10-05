@@ -2146,3 +2146,22 @@ def test_fw_mission_stops_on_low_voltage(fw, fw_plane, tmp_path):
     fw_plane.battery.resistance_cell = 0.200
     results, _w, _s = fw.simulate_fw_mission(fw_plane, profile)
     assert "voltage" in results[-1][-1]
+
+
+# ----------------------------------------------------------------------
+# Audit F1: the fixed-wing mission advances temperature a whole phase at a
+# time. With explicit Euler, a phase longer than two thermal time constants
+# diverged; on fw_04 the motor reached thousands of degrees either side of
+# zero.
+# ----------------------------------------------------------------------
+
+def test_fw_mission_temperatures_stay_physical(fw, paths):
+    cfg = _fw_table_config(fw, None)
+    mission = fw.MissionProfile.from_json(
+        os.path.join(paths["missions"], "fw_04_loiter_on_station.json"))
+    _results, worst, series = fw.simulate_fw_mission(cfg, mission)
+    for key in ("motor_temp_est_C", "esc_temp_est_C", "battery_temp_est_C"):
+        ambient = series[key][0]
+        assert min(series[key]) >= ambient - 1e-9, key
+        assert max(series[key]) < ambient + 150.0, key
+        assert worst[key] < ambient + 150.0, key
