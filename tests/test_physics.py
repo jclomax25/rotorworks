@@ -2089,3 +2089,60 @@ def test_the_m30_documents_where_this_model_stops_being_accurate(mc):
     assert fom_small > fom_large, (
         "the small-rotor figure of merit is no longer above the large-rotor "
         "one — the scaling may have been corrected, so revisit the M30 gap")
+
+
+# ----------------------------------------------------------------------
+# Audit C1: the loaded pack voltage may fall below the cutoff.
+#
+# It used to be clamped at V_min, so a pack too resistive to hold its
+# cutoff under load reported exactly V_min and every "V_load < V_min" stop
+# was unreachable. Each test below fails with the clamp in place.
+# ----------------------------------------------------------------------
+
+def test_mc_pack_solve_falls_below_cutoff(mc, mc_quad):
+    batt = mc_quad.battery
+    v_ok, _i = mc.solve_pack_voltage_and_current(batt, 160.0)
+    assert v_ok > batt.vmin_pack
+    batt.resistance_cell = 0.090                # 90 mOhm per cell
+    v, i = mc.solve_pack_voltage_and_current(batt, 160.0)
+    assert v < batt.vmin_pack
+
+
+def test_mc_single_point_endurance_is_zero_in_brownout(mc, mc_quad):
+    assert mc.estimate_flight_time_minutes(mc_quad, 10.0, "translating") > 0
+    mc_quad.battery.resistance_cell = 0.090
+    assert mc.estimate_flight_time_minutes(mc_quad, 10.0, "translating") == 0.0
+
+
+def test_mc_mission_stops_on_low_voltage(mc, mc_quad, tmp_path):
+    mission = _square_mission(mc, tmp_path, speed=10.0)
+    results, _w, _s = mc.simulate_mission(mc_quad, mission)
+    assert not any("voltage" in s for _n, _t, _d, s in results)
+    mc_quad.battery.resistance_cell = 0.090
+    results, _w, _s = mc.simulate_mission(mc_quad, mission)
+    assert any("voltage under load" in s for _n, _t, _d, s in results)
+
+
+def test_fw_voltage_under_load_is_not_clamped(fw, fw_plane):
+    batt = fw_plane.battery
+    i = (batt.ocv_at_soc(1.0) - 0.5 * batt.vmin_pack) / batt.resistance_at_soc(1.0)
+    assert batt.voltage_under_load(i) == pytest.approx(0.5 * batt.vmin_pack)
+
+
+def test_fw_single_point_endurance_is_zero_in_brownout(fw, fw_plane):
+    m = fw.compute_metrics(fw_plane, 19.0)
+    assert m["flight_time_min"] > 0
+    fw_plane.battery.resistance_cell = 0.200    # 200 mOhm per cell
+    m = fw.compute_metrics(fw_plane, 19.0)
+    assert m["v_load_V"] < fw_plane.battery.vmin_pack
+    assert m["flight_time_min"] == 0.0
+
+
+def test_fw_mission_stops_on_low_voltage(fw, fw_plane, tmp_path):
+    profile = _fw_mission(fw, tmp_path, {"phases": [
+        {"name": "Cruise", "speed": 19.0, "duration": 300, "altitude": 150}]})
+    results, _w, _s = fw.simulate_fw_mission(fw_plane, profile)
+    assert results[0][-1] == "OK"
+    fw_plane.battery.resistance_cell = 0.200
+    results, _w, _s = fw.simulate_fw_mission(fw_plane, profile)
+    assert "voltage" in results[-1][-1]

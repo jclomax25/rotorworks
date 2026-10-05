@@ -336,16 +336,20 @@ class BatteryConfig:
     def voltage_under_load(self, current_A: float,
                            soc: Optional[float] = None) -> float:
         """
-        V_load = OCV(soc) - I x R_pack(soc), clamped at V_min.
+        V_load = OCV(soc) - I x R_pack(soc).
 
-        `soc` defaults to 1.0 (full charge), which reproduces the previous
-        behaviour exactly when no SoC is supplied.
+        Not clamped at V_min: the clamp made the "V_load < V_min" stops in
+        the mission and the single-point endurance check unreachable, so a
+        pack in brownout kept flying at exactly its cutoff voltage. The only
+        floor is 0 V.
+
+        `soc` defaults to 1.0 (full charge).
         """
         soc_eval = 1.0 if soc is None else min(max(float(soc), 0.0), 1.0)
         ocv = self.ocv_at_soc(soc_eval)
         r   = self.resistance_at_soc(soc_eval)
         v = ocv - float(current_A) * r
-        return max(float(v), float(self.vmin_pack))
+        return max(float(v), 0.0)
 
     def soc_after_energy_draw(self, soc_now: float, energy_draw_Wh: float) -> float:
         """Advance SoC after drawing a given amount of energy."""

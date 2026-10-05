@@ -58,7 +58,7 @@ __all__ = [
     "normalize_soc_curves", "load_soc_curve_csv",
     "configure_battery_soc_model", "soc_model_short_label",
     "pack_ocv_from_soc", "pack_resistance_from_soc",
-    "pack_voltage_under_load", "soc_after_energy_draw",
+    "pack_voltage_under_load", "solve_pack_for_power", "soc_after_energy_draw",
     # wind
     "wind_components_mps", "groundspeed_along_track_mps",
     # rotor inflow
@@ -441,15 +441,52 @@ def pack_resistance_from_soc(battery, soc: float) -> float:
 def pack_voltage_under_load(battery, current_A: float,
                             soc: Optional[float] = None) -> float:
     """
-    Loaded pack voltage: V = OCV(soc) - I * R(soc), clamped at V_min.
+    Loaded pack voltage: V = OCV(soc) - I * R(soc).
 
-    `soc` defaults to 1.0 (fully charged), reproducing the behaviour of the
-    original single-argument signature exactly.
+    NOT clamped at the cutoff. It used to be floored at V_min, which made
+    every downstream "V_load < V_min" check unreachable: a pack driven into
+    brownout reported exactly its cutoff voltage and kept flying. The only
+    floor now is 0 V.
+
+    `soc` defaults to 1.0 (fully charged).
     """
     soc_eval = 1.0 if soc is None else min(max(float(soc), 0.0), 1.0)
     ocv = pack_ocv_from_soc(battery, soc_eval)
     r = pack_resistance_from_soc(battery, soc_eval)
-    return max(float(ocv - float(current_A) * r), float(battery.vmin_pack))
+    return max(float(ocv - float(current_A) * r), 0.0)
+
+
+def solve_pack_for_power(battery, power_W: float,
+                         soc: Optional[float] = None) -> Tuple[float, float, bool]:
+    """
+    Terminal voltage and current for a load that draws a constant power.
+
+    P = V * I with V = OCV - I * R gives R*I^2 - OCV*I + P = 0, whose
+    physical (high-voltage) root is
+
+        I = (OCV - sqrt(OCV^2 - 4*R*P)) / (2*R),    V = OCV - I*R.
+
+    A load above the pack's maximum deliverable power, OCV^2 / (4R), has no
+    solution: the voltage collapses. That case returns the maximum-power
+    point (V = OCV/2, I = OCV/(2R)) with `deliverable` False. OCV/2 is far
+    below any cell's cutoff, so the caller's low-voltage check fires rather
+    than a fixed-point iteration running away.
+
+    Returns (V_load, I_pack, deliverable).
+    """
+    soc_eval = 1.0 if soc is None else min(max(float(soc), 0.0), 1.0)
+    ocv = float(pack_ocv_from_soc(battery, soc_eval))
+    r = float(pack_resistance_from_soc(battery, soc_eval))
+    p = max(float(power_W), 0.0)
+    if p <= 0.0:
+        return ocv, 0.0, True
+    if r <= 1e-12:
+        return ocv, p / max(ocv, 1e-9), True
+    disc = ocv * ocv - 4.0 * r * p
+    if disc < 0.0:
+        return 0.5 * ocv, 0.5 * ocv / r, False
+    i = (ocv - math.sqrt(disc)) / (2.0 * r)
+    return ocv - i * r, i, True
 
 
 def soc_after_energy_draw(battery, soc_now: float, energy_draw_Wh: float) -> float:

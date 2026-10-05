@@ -570,23 +570,19 @@ def solve_pack_voltage_and_current(battery: "BatteryConfig",
                                    total_power_W: float,
                                    iters: int = 12,
                                    soc: Optional[float] = None) -> tuple[float, float]:
-    """Solve V_load and I_pack for a load that draws a (roughly) constant electrical power.
+    """Solve V_load and I_pack for a load that draws a constant electrical power.
 
-    We iterate:
-      I = P / V
-      V = Vmax - I*Rpack (clamped at Vmin)
+    Solved exactly (core.solve_pack_for_power) rather than by iterating
+    I = P / V, V = OCV - I*R. The iteration only ever converged because V
+    was clamped at the cutoff; with the clamp gone it runs away whenever the
+    load exceeds what the pack can deliver. Past that point the result is
+    the pack's maximum-power point, whose voltage is far below cutoff, so
+    the low-voltage checks downstream now fire. `iters` is kept for callers
+    that pass it.
 
     Returns (V_load, I_pack).
     """
-    soc_eval = 1.0 if soc is None else min(max(float(soc), 0.0), 1.0)
-    if total_power_W <= 0:
-        return (battery_ocv_pack(battery, soc_eval), 0.0)
-
-    v = battery_ocv_pack(battery, soc_eval)
-    i = total_power_W / max(v, 1e-9)
-    for _ in range(max(1, int(iters))):
-        v = battery_voltage_under_load(battery, i, soc=soc_eval)
-        i = total_power_W / max(v, 1e-9)
+    v, i, _ok = core.solve_pack_for_power(battery, total_power_W, soc=soc)
     return (float(v), float(i))
 
 

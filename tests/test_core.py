@@ -251,10 +251,45 @@ def test_voltage_under_load_defaults_to_full_charge(core):
         core.pack_voltage_under_load(pack, 20.0, soc=1.0))
 
 
-def test_voltage_is_clamped_at_the_cutoff(core):
+def test_voltage_can_fall_below_the_cutoff(core):
+    """Audit C1: the loaded voltage used to be clamped at V_min, so no
+    "V_load < V_min" check could ever fire. It may now sag below the cutoff,
+    and is floored only at 0 V."""
     pack = _FakePack()
     core.configure_battery_soc_model(pack, "auto", None, None, None, None)
-    assert core.pack_voltage_under_load(pack, 10_000.0) == pytest.approx(pack.vmin_pack)
+    ocv = core.pack_ocv_from_soc(pack, 1.0)
+    r = core.pack_resistance_from_soc(pack, 1.0)
+    i = (ocv - 0.5 * pack.vmin_pack) / r          # sags to half the cutoff
+    assert core.pack_voltage_under_load(pack, i) == pytest.approx(0.5 * pack.vmin_pack)
+    assert core.pack_voltage_under_load(pack, i) < pack.vmin_pack
+    assert core.pack_voltage_under_load(pack, 10_000.0) == 0.0
+
+
+def test_constant_power_solve_is_exact(core):
+    pack = _FakePack()
+    core.configure_battery_soc_model(pack, "auto", None, None, None, None)
+    v, i, ok = core.solve_pack_for_power(pack, 300.0, soc=0.6)
+    assert ok
+    assert v * i == pytest.approx(300.0)
+    assert v == pytest.approx(core.pack_voltage_under_load(pack, i, soc=0.6))
+    # The physical (high-voltage) root, not the collapsed one.
+    assert v > 0.5 * core.pack_ocv_from_soc(pack, 0.6)
+
+
+def test_constant_power_solve_reports_an_overload(core):
+    """Beyond OCV^2 / 4R the pack cannot deliver the power. The solve
+    returns the maximum-power point, well below cutoff, instead of
+    diverging."""
+    pack = _FakePack()
+    core.configure_battery_soc_model(pack, "auto", None, None, None, None)
+    ocv = core.pack_ocv_from_soc(pack, 1.0)
+    r = core.pack_resistance_from_soc(pack, 1.0)
+    v, i, ok = core.solve_pack_for_power(pack, 1.01 * ocv * ocv / (4.0 * r))
+    assert not ok
+    assert v == pytest.approx(0.5 * ocv)
+    assert i == pytest.approx(0.5 * ocv / r)
+    assert v < pack.vmin_pack
+    assert core.solve_pack_for_power(pack, 0.0) == (pytest.approx(ocv), 0.0, True)
 
 
 def test_soc_after_energy_draw_stays_in_range(core):
