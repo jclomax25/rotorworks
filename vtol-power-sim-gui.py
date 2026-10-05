@@ -1968,10 +1968,15 @@ def turn(cfg: VTOLConfig, airspeed_mps: float, bank_deg: float) -> Dict[str, flo
     radius = v * v / (G0 * tan_phi) if tan_phi > 1e-6 else float("inf")
     rate = math.degrees(G0 * tan_phi / v)
     drag = wingborne_drag_N(cfg, v, n)
-    shaft = cruise_prop_power_W(cfg, drag, v)
     if uses_vectored_thrust(cfg):
+        # The lift rotors, pointed straight ahead, make the forward thrust:
+        # the same pricing as level wing-borne cruise. cruise_prop_power_W
+        # describes the lift+cruise pusher, whose fields are hidden on these
+        # types, and overcharged a tiltrotor's turn (audit V1).
+        shaft = vectored_rotor_power_W(cfg, drag, 90.0, v)
         chain = drive_chain(cfg, drag, shaft, rotor_axial_mps=v)
     else:
+        shaft = cruise_prop_power_W(cfg, drag, v)
         chain = drive_chain(cfg, 0.0, 0.0, drag, shaft, cruise_axial_mps=v)
     return {"load_factor": n, "turn_radius_m": radius, "turn_rate_deg_s": rate,
             "turn_period_s": 360.0 / rate if rate > 1e-9 else float("inf"),

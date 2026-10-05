@@ -4458,3 +4458,28 @@ def test_wiring_reaches_the_shared_status_checks(gui):
                  "Battery connector current (hover)", "Battery connector voltage"):
         assert name in rows, f"{name!r} missing from Status; have {sorted(rows)}"
     assert rows["Battery connector voltage"][2] == "<= 12 V"
+
+
+# ----------------------------------------------------------------------
+# Audit V1: turn() priced the forward thrust with cruise_prop_power_W,
+# the lift+cruise pusher's fields, also on vectored types, where those
+# fields are hidden and the lift rotors make the thrust.
+# ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("config_type", ALL_TYPES)
+def test_a_wings_level_turn_costs_level_flight(vtol, config_type):
+    cfg = vtol.VTOLConfig(config_type=config_type)
+    v = cfg.cruise_speed_mps
+    level = vtol.power_at_airspeed(cfg, v)["total_power_W"]
+    assert vtol.turn(cfg, v, 0.0)["turn_power_W"] == pytest.approx(level, rel=1e-9)
+    assert vtol.turn(cfg, v, 30.0)["turn_power_W"] > level
+
+
+@pytest.mark.parametrize("config_type", VECTORED)
+def test_vectored_turn_ignores_the_hidden_pusher(vtol, config_type):
+    cfg = vtol.VTOLConfig(config_type=config_type)
+    v = cfg.cruise_speed_mps
+    before = vtol.turn(cfg, v, 30.0)["turn_power_W"]
+    cfg.cruise_prop_diameter_in = cfg.cruise_prop_diameter_in * 0.5
+    cfg.num_cruise_motors = 3
+    assert vtol.turn(cfg, v, 30.0)["turn_power_W"] == pytest.approx(before, rel=1e-12)
