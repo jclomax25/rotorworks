@@ -545,7 +545,7 @@ def total_power_with_esc(config: "DroneConfig",
       (total_power_W, v_load_V, pack_current_A, esc_note, motor_current_per_esc_A)
     """
     total_power = float(motor_power_W) + float(periph_power_W)
-    v_load = battery_ocv_pack(config.battery, soc if soc is not None else 1.0)
+    v_load = battery_ocv_pack(config.battery, core.cell_soc_from_usable(config.battery, soc))
     pack_current = total_power / max(v_load, 1e-9)
     esc_note = ""
     i_motor = 0.0
@@ -1903,8 +1903,11 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         thermal_rise_C = 55.0 * (motor_I_esc_A / motor_i_max) ** 2 if motor_I_esc_A >= 0 else 0.0
     motor_temp_est_C = float(ambient_temp_C) + thermal_rise_C
     esc_temp_est_C = float(ambient_temp_C) + float(esc_loss_W) * 0.75
+    # soc_eval is the usable-energy SoC; the resistance curve is on the
+    # cell's full-capacity scale.
+    _cell_soc = core.cell_soc_from_usable(drone.battery, soc_eval)
     battery_loss_W = (float(pack_current_A) ** 2) * max(
-        float(battery_pack_resistance(drone.battery, soc_eval)),
+        float(battery_pack_resistance(drone.battery, _cell_soc)),
         0.0
     )
     battery_temp_est_C = float(ambient_temp_C) + battery_loss_W * 0.25
@@ -1981,8 +1984,7 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         # Resistive loss in the pack itself (#38): I^2 * R_pack. Shows as
         # voltage sag in the loaded voltage, but was never itemised.
         "battery_i2r_loss_W":  float(pack_current_A) ** 2
-                               * float(drone.battery.resistance_at_soc(
-                                   soc_eval if soc_eval is not None else 1.0)),
+                               * float(drone.battery.resistance_at_soc(_cell_soc)),
         "esc_note":            str(esc_note),
         "motor_I_per_esc_A":   float(motor_I_esc_A),
         "thrust_total_N":      float(total_thrust_N),

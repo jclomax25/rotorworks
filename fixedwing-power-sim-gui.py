@@ -343,9 +343,11 @@ class BatteryConfig:
         pack in brownout kept flying at exactly its cutoff voltage. The only
         floor is 0 V.
 
-        `soc` defaults to 1.0 (full charge).
+        `soc` is the usable-energy state of charge the mission tracks; the
+        curves are read at the matching CELL state of charge
+        (core.cell_soc_from_usable). It defaults to 1.0, full charge.
         """
-        soc_eval = 1.0 if soc is None else min(max(float(soc), 0.0), 1.0)
+        soc_eval = core.cell_soc_from_usable(self, soc)
         ocv = self.ocv_at_soc(soc_eval)
         r   = self.resistance_at_soc(soc_eval)
         v = ocv - float(current_A) * r
@@ -2834,7 +2836,8 @@ def simulate_fw_mission(
         motor_i_per_motor = m["motor_power_W"] / max(m["v_load_V"], 1.0) / max(cfg.num_motors, 1)
         motor_copper_loss_W = (motor_i_per_motor ** 2) * max(cfg.motor.resistance, 0.0) * max(cfg.num_motors, 1)
         battery_loss_W = (m["pack_current_A"] ** 2) * max(
-            cfg.battery.resistance_at_soc(soc_now), 0.0)
+            cfg.battery.resistance_at_soc(
+                core.cell_soc_from_usable(cfg.battery, soc_now)), 0.0)
         m["motor_copper_loss_W"] = motor_copper_loss_W
         m["battery_loss_W"] = battery_loss_W
         m["reserve_margin_Wh"] = remaining_Wh - reserve_target_Wh

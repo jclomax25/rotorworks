@@ -3324,12 +3324,16 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
             # to cover their own I^2 R, and the current that causes it rises
             # as the pack empties and its voltage falls.
             soc = min(max(remaining_Wh / max(usable_Wh, 1e-9), 0.0), 1.0)
-            cell_v = (float(np.interp(soc, cfg.battery.soc_bp,
+            # The curves span the cell's full capacity; `soc` is on the
+            # usable-energy scale. Reading them at `soc` reached the curve's
+            # empty end while the cell still held its reserve.
+            cell_soc = core.cell_soc_from_usable(cfg.battery, soc)
+            cell_v = (float(np.interp(cell_soc, cfg.battery.soc_bp,
                                       cfg.battery.ocv_cell_bp))
                       if cfg.battery.soc_bp else cfg.battery.vnom_cell)
             pack_v = max(cell_v * cfg.battery.series_cells, 1e-6)
             pack_I = power / pack_v
-            r_scale = (float(np.interp(soc, cfg.battery.soc_bp,
+            r_scale = (float(np.interp(cell_soc, cfg.battery.soc_bp,
                                        cfg.battery.r_scale_bp))
                        if getattr(cfg.battery, "r_scale_bp", None) else 1.0)
             battery_loss_W = pack_I * pack_I * cfg.battery.pack_resistance * r_scale

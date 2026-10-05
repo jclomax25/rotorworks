@@ -2204,3 +2204,40 @@ def test_fw_thrust_available_varies_with_speed(fw, fw_plane):
     assert avail[-1] < avail[0], "thrust available must fall with airspeed"
     _xs, p_avail = _line(fig.axes[2], "Thrust power available")
     assert p_avail[-1] * 1000 == pytest.approx(avail[-1] * xs[-1], rel=1e-9)
+
+
+# ----------------------------------------------------------------------
+# Audit C2: missions track usable-energy SoC, but the OCV and resistance
+# curves span the cell's full capacity. At the end of usable energy an 80%
+# pack's cell is at 20%, not at the curve's empty end.
+# ----------------------------------------------------------------------
+
+def test_mc_empty_usable_pack_reads_the_cell_at_its_reserve(mc, mc_quad):
+    batt = mc_quad.battery
+    assert batt.usable_fraction == pytest.approx(0.8)
+    v, _i = mc.solve_pack_voltage_and_current(batt, 0.0, soc=0.0)
+    assert v == pytest.approx(batt.ocv_at_soc(0.2))
+    assert v > batt.vmin_pack
+
+
+def test_fw_empty_usable_pack_reads_the_cell_at_its_reserve(fw, fw_plane):
+    batt = fw_plane.battery
+    assert batt.usable_fraction == pytest.approx(0.8)
+    assert batt.voltage_under_load(0.0, soc=0.0) == pytest.approx(batt.ocv_at_soc(0.2))
+    assert batt.voltage_under_load(0.0, soc=0.0) > batt.vmin_pack
+
+
+def test_vtol_mission_to_depletion_has_no_false_low_voltage(vtol, paths):
+    """vtol_02 on the 2.4 m example draws the whole usable energy. Reading
+    the curve on the usable scale put the last points at 17.6 V, under the
+    19.8 V cutoff, while the cells still held their 20% reserve."""
+    import json
+    payload = json.load(open(os.path.join(paths["configs"],
+                                          "vtol_2m4_lift_cruise_survey.json")))
+    cfg = vtol.config_from_fields(vtol.migrate_legacy_fields(payload["vars"]),
+                                  payload["config_type"])
+    mission = vtol.VTOLMission.from_json(
+        os.path.join(paths["missions"], "vtol_02_corridor_powerline.json"))
+    _results, totals = vtol.simulate_mission(cfg, mission)[:2]
+    assert totals["worst"]["min_soc_pct"] < 1.0, "the mission must drain the pack"
+    assert totals["worst"]["min_battery_voltage_V"] > cfg.battery.vmin_pack

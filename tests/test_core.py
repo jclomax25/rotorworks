@@ -292,6 +292,25 @@ def test_constant_power_solve_reports_an_overload(core):
     assert core.solve_pack_for_power(pack, 0.0) == (pytest.approx(ocv), 0.0, True)
 
 
+def test_usable_soc_maps_onto_the_cell_curve(core):
+    """Audit C2: missions track usable-energy SoC, the curves span the full
+    cell capacity. With 80% usable, usable 0.0 is the cell's 0.2."""
+    pack = _FakePack()
+    core.configure_battery_soc_model(pack, "auto", None, None, None, None)
+    pack.usable_fraction = 0.8
+    assert core.cell_soc_from_usable(pack, 1.0) == pytest.approx(1.0)
+    assert core.cell_soc_from_usable(pack, 0.5) == pytest.approx(0.6)
+    assert core.cell_soc_from_usable(pack, 0.0) == pytest.approx(0.2)
+    assert core.cell_soc_from_usable(pack, None) == pytest.approx(1.0)
+    assert core.pack_voltage_under_load(pack, 0.0, soc=0.0) == pytest.approx(
+        core.pack_ocv_from_soc(pack, 0.2))
+    v, i, _ok = core.solve_pack_for_power(pack, 150.0, soc=0.0)
+    assert v == pytest.approx(core.pack_voltage_under_load(pack, i, soc=0.0))
+    # Without a usable fraction the two scales coincide.
+    del pack.usable_fraction
+    assert core.cell_soc_from_usable(pack, 0.3) == pytest.approx(0.3)
+
+
 def test_soc_after_energy_draw_stays_in_range(core):
     pack = _FakePack()
     assert core.soc_after_energy_draw(pack, 1.0, 0.0) == pytest.approx(1.0)

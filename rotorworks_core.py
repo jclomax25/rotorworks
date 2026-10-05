@@ -57,7 +57,7 @@ __all__ = [
     "SOC_PRESETS", "SOC_PRESET_ALIASES", "battery_preset_key",
     "normalize_soc_curves", "load_soc_curve_csv",
     "configure_battery_soc_model", "soc_model_short_label",
-    "pack_ocv_from_soc", "pack_resistance_from_soc",
+    "pack_ocv_from_soc", "pack_resistance_from_soc", "cell_soc_from_usable",
     "pack_voltage_under_load", "solve_pack_for_power", "soc_after_energy_draw",
     # wind
     "wind_components_mps", "groundspeed_along_track_mps",
@@ -417,7 +417,11 @@ def soc_model_short_label(source: Optional[str]) -> str:
 
 
 def pack_ocv_from_soc(battery, soc: float) -> float:
-    """Pack open-circuit voltage at a state of charge in [0, 1]."""
+    """Pack open-circuit voltage at a CELL state of charge in [0, 1].
+
+    The curve's own axis, spanning the full capacity. A mission's
+    usable-energy SoC goes through cell_soc_from_usable first.
+    """
     if bool(getattr(battery, "soc_nonlinear_enabled", False)) and getattr(battery, "soc_bp", None):
         ocv_cell = interp_linear_clamped(
             min(max(float(soc), 0.0), 1.0),
@@ -428,7 +432,10 @@ def pack_ocv_from_soc(battery, soc: float) -> float:
 
 
 def pack_resistance_from_soc(battery, soc: float) -> float:
-    """Pack internal resistance at a state of charge in [0, 1]."""
+    """Pack internal resistance at a CELL state of charge in [0, 1].
+
+    On the curve's own axis, as pack_ocv_from_soc.
+    """
     base_r = max(float(getattr(battery, "pack_resistance", 0.0)), 0.0)
     if bool(getattr(battery, "soc_nonlinear_enabled", False)) and getattr(battery, "soc_bp", None):
         scale = interp_linear_clamped(
@@ -436,6 +443,30 @@ def pack_resistance_from_soc(battery, soc: float) -> float:
             list(battery.soc_bp), list(battery.r_scale_bp))
         return base_r * max(float(scale), 0.05)
     return base_r
+
+
+def cell_soc_from_usable(battery, soc_usable: Optional[float]) -> float:
+    """
+    Convert the usable-energy state of charge the simulators track into the
+    cell state of charge the OCV and resistance curves are defined on.
+
+    Every mission tracks SoC as remaining USABLE energy over usable energy:
+    1.0 at take-off, 0.0 when the discharge limit is reached. The curves span
+    the cell's FULL capacity, so with 80% usable the usable scale's 0.0 is
+    the cell's 0.2:
+
+        soc_cell = 1 - usable_fraction * (1 - soc_usable)
+
+    Reading the curves on the usable scale reached the curve's 0% point
+    (3.0 V per LiPo cell, resistance x2.6) while the real cell was still at
+    20% (about 3.65 V, x1.35), which overstated late-flight sag.
+
+    `soc_usable` None means full charge.
+    """
+    s = 1.0 if soc_usable is None else min(max(float(soc_usable), 0.0), 1.0)
+    frac = getattr(battery, "usable_fraction", None)
+    frac = 1.0 if frac is None else min(max(float(frac), 0.0), 1.0)
+    return 1.0 - frac * (1.0 - s)
 
 
 def pack_voltage_under_load(battery, current_A: float,
@@ -448,9 +479,10 @@ def pack_voltage_under_load(battery, current_A: float,
     brownout reported exactly its cutoff voltage and kept flying. The only
     floor now is 0 V.
 
-    `soc` defaults to 1.0 (fully charged).
+    `soc` is the usable-energy state of charge the missions track (see
+    cell_soc_from_usable); it defaults to 1.0, fully charged.
     """
-    soc_eval = 1.0 if soc is None else min(max(float(soc), 0.0), 1.0)
+    soc_eval = cell_soc_from_usable(battery, soc)
     ocv = pack_ocv_from_soc(battery, soc_eval)
     r = pack_resistance_from_soc(battery, soc_eval)
     return max(float(ocv - float(current_A) * r), 0.0)
@@ -472,9 +504,12 @@ def solve_pack_for_power(battery, power_W: float,
     below any cell's cutoff, so the caller's low-voltage check fires rather
     than a fixed-point iteration running away.
 
+    `soc` is the usable-energy state of charge, as for
+    pack_voltage_under_load.
+
     Returns (V_load, I_pack, deliverable).
     """
-    soc_eval = 1.0 if soc is None else min(max(float(soc), 0.0), 1.0)
+    soc_eval = cell_soc_from_usable(battery, soc)
     ocv = float(pack_ocv_from_soc(battery, soc_eval))
     r = float(pack_resistance_from_soc(battery, soc_eval))
     p = max(float(power_W), 0.0)
