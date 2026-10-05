@@ -2165,3 +2165,42 @@ def test_fw_mission_temperatures_stay_physical(fw, paths):
         assert min(series[key]) >= ambient - 1e-9, key
         assert max(series[key]) < ambient + 150.0, key
         assert worst[key] < ambient + 150.0, key
+
+
+# ----------------------------------------------------------------------
+# Audit F2 and F3: the fixed-wing performance figure plotted D x V as
+# "Electrical required (from pack)", D x V x prop efficiency as
+# "Mechanical (to the air)" (below the physical minimum), and the static
+# thrust as "Thrust Available" at every speed.
+# ----------------------------------------------------------------------
+
+def _line(axis, label):
+    for line in axis.lines:
+        if line.get_label() == label:
+            return list(line.get_xdata()), list(line.get_ydata())
+    raise AssertionError(f"no curve labelled {label!r}: "
+                         f"{[l.get_label() for l in axis.lines]}")
+
+
+def test_fw_power_panel_plots_pack_power(fw, fw_plane):
+    fig = fw.make_performance_figure(fw_plane, max_speed=35, figsize=(8, 6))
+    power_ax = fig.axes[2]
+    xs, elec = _line(power_ax, "Electrical (from pack)")
+    _xs, req = _line(power_ax, "Thrust power required (D·V)")
+    for i in (0, len(xs) // 2, len(xs) - 1):
+        v = xs[i]
+        assert elec[i] * 1000 == pytest.approx(
+            fw.compute_metrics(fw_plane, v)["total_power_W"], rel=1e-9)
+        assert req[i] * 1000 == pytest.approx(fw.power_required_W(fw_plane, v), rel=1e-9)
+    # What the pack pays always exceeds what reaches the air.
+    assert all(e > r for e, r in zip(elec, req))
+
+
+def test_fw_thrust_available_varies_with_speed(fw, fw_plane):
+    fig = fw.make_performance_figure(fw_plane, max_speed=35, figsize=(8, 6))
+    xs, avail = _line(fig.axes[1], "Thrust Available (N)")
+    for i in (0, len(xs) // 2, len(xs) - 1):
+        assert avail[i] == pytest.approx(fw.thrust_available_N(fw_plane, xs[i]), rel=1e-9)
+    assert avail[-1] < avail[0], "thrust available must fall with airspeed"
+    _xs, p_avail = _line(fig.axes[2], "Thrust power available")
+    assert p_avail[-1] * 1000 == pytest.approx(avail[-1] * xs[-1], rel=1e-9)

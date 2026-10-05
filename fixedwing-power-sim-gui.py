@@ -2202,23 +2202,29 @@ def make_performance_figure(config: FixedWingConfig,
 
     times, ranges, drags, T_avail_v = [], [], [], []
     powers_req, powers_avail        = [], []
+    powers_elec                     = []
     rcs, CLs, CDs, LDs              = [], [], [], []
     induced_drags, parasitic_drags  = [], []
 
-    # Evaluated per speed inside the loop below; kept here only as the
-    # static reference for any caller that wants it.
-    T_av = thrust_available_N(config, 0.0)
     af   = config.airframe
     rho  = config.air_density
     W    = config.weight_N
 
     for V in speeds:
-        times.append(flight_time_min(config, V))
-        ranges.append(flight_range_km(config, V))
+        # One evaluation per speed gives the endurance, range and the pack
+        # power they are computed from, so the power panel's electrical
+        # curve is exactly the number the endurance curve divides into.
+        m_v = compute_metrics(config, V)
+        times.append(m_v["flight_time_min"])
+        ranges.append(m_v["flight_range_km"])
+        powers_elec.append(float(m_v["total_power_W"]))
         d_ind, d_par, D = drag_components_N(config, V)
         induced_drags.append(d_ind)
         parasitic_drags.append(d_par)
         drags.append(D)
+        # Thrust available falls with airspeed. It used to be evaluated once
+        # at 0 m/s and drawn flat at every speed.
+        T_av = thrust_available_N(config, V)
         T_avail_v.append(T_av)
         powers_req.append(power_required_W(config, V))
         powers_avail.append(T_av * V)
@@ -2254,22 +2260,23 @@ def make_performance_figure(config: FixedWingConfig,
     ax.axvline(V_stall, color="red", linestyle=":", linewidth=1)
     _mark_cruise(ax)
 
-    # Combined motor+propeller efficiency, for the shaft-power trace.
-    cfg_eta = max(float(config.airframe.prop_efficiency), 0.05)
-
     # ---- 3. Power ----
     ax = axes[0, 2]
-    # Required power here is ELECTRICAL, drawn from the pack. Showing the
-    # mechanical (shaft) power alongside it makes the drivetrain loss visible
-    # as the gap between the two curves.
+    # Electrical is the total drawn from the pack (propulsion, ESC, wiring
+    # and avionics), the figure endurance is computed from. Thrust power
+    # D x V is what actually reaches the air, so the gap between the two is
+    # the whole drivetrain's loss. Available is T_avail(V) x V on the same
+    # thrust-power basis as required, so the gap between those two is the
+    # climb margin. The electrical curve used to be D x V itself, and the
+    # "mechanical" curve D x V x prop efficiency, below the physical minimum.
+    ax.plot(speeds, [p / 1000 for p in powers_elec],
+            label="Electrical (from pack)", color="crimson")
     ax.plot(speeds, [p / 1000 for p in powers_req],
-            label="Electrical required (from pack)", color="crimson")
-    ax.plot(speeds, [p / 1000 * cfg_eta for p in powers_req],
-            label="Mechanical (to the air)", color="#1565C0", linestyle="--")
+            label="Thrust power required (D·V)", color="#1565C0", linestyle="--")
     ax.plot(speeds, [p / 1000 for p in powers_avail],
-            label="Power available", color="green", linestyle=":")
+            label="Thrust power available", color="green", linestyle=":")
     ax.set_xlabel("Airspeed (m/s)"); ax.set_ylabel("Power (kW)")
-    ax.set_title("Power vs Airspeed — mechanical, electrical, available")
+    ax.set_title("Power vs Airspeed")
     ax.legend(fontsize=8); ax.grid(True, alpha=0.4)
     ax.axvline(V_stall, color="red", linestyle=":", linewidth=1)
     _mark_cruise(ax)
@@ -7171,17 +7178,19 @@ def launch_gui():
             _sp_vs = [stall_speed(cfg)+0.1 + (max_v-stall_speed(cfg)-0.1)*i/300
                        for i in range(301)]
             _sp_vs = [max(v, 0.1) for v in _sp_vs]
+            # One evaluation per speed, shared by every column that needs it.
+            _sp_m = [compute_metrics(cfg, v) for v in _sp_vs]
             _last_run_sweep.clear()
             _last_run_sweep.update({
                 "Speed (m/s)":           _sp_vs,
-                "Flight Time (min)":     [flight_time_min(cfg, v) for v in _sp_vs],
-                "Range (km)":            [flight_range_km(cfg, v) for v in _sp_vs],
-                # #21 both power curves the panel now draws, so a column in
-                # the file corresponds to a curve on screen.
-                "Power Electrical (W)":  [power_required_W(cfg, v) for v in _sp_vs],
-                "Power Mechanical (W)":  [power_required_W(cfg, v)
-                                          * max(float(cfg.airframe.prop_efficiency), 0.05)
-                                          for v in _sp_vs],
+                "Flight Time (min)":     [m_["flight_time_min"] for m_ in _sp_m],
+                "Range (km)":            [m_["flight_range_km"] for m_ in _sp_m],
+                # #21 the power curves the panel draws, so a column in the
+                # file corresponds to a curve on screen.
+                "Power Electrical (W)":  [m_["total_power_W"] for m_ in _sp_m],
+                "Thrust Power Required (W)": [power_required_W(cfg, v) for v in _sp_vs],
+                "Thrust Power Available (W)": [thrust_available_N(cfg, v) * v
+                                               for v in _sp_vs],
                 "Thrust Required (N)":   [drag_N(cfg, v) for v in _sp_vs],
                 "Thrust Available (N)":  [thrust_available_N(cfg, v) for v in _sp_vs],
                 "Drag (N)":              [drag_N(cfg, v) for v in _sp_vs],
