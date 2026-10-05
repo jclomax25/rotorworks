@@ -1245,6 +1245,14 @@ def pitch_speed_mps(config: FixedWingConfig, rpm: Optional[float] = None) -> flo
     return config.propeller.pitch_m * n
 
 
+def table_power_includes_esc(config: FixedWingConfig) -> bool:
+    """True when the motor power already contains the ESC's loss: a bench
+    table is measured at the ESC input. Without a table the motor power is
+    the motor's own input and the ESC loss is additional."""
+    return (getattr(config.propeller, "table", None) is not None
+            and getattr(config, "esc", None) is not None)
+
+
 def esc_losses_W(config: FixedWingConfig, v_pack: float, motor_P_total_W: float) -> Tuple[float, str]:
     """
     ESC conduction and idle losses:
@@ -1947,18 +1955,28 @@ def compute_metrics(config: FixedWingConfig,
     # more loss — and the ESCs see the pack voltage minus the lead's I*R
     # drop. With no wiring entered the resistance is zero and this is exactly
     # the ESC-only chain it replaced.
+    #
+    # A bench table's Power_W is measured at the ESC INPUT, so with a table
+    # P_elec already contains the ESC's loss. The loss is still estimated,
+    # for the ESC current check and temperature, but is not added on top,
+    # which counted it twice (audit F8); P_elec is then reduced to the
+    # motors' own input so each loss is reported once.
+    _esc_in_P = table_power_includes_esc(config)
     _wiring = getattr(config, "wiring", None)
     r_wire = _wiring.resistance_ohm if _wiring is not None else 0.0
     esc_loss, esc_note = esc_losses_W(config, batt.vmax_pack, P_elec)
     wire_loss = 0.0
     if r_wire > 0:
         for _ in range(6):
-            pack_I = (P_elec + esc_loss + P_avionics + wire_loss) / max(batt.vnom_pack, 1.0)
+            pack_I = (P_elec + (0.0 if _esc_in_P else esc_loss)
+                      + P_avionics + wire_loss) / max(batt.vnom_pack, 1.0)
             wire_loss = pack_I * pack_I * r_wire
             esc_loss, esc_note = esc_losses_W(
                 config, max(batt.vmax_pack - pack_I * r_wire, 1.0), P_elec)
 
-    P_total = P_elec + esc_loss + P_avionics + wire_loss
+    P_total = P_elec + (0.0 if _esc_in_P else esc_loss) + P_avionics + wire_loss
+    if _esc_in_P:
+        P_elec = max(P_elec - esc_loss, 0.0)
     pack_I  = P_total / max(batt.vnom_pack, 1.0)
     V_load  = batt.voltage_under_load(pack_I)
     wire = (_wiring.summary(pack_I, ambient_temp_C) if _wiring is not None

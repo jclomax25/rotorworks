@@ -2241,3 +2241,68 @@ def test_vtol_mission_to_depletion_has_no_false_low_voltage(vtol, paths):
     _results, totals = vtol.simulate_mission(cfg, mission)[:2]
     assert totals["worst"]["min_soc_pct"] < 1.0, "the mission must drain the pack"
     assert totals["worst"]["min_battery_voltage_V"] > cfg.battery.vmin_pack
+
+
+# ----------------------------------------------------------------------
+# Audit M4 and F8: a bench table's power is measured at the ESC input, so
+# it already contains the ESC's loss. Adding the modelled ESC loss on top
+# counted it twice.
+# ----------------------------------------------------------------------
+
+def _mc_esc(mc):
+    return mc.ESCConfig(voltage_rating=12, continuous_current_A=40,
+                        max_current_A=60, idle_current_A=0.10, resistance=0.004)
+
+
+def test_mc_table_power_is_not_charged_esc_loss_twice(mc):
+    drone = _quad_with_table(mc)
+    drone.esc = _mc_esc(mc)
+    table_W = mc.power_required(drone, 8.0, "forward")
+    total, *_ = mc.total_power_with_esc(drone, motor_power_W=table_W, periph_power_W=50.0)
+    assert total == pytest.approx(table_W + 50.0, rel=1e-9)
+
+
+def test_mc_table_run_still_reports_its_esc_loss(mc):
+    """The ESC loss inside the table power is split out, not dropped: the
+    ESC temperature needs it, and the budget must still balance."""
+    drone = _quad_with_table(mc)
+    drone.esc = _mc_esc(mc)
+    m = mc.compute_operating_metrics(drone, 8.0, "forward")
+    assert m["esc_loss_W"] > 0
+    assert (m["motor_power_W"] + m["esc_loss_W"] + m["periph_power_W"]
+            + m.get("wire_loss_W", 0.0)) == pytest.approx(m["total_power_W"], rel=1e-9)
+    assert m["total_power_W"] == pytest.approx(
+        mc.power_required(drone, 8.0, "forward") + m["periph_power_W"]
+        + m.get("wire_loss_W", 0.0), rel=1e-9)
+
+
+def test_mc_esc_loss_still_adds_without_a_table(mc, mc_quad):
+    mc_quad.esc = _mc_esc(mc)
+    motor_W = mc.power_required(mc_quad, 10.0, "forward")
+    total, *_ = mc.total_power_with_esc(mc_quad, motor_power_W=motor_W, periph_power_W=0.0)
+    assert total > motor_W
+
+
+def _fw_esc(fw):
+    return fw.ESCConfig(voltage_rating=6, continuous_current_A=60,
+                        max_current_A=80, idle_current_A=0.10, resistance=0.004)
+
+
+def test_fw_table_power_is_not_charged_esc_loss_twice(fw):
+    cfg = _fw_table_config(fw, _FW_TABLE_CSV)
+    table_W = fw.motor_shaft_power_from_thrust(cfg, fw.drag_N(cfg, 22.0), 22.0)
+    cfg.esc = _fw_esc(fw)
+    m = fw.compute_metrics(cfg, 22.0)
+    avionics = m["total_power_W"] - table_W
+    assert m["esc_loss_W"] > 0
+    assert avionics == pytest.approx(
+        fw.avionics_input_power_W(cfg.avionics)
+        + cfg.battery.vnom_pack * max(cfg.periph_current_A, 0.0), abs=1e-6)
+    assert m["motor_power_W"] == pytest.approx(table_W - m["esc_loss_W"], rel=1e-9)
+
+
+def test_fw_esc_loss_still_adds_without_a_table(fw):
+    cfg = _fw_table_config(fw, None)
+    bare = fw.compute_metrics(cfg, 22.0)["total_power_W"]
+    cfg.esc = _fw_esc(fw)
+    assert fw.compute_metrics(cfg, 22.0)["total_power_W"] > bare

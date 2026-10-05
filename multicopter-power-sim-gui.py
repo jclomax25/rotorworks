@@ -526,6 +526,19 @@ def esc_loss_and_checks(config: "DroneConfig", v_pack: float, motor_power_total_
     return float(esc_loss_total), ("; ".join(note_parts) if note_parts else ""), float(i_motor)
 
 
+def table_power_includes_esc(config: "DroneConfig") -> bool:
+    """True when the motor power already contains the ESC's loss.
+
+    A bench table's Power_W is measured at the ESC INPUT, so with a table
+    the ESC's conduction and idle losses are inside the motor power. Adding
+    the modelled ESC loss on top counted it twice (audit M4). Without a
+    table the motor power is the motor's own input and the ESC loss is
+    additional.
+    """
+    return (getattr(getattr(config, "propeller", None), "table", None) is not None
+            and getattr(config, "esc", None) is not None)
+
+
 def total_power_with_esc(config: "DroneConfig",
                          motor_power_W: float,
                          periph_power_W: float,
@@ -541,9 +554,15 @@ def total_power_with_esc(config: "DroneConfig",
     as well as watts. With no wiring entered the resistance is zero and this
     is exactly the ESC-only loop it replaced.
 
+    With a bench table the motor power is measured at the ESC input and
+    already contains the ESC loss (table_power_includes_esc), so the loss is
+    still estimated, for the current checks and the ESC temperature, but is
+    not added to the total.
+
     Returns:
       (total_power_W, v_load_V, pack_current_A, esc_note, motor_current_per_esc_A)
     """
+    esc_in_motor_power = table_power_includes_esc(config)
     total_power = float(motor_power_W) + float(periph_power_W)
     v_load = battery_ocv_pack(config.battery, core.cell_soc_from_usable(config.battery, soc))
     pack_current = total_power / max(v_load, 1e-9)
@@ -561,7 +580,8 @@ def total_power_with_esc(config: "DroneConfig",
         esc_loss_W, esc_note, i_motor = esc_loss_and_checks(config, v_esc, motor_power_W)
         wire_loss = pack_current * pack_current * r_wire
         total_power = (float(motor_power_W) + float(periph_power_W)
-                       + float(esc_loss_W) + wire_loss)
+                       + (0.0 if esc_in_motor_power else float(esc_loss_W))
+                       + wire_loss)
 
     return float(total_power), float(v_load), float(pack_current), esc_note, float(i_motor)
 
@@ -1805,6 +1825,14 @@ def _compute_operating_metrics_core(drone: DroneConfig,
     _wiring = getattr(drone, "wiring", None)
     wire = (_wiring.summary(pack_current_A, ambient_temp_C) if _wiring is not None
             else core.wiring_summary(0.0, 0.0, ambient_C=ambient_temp_C))
+    if table_power_includes_esc(drone):
+        # Bench-table power is ESC-input power. Split the ESC's share out of
+        # it, so "motor power" is what the motors themselves draw and every
+        # loss is reported once: motor + ESC + peripherals + wire = total.
+        _v_esc = max(float(v_load) - float(pack_current_A) * float(
+            _wiring.resistance_ohm if _wiring is not None else 0.0), 1e-3)
+        _esc_inside, _n, _i = esc_loss_and_checks(drone, _v_esc, motor_power_W)
+        motor_power_W = max(float(motor_power_W) - float(_esc_inside), 0.0)
     esc_loss_W  = max(0.0, float(total_power_W) - float(motor_power_W)
                       - float(periph_power_W) - float(wire["loss_W"]))
     rpm_est     = None
