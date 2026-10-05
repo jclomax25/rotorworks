@@ -4483,3 +4483,17 @@ def test_vectored_turn_ignores_the_hidden_pusher(vtol, config_type):
     cfg.cruise_prop_diameter_in = cfg.cruise_prop_diameter_in * 0.5
     cfg.num_cruise_motors = 3
     assert vtol.turn(cfg, v, 30.0)["turn_power_W"] == pytest.approx(before, rel=1e-12)
+
+
+# ----------------------------------------------------------------------
+# Audit V3: the take-off roll repeated the fixed-wing's double margin.
+# ----------------------------------------------------------------------
+
+def test_vtol_takeoff_roll_matches_raymer_at_the_textbook_lift_off(vtol):
+    cfg = vtol.VTOLConfig(config_type="lift+cruise")
+    cfg.CL_takeoff = cfg.CL_max / 1.44
+    w = cfg.weight_N
+    v_lof = 1.2 * vtol.stall_speed_mps(cfg)
+    net = vtol.forward_thrust_available_N(cfg, 0.707 * v_lof) - cfg.mu_roll * w
+    raymer = 1.44 * w ** 2 / (vtol.G0 * cfg.air_density * cfg.wing_area_m2 * cfg.CL_max * net)
+    assert vtol.takeoff_roll_m(cfg) == pytest.approx(raymer, rel=1e-6)

@@ -1873,38 +1873,44 @@ def best_range_speed(config: FixedWingConfig,
 
 def takeoff_distance_m(config: FixedWingConfig) -> float:
     """
-    Ground roll to lift-off (simplified Raymer method):
+    Ground roll to lift-off:
 
-        s_g = 1.44 · W² / (g · ρ · S · CL_TO · (T_avg - μr · W))
+        V_LO = sqrt(2 W / (ρ · S · CL_TO))
+        s_g  = V_LO² · W / (2 g · (T_avg - μr · W))
+             = W² / (g · ρ · S · CL_TO · (T_avg - μr · W))
 
     where:
-        CL_TO = CL at takeoff rotation (user-supplied, typically 0.6–1.0)
-        T_avg = average thrust during roll ≈ T_static × 0.75
-                (thrust decreases as speed builds up)
+        CL_TO = CL at take-off rotation, the lift-off CL (user-supplied,
+                typically 0.7–0.9, capped at CL_max)
+        T_avg = thrust at 0.707 × V_LO (thrust decreases as speed builds up)
         μr    = rolling friction coefficient (paved: 0.02–0.05)
+
+    Raymer's form, 1.44 W² / (g ρ S CL_max (T - μW)), is this with lift-off
+    at 1.2 × stall, i.e. CL_TO = CL_max / 1.44. The 1.44 used to be kept
+    while dividing by CL_TO, which applied the 1.2 × stall margin twice: the
+    roll came out 50% long at the defaults (audit F4).
 
     If the net force (T - μr·W) ≤ 0, no takeoff is possible (∞ distance).
     """
     af    = config.airframe
     rho   = config.air_density
     W     = config.weight_N
+    S     = af.wing_area_m2
+    CL_to = min(max(af.CL_takeoff, 1e-3), max(af.CL_max, 1e-3))
+    # Lift-off where the wing, at the rotation CL, carries the weight.
+    _v_liftoff = math.sqrt(2.0 * W / max(rho * S * CL_to, 1e-12))
     # Thrust decays with speed during the roll. The standard treatment
     # evaluates thrust once at 0.707 x lift-off speed, which is the speed at
     # which the instantaneous thrust equals the mean value over a roll with
     # V^2-proportional drag. That is more defensible than either a flat 75%
     # of static (the old assumption) or averaging the two endpoints.
-    T_static = thrust_available_N(config, 0.0)
-    _v_liftoff = 1.2 * stall_speed(config)
-    T_max = T_static
     T_avg = thrust_available_N(config, 0.707 * _v_liftoff)
     mu_r  = af.mu_roll
-    CL_to = max(af.CL_takeoff, 1e-3)
-    S     = af.wing_area_m2
 
     net_force = T_avg - mu_r * W
     if net_force <= 0:
         return float("inf")
-    return 1.44 * W ** 2 / (G0 * rho * S * CL_to * net_force)
+    return _v_liftoff ** 2 * W / (2.0 * G0 * net_force)
 
 
 # ============================================================

@@ -2350,3 +2350,25 @@ def test_fw_winding_current_exceeds_the_supply_current(fw):
     assert m["motor_no_load_loss_W"] > 0
     assert m["motor_temp_est_C"] == pytest.approx(
         25.0 + (m["motor_copper_loss_W"] + m["motor_no_load_loss_W"]) * 0.35, rel=1e-9)
+
+
+# ----------------------------------------------------------------------
+# Audit F4: Raymer's 1.44 factor already puts lift-off at 1.2 x stall on
+# CL_max. Keeping it while dividing by the rotation CL applied the margin
+# twice, making the roll 50% long at the defaults.
+# ----------------------------------------------------------------------
+
+def test_fw_takeoff_roll_matches_raymer_at_the_textbook_lift_off(fw, fw_plane):
+    af, rho, w = fw_plane.airframe, fw_plane.air_density, fw_plane.weight_N
+    af.CL_takeoff = af.CL_max / 1.44            # lift-off at 1.2 x stall
+    v_lof = 1.2 * fw.stall_speed(fw_plane)
+    net = fw.thrust_available_N(fw_plane, 0.707 * v_lof) - af.mu_roll * w
+    raymer = 1.44 * w ** 2 / (fw.G0 * rho * af.wing_area_m2 * af.CL_max * net)
+    assert fw.takeoff_distance_m(fw_plane) == pytest.approx(raymer, rel=1e-6)
+
+
+def test_fw_takeoff_roll_is_the_kinematic_roll_to_lift_off(fw, fw_plane):
+    af, rho, w = fw_plane.airframe, fw_plane.air_density, fw_plane.weight_N
+    v_lof = math.sqrt(2.0 * w / (rho * af.wing_area_m2 * af.CL_takeoff))
+    accel = (fw.thrust_available_N(fw_plane, 0.707 * v_lof) - af.mu_roll * w) / (w / fw.G0)
+    assert fw.takeoff_distance_m(fw_plane) == pytest.approx(v_lof ** 2 / (2.0 * accel), rel=1e-9)

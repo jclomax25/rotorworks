@@ -1926,18 +1926,24 @@ def glide(cfg: VTOLConfig) -> Dict[str, float]:
 
 def takeoff_roll_m(cfg: VTOLConfig) -> float:
     """
-    Conventional take-off roll on the forward thrust — the fixed-wing's
-    Raymer estimate, s = 1.44 W^2 / (g rho S CL_to (T - mu W)), with thrust
-    taken at 0.707 of the lift-off speed. Infinite if the thrust cannot
+    Conventional take-off roll on the forward thrust, the fixed-wing's
+    method: lift-off where the wing at the rotation CL carries the weight,
+
+        V_lof = sqrt(2 W / (rho S CL_to)),   s = V_lof^2 W / (2 g (T - mu W))
+
+    with thrust taken at 0.707 of the lift-off speed. Raymer's 1.44 factor
+    is this with CL_to = CL_max / 1.44; keeping it while dividing by CL_to
+    applied the margin twice (audit V3). Infinite if the thrust cannot
     overcome the rolling friction.
     """
-    v_lof = 1.2 * stall_speed_mps(cfg)
+    w = cfg.weight_N
+    cl_to = min(max(float(cfg.CL_takeoff), 1e-3), max(float(cfg.CL_max), 1e-3))
+    v_lof = math.sqrt(2.0 * w / max(cfg.air_density * cfg.wing_area_m2 * cl_to, 1e-12))
     thrust = forward_thrust_available_N(cfg, 0.707 * v_lof)
-    net = thrust - cfg.mu_roll * cfg.weight_N
+    net = thrust - cfg.mu_roll * w
     if net <= 0:
         return float("inf")
-    return (1.44 * cfg.weight_N ** 2 /
-            (G0 * cfg.air_density * cfg.wing_area_m2 * cfg.CL_takeoff * net))
+    return v_lof ** 2 * w / (2.0 * G0 * net)
 
 
 def landing_distance_m(cfg: VTOLConfig, obstacle_m: float = 15.0) -> float:
