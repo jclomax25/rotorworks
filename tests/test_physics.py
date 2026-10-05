@@ -2306,3 +2306,47 @@ def test_fw_esc_loss_still_adds_without_a_table(fw):
     bare = fw.compute_metrics(cfg, 22.0)["total_power_W"]
     cfg.esc = _fw_esc(fw)
     assert fw.compute_metrics(cfg, 22.0)["total_power_W"] > bare
+
+
+# ----------------------------------------------------------------------
+# Audit M2, M3 and F9: motor current was the ESC's input current P / V,
+# which understates the winding current at part throttle and, in the
+# multicopter, was 0 with no ESC entered, so motor heat vanished.
+# ----------------------------------------------------------------------
+
+def test_mc_motor_heats_without_an_esc(mc):
+    drone = _heavy_lift(mc)
+    assert getattr(drone, "esc", None) is None
+    m = mc.compute_operating_metrics(drone, 0.0, "hover")
+    assert m["motor_current_A"] > 0
+    assert m["motor_copper_loss_W_per_motor"] > 0
+    assert m["motor_temp_est_C"] > 25.0
+
+
+def test_mc_winding_current_exceeds_the_supply_current(mc, mc_quad):
+    m = mc.compute_operating_metrics(mc_quad, 10.0, "translating")
+    supply_side = (m["motor_power_W"] / mc_quad.num_motors
+                   / m["esc_input_voltage_V"])
+    assert m["motor_current_A"] > supply_side
+    assert m["motor_copper_loss_W_per_motor"] == pytest.approx(
+        m["motor_current_A"] ** 2 * mc_quad.motor.resistance, rel=1e-9)
+
+
+def test_mc_mission_motor_heats_without_an_esc(mc, tmp_path):
+    drone = _heavy_lift(mc)
+    mission = _square_mission(mc, tmp_path, speed=8.0)
+    _results, worst, series = mc.simulate_mission(drone, mission)
+    assert max(series["motor_current_A"]) > 0
+    assert worst["motor_temp_est_C"] > series["motor_temp_est_C"][0]
+
+
+def test_fw_winding_current_exceeds_the_supply_current(fw):
+    cfg = _fw_table_config(fw, None)
+    m = fw.compute_metrics(cfg, 22.0)
+    assert m["motor_current_A"] > m["motor_I_per_esc_A"]
+    assert m["motor_copper_loss_W"] == pytest.approx(
+        m["motor_current_A"] ** 2 * cfg.motor.resistance * cfg.num_motors, rel=1e-9)
+    # Motor heat includes the no-load loss, not just copper.
+    assert m["motor_no_load_loss_W"] > 0
+    assert m["motor_temp_est_C"] == pytest.approx(
+        25.0 + (m["motor_copper_loss_W"] + m["motor_no_load_loss_W"]) * 0.35, rel=1e-9)

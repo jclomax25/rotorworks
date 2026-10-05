@@ -1918,7 +1918,17 @@ def _compute_operating_metrics_core(drone: DroneConfig,
     tip_speed = tip_speed_mps_from_rpm(drone.propeller.diameter_in, float(rpm_est)) if rpm_est is not None else float("nan")
     tip_mach = tip_speed / 340.0 if tip_speed == tip_speed else float("nan")
 
-    p_copper = (motor_I_esc_A ** 2) * float(getattr(drone.motor, "resistance", 0.0))
+    # Motor current on the WINDING side of the ESC (audit M2, M3). It used to
+    # be the ESC's input current P / V, which understates the winding current
+    # at part throttle and is 0 when no ESC is entered, so a heavy hover
+    # reported no copper loss and an ambient motor.
+    _r_wire = (_wiring.resistance_ohm if _wiring is not None else 0.0)
+    _v_supply = max(float(v_load) - float(pack_current_A) * float(_r_wire), 1e-3)
+    motor_current_A = core.motor_winding_current_A(
+        float(motor_power_W) / max(int(drone.num_motors), 1), rpm_est,
+        getattr(drone.motor, "kv", None),
+        float(getattr(drone.motor, "resistance", 0.0) or 0.0), _v_supply)
+    p_copper = (motor_current_A ** 2) * float(getattr(drone.motor, "resistance", 0.0))
     # The motor thermal estimate is anchored to the motor's rated current:
     # at the rating we assume a 55 C rise, scaling with I^2.  If no rating was
     # supplied there is nothing to scale against, so report ambient rather
@@ -1928,7 +1938,7 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         thermal_rise_C = 0.0
     else:
         motor_i_max = max(float(_i_max_raw), 1e-9)
-        thermal_rise_C = 55.0 * (motor_I_esc_A / motor_i_max) ** 2 if motor_I_esc_A >= 0 else 0.0
+        thermal_rise_C = 55.0 * (motor_current_A / motor_i_max) ** 2
     motor_temp_est_C = float(ambient_temp_C) + thermal_rise_C
     esc_temp_est_C = float(ambient_temp_C) + float(esc_loss_W) * 0.75
     # soc_eval is the usable-energy SoC; the resistance curve is on the
@@ -2015,6 +2025,7 @@ def _compute_operating_metrics_core(drone: DroneConfig,
                                * float(drone.battery.resistance_at_soc(_cell_soc)),
         "esc_note":            str(esc_note),
         "motor_I_per_esc_A":   float(motor_I_esc_A),
+        "motor_current_A":     float(motor_current_A),
         "thrust_total_N":      float(total_thrust_N),
         "thrust_per_motor_N":  float(thrust_per_motor_N),
         "prop_rpm":            (float(rpm_est) if rpm_est is not None else None),
@@ -2334,7 +2345,7 @@ def simulate_mission(config: DroneConfig,
         mp = float(m.get('motor_power_W', 0.0))
         mission_series['motor_power_W'].append(mp)
         mission_series['motor_power_per_motor_W'].append(mp / max(int(config.num_motors), 1))
-        mission_series['motor_current_A'].append(float(m.get('motor_I_per_esc_A', 0.0)))
+        mission_series['motor_current_A'].append(float(m.get('motor_current_A', 0.0)))
         mission_series['motor_rpm'].append(float(m.get('prop_rpm')) if m.get('prop_rpm') is not None else float('nan'))
         mission_series['motor_thrust_N'].append(float(m.get('thrust_per_motor_N', 0.0)))
         mission_series['thrust_total_N'].append(float(m.get('thrust_total_N', 0.0)))
@@ -2362,7 +2373,8 @@ def simulate_mission(config: DroneConfig,
             worst["soc_percent"] = min(float(worst.get("soc_percent", 100.0)), float(m.get("soc_percent", 100.0)))
             worst["soc_model_source"] = str(m.get("soc_model_source", worst.get("soc_model_source", "linear-fallback")))
         for k in ("pack_current_A", "total_power_W", "motor_power_W", "periph_power_W",
-                  "esc_loss_W", "motor_I_per_esc_A", "thrust_total_N", "thrust_per_motor_N",
+                  "esc_loss_W", "motor_I_per_esc_A", "motor_current_A",
+                  "thrust_total_N", "thrust_per_motor_N",
                   "motor_temp_est_C", "esc_temp_est_C", "battery_temp_est_C",
                   "accel_mps2", "commanded_airspeed_mps", "advance_ratio_mu",
                   "wire_loss_W", "wire_drop_V", "wire_temp_C"):
@@ -2534,6 +2546,7 @@ def simulate_mission(config: DroneConfig,
                 m["motor_power_W"] = float(m.get("motor_power_W", 0.0)) * scale
                 m["esc_loss_W"] = float(m.get("esc_loss_W", 0.0)) * scale
                 m["motor_I_per_esc_A"] = float(m.get("motor_I_per_esc_A", 0.0)) * max(scale, 0.0)
+                m["motor_current_A"] = float(m.get("motor_current_A", 0.0)) * max(scale, 0.0)
             m["climb_rate_cmd_mps"] = climb_cmd
             m["descent_rate_cmd_mps"] = descent_cmd
             m["potential_power_W"] = potential_power_w
@@ -2616,6 +2629,7 @@ def simulate_mission(config: DroneConfig,
                         m["motor_power_W"] = float(m.get("motor_power_W", 0.0)) * scale
                         m["esc_loss_W"] = float(m.get("esc_loss_W", 0.0)) * scale
                         m["motor_I_per_esc_A"] = float(m.get("motor_I_per_esc_A", 0.0)) * max(scale, 0.0)
+                        m["motor_current_A"] = float(m.get("motor_current_A", 0.0)) * max(scale, 0.0)
                     m["climb_rate_cmd_mps"] = climb_cmd
                     m["descent_rate_cmd_mps"] = descent_cmd
                     m["potential_power_W"] = potential_power_w
@@ -2674,7 +2688,7 @@ def simulate_mission(config: DroneConfig,
             t_s += dt_s
             dist_km += step_distance_m / 1000.0
 
-            motor_copper_total_w = (motor_I_esc_A ** 2) * float(getattr(config.motor, "resistance", 0.0)) * max(int(config.num_motors), 1)
+            motor_copper_total_w = (float(m.get("motor_current_A", 0.0)) ** 2) * float(getattr(config.motor, "resistance", 0.0)) * max(int(config.num_motors), 1)
             battery_loss_w = (pack_current_A ** 2) * max(float(getattr(config.battery, "pack_resistance", 0.0)), 0.0)
             m["motor_copper_loss_W"] = motor_copper_total_w
             m["battery_loss_W"] = battery_loss_w
@@ -6013,7 +6027,7 @@ def launch_gui():
 
         # Margins, which is what most design changes are actually buying.
         ("thrust_available_N", "Thrust available (N)", 1,  1),
-        ("motor_I_per_esc_A", "Motor current / motor (A)", 2, -1),
+        ("motor_current_A",   "Motor current / motor (A)", 2, -1),
         ("tip_mach",          "Tip Mach",              3, -1),
         ("esc_temp_est_C",    "ESC temp (°C)",         1, -1),
         ("battery_temp_est_C", "Battery temp (°C)",    1, -1),
@@ -6462,6 +6476,9 @@ def launch_gui():
         Periph   = float(metrics.get("periph_power_W",  0.0))
         P_esc    = float(metrics.get("esc_loss_W",       0.0))
         Iesc     = float(metrics.get("motor_I_per_esc_A",0.0))
+        # The motor's own ratings apply to its winding current; the ESC's
+        # input current is checked against the ESC below.
+        Imotor   = float(metrics.get("motor_current_A", Iesc))
         tip_mach = metrics.get("tip_mach", None)
 
         # ── Battery Status ────────────────────────────────────────────────
@@ -6551,8 +6568,8 @@ def launch_gui():
         if getattr(config.motor, "max_current", None) is not None:
             imax_m = float(config.motor.max_current)
             _insert_status_row(motor_table, "Motor current / motor (est)",
-                f"{Iesc:.2f} A", f"<= {imax_m:.2f} A",
-                _status_color_tag(Iesc, imax_m, "max"))
+                f"{Imotor:.2f} A", f"<= {imax_m:.2f} A",
+                _status_color_tag(Imotor, imax_m, "max"))
 
         # Thrust margin must compare what the propulsion system CAN produce
         # against the weight. Comparing REQUIRED thrust against weight sits at
@@ -6622,7 +6639,7 @@ def launch_gui():
                 f"hot, so this is a longevity limit too.")
 
         # #28 motor current and power against BOTH ratings, with duration.
-        _dual_limit_row(motor_table, "Motor current / motor", Iesc,
+        _dual_limit_row(motor_table, "Motor current / motor", Imotor,
                         None, getattr(config.motor, "max_current", None), "A",
                         _limit_value("motor_max_time_s", None))
         _dual_limit_row(motor_table, "Motor power / motor", Pmotor / nm,
@@ -6962,7 +6979,11 @@ def launch_gui():
         #     V^2 - V_emf*V - P_elec*Rm = 0
         # The ESCs see the pack voltage minus the main lead's drop.
         v_supply = float(metrics.get("esc_input_voltage_V", v_load) or v_load)
-        P_elec_motor = (I_motor * v_supply) if (I_motor == I_motor and v_supply == v_supply) else float("nan")
+        # The motor's input power, per motor. It used to be rebuilt as the
+        # ESC current times the supply, which is 0 when no ESC is entered.
+        P_elec_motor = float(metrics.get("motor_power_W", float("nan"))) / nm
+        if v_supply == v_supply and v_supply > 1e-6 and P_elec_motor == P_elec_motor:
+            I_motor = P_elec_motor / v_supply
 
         V_motor = v_supply
         I_winding = I_motor
@@ -7439,7 +7460,7 @@ def launch_gui():
         ("total_power_W",       "Total power",                   "W"),
         ("motor_power_W",       "Motor power (total)",           "W"),
         ("motor_power_per_motor_W","Motor power (per motor)",    "W"),
-        ("motor_current_A",     "Motor/ESC current (per ESC)",   "A"),
+        ("motor_current_A",     "Motor current (per motor)",     "A"),
         ("motor_rpm",           "Motor RPM",                     "rpm"),
         ("tip_mach",            "Tip Mach",                      "—"),
         ("advance_ratio_mu",    "Advance ratio (μ)",             "—"),

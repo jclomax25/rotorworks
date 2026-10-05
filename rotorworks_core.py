@@ -66,7 +66,7 @@ __all__ = [
     # transient flight
     "kinetic_power_term_W", "ramp_speed",
     # thermal
-    "thermal_step",
+    "thermal_step", "motor_winding_current_A", "rpm_from_thrust_forward",
     # propeller table fitting
     "fit_propeller_curve",
     # sensitivity and comparison
@@ -706,6 +706,47 @@ def ramp_speed(current_mps: float,
 # THERMAL
 # ============================================================
 
+def motor_winding_current_A(input_power_W: float, rpm: Optional[float],
+                            kv_rpm_per_V: Optional[float], resistance_ohm: float,
+                            supply_V: float) -> float:
+    """
+    Winding current of a brushless motor drawing `input_power_W` at `rpm`.
+
+    The ESC chops its supply down to the voltage the winding needs, so power
+    is conserved across it but current is not: at part throttle the winding
+    carries more current than the ESC draws from its supply. With the DC
+    motor model
+
+        P_in = V_w * I_w,    V_w = V_emf + I_w * R,    V_emf = rpm / Kv
+
+        I_w = 2 P / (V_emf + sqrt(V_emf^2 + 4 R P))
+
+    which includes the no-load current (it is part of what P_in pays for).
+
+    I_w cannot be below the supply-side current P / V_supply: that would need
+    the winding voltage to exceed the supply. That is the floor, and the
+    answer when RPM or Kv is unknown.
+    """
+    p = max(float(input_power_W), 0.0)
+    if p <= 0.0:
+        return 0.0
+    i_supply = p / max(float(supply_V), 1e-6)
+    try:
+        kv = float(kv_rpm_per_V) if kv_rpm_per_V is not None else 0.0
+        n = float(rpm) if rpm is not None else 0.0
+    except (TypeError, ValueError):
+        return i_supply
+    if not (kv > 0.0 and n > 0.0 and math.isfinite(n)):
+        return i_supply
+    v_emf = n / kv
+    r = max(float(resistance_ohm or 0.0), 0.0)
+    if r <= 1e-12:
+        i_w = p / max(v_emf, 1e-9)
+    else:
+        i_w = 2.0 * p / (v_emf + math.sqrt(v_emf * v_emf + 4.0 * r * p))
+    return max(i_w, i_supply)
+
+
 def thermal_step(temp_C: float, ambient_C: float, power_loss_W: float,
                  thermal_resistance_C_per_W: float, thermal_mass_J_per_C: float,
                  dt_s: float) -> float:
@@ -1290,6 +1331,42 @@ def rpm_from_thrust(thrust_N: float, diameter_m: float, rho: float,
         return 0.0
     n_rev_s = math.sqrt(t / (float(c_t) * float(rho) * d ** 4))
     return n_rev_s * 60.0
+
+
+def rpm_from_thrust_forward(thrust_N: float, airspeed_mps: float,
+                            diameter_m: float, pitch_m: float, rho: float,
+                            c_t_static: float) -> Optional[float]:
+    """
+    Propeller speed for a thrust at an axial airspeed.
+
+    C_T is taken to fall linearly from its static value to zero at the
+    zero-thrust advance ratio, J0 = pitch / D (the blade meets the air at
+    zero incidence at pitch speed):
+
+        T = C_T0 * (1 - J / J0) * rho * n^2 * D^4,    J = V / (n * D)
+          = C_T0 * rho * D^4 * (n^2 - n * V / pitch)
+
+    whose positive root is
+
+        n = b/2 + sqrt((b/2)^2 + T / (C_T0 * rho * D^4)),    b = V / pitch
+
+    At V = 0 this is rpm_from_thrust. As V rises n tends to pitch speed plus
+    the margin the thrust needs, which is how a fixed-pitch prop behaves in
+    cruise. With no pitch it falls back to the static form.
+
+    Returns RPM, or None when the inputs cannot give an answer.
+    """
+    d = float(diameter_m)
+    if thrust_N is None or d <= 0 or rho <= 0 or c_t_static is None or c_t_static <= 0:
+        return None
+    t = max(float(thrust_N), 0.0)
+    v = max(float(airspeed_mps), 0.0)
+    p = float(pitch_m or 0.0)
+    if p <= 0.0 or v <= 0.0:
+        return rpm_from_thrust(t, d, rho, c_t_static)
+    half_b = 0.5 * v / p
+    c = t / (float(c_t_static) * float(rho) * d ** 4)
+    return (half_b + math.sqrt(half_b * half_b + c)) * 60.0
 
 
 # ============================================================

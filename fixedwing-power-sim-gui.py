@@ -1910,6 +1910,42 @@ def takeoff_distance_m(config: FixedWingConfig) -> float:
 # ============================================================
 # FULL OPERATING METRICS AT A GIVEN SPEED
 # ============================================================
+def motor_operating_current(config: FixedWingConfig, motor_input_W: float,
+                            thrust_N: float, airspeed_mps: float,
+                            supply_V: float) -> dict:
+    """
+    Per-motor winding current, operating RPM and losses (audit F9).
+
+    The motor current used to be the ESC's input current P / V / n. At part
+    throttle the winding carries more than that, so copper loss and motor
+    temperature were understated, and only copper loss heated the motor.
+
+    The operating RPM comes from the propeller (TConst, or the geometric
+    C_T estimate) at this thrust and airspeed; the winding current then
+    follows from the DC motor model at that back-EMF. Heat is copper loss
+    plus the no-load loss I0 * V_emf.
+
+    `motor_input_W` and `thrust_N` are totals for all motors.
+    """
+    n_m = max(int(config.num_motors), 1)
+    prop = config.propeller
+    c_t = (float(prop.TConst) if prop.TConst is not None else
+           core.estimate_prop_thrust_coefficient(
+               prop.diameter_in, prop.pitch_in, getattr(prop, "blades", 2)))
+    rpm_op = core.rpm_from_thrust_forward(
+        float(thrust_N) / n_m, airspeed_mps, prop.diameter_m, prop.pitch_m,
+        float(config.air_density), c_t)
+    kv = config.motor.kv
+    r_m = max(float(config.motor.resistance), 0.0)
+    i_w = core.motor_winding_current_A(
+        float(motor_input_W) / n_m, rpm_op, kv, r_m, supply_V)
+    v_emf = (min(float(rpm_op) / float(kv), max(float(supply_V), 0.0))
+             if (kv and rpm_op) else 0.0)
+    no_load_W = max(float(config.motor.idle_current), 0.0) * v_emf * n_m
+    return {"rpm": rpm_op, "current_A": i_w,
+            "copper_W": i_w * i_w * r_m * n_m, "no_load_W": no_load_W}
+
+
 def compute_metrics(config: FixedWingConfig,
                     speed_mps: float,
                     bank_deg: float = 0.0,
@@ -2034,10 +2070,13 @@ def compute_metrics(config: FixedWingConfig,
     loiter_circles = ((t_min * 60.0) / turn_period_s) if (turn_period_s > 0 and math.isfinite(turn_period_s)) else 0.0
 
     # Thermal model (single-point steady estimate, not a transient RC network).
+    # The ESC-side current stays for the ESC and connector checks; the
+    # motor's own current, copper loss and heat use the winding side.
     motor_i_per_motor = P_elec / max(V_esc, 1.0) / max(config.num_motors, 1)
-    motor_copper_loss_W = (motor_i_per_motor ** 2) * max(config.motor.resistance, 0.0) * max(config.num_motors, 1)
+    _mop = motor_operating_current(config, P_elec, T_req, V, V_esc)
+    motor_copper_loss_W = _mop["copper_W"]
     battery_loss_W = (pack_I ** 2) * max(config.battery.pack_resistance, 0.0)
-    motor_temp_est_C = ambient_temp_C + motor_copper_loss_W * 0.35
+    motor_temp_est_C = ambient_temp_C + (motor_copper_loss_W + _mop["no_load_W"]) * 0.35
     esc_temp_est_C = ambient_temp_C + esc_loss * 0.70
     battery_temp_est_C = ambient_temp_C + battery_loss_W * 0.25
     max_temp = max(motor_temp_est_C, esc_temp_est_C, battery_temp_est_C)
@@ -2067,6 +2106,9 @@ def compute_metrics(config: FixedWingConfig,
         wire_temp_C        = float(wire["temp_C"]),
         esc_input_voltage_V = float(V_esc),
         motor_I_per_esc_A  = float(motor_i_per_motor),
+        motor_current_A    = float(_mop["current_A"]),
+        motor_rpm_operating = (float(_mop["rpm"]) if _mop["rpm"] is not None else None),
+        motor_no_load_loss_W = float(_mop["no_load_W"]),
         wind_mps           = float(math.hypot(wind_head_mps, wind_cross_mps)),
         altitude_m         = float(getattr(config, "reference_altitude_m", 0.0) or 0.0),
 
@@ -2782,7 +2824,8 @@ def simulate_fw_mission(
         for k in ("total_power_W","motor_power_W","pack_current_A",
                   "drag_N","thrust_required_N","esc_loss_W",
                   "load_factor","motor_temp_est_C","esc_temp_est_C","battery_temp_est_C",
-                  "wire_loss_W","wire_drop_V","wire_temp_C","motor_I_per_esc_A"):
+                  "wire_loss_W","wire_drop_V","wire_temp_C","motor_I_per_esc_A",
+                  "motor_current_A"):
             w[k] = max(float(w.get(k,0)), float(m.get(k,0)))
         w["v_load_V"] = min(float(w.get("v_load_V",1e9)),
                             float(m.get("v_load_V",1e9)))
@@ -2851,8 +2894,12 @@ def simulate_fw_mission(
         m["soc_model_source"] = _soc_model_short_label(
             getattr(cfg.battery, "soc_model_source", None))
         m["v_load_V"] = cfg.battery.voltage_under_load(m["pack_current_A"], soc=soc_now)
-        motor_i_per_motor = m["motor_power_W"] / max(m["v_load_V"], 1.0) / max(cfg.num_motors, 1)
-        motor_copper_loss_W = (motor_i_per_motor ** 2) * max(cfg.motor.resistance, 0.0) * max(cfg.num_motors, 1)
+        _mop = motor_operating_current(
+            cfg, m["motor_power_W"], m.get("thrust_required_N", m.get("drag_N", 0.0)),
+            V_air, max(m["v_load_V"], 1.0))
+        m["motor_current_A"] = _mop["current_A"]
+        m["motor_no_load_loss_W"] = _mop["no_load_W"]
+        motor_copper_loss_W = _mop["copper_W"]
         battery_loss_W = (m["pack_current_A"] ** 2) * max(
             cfg.battery.resistance_at_soc(
                 core.cell_soc_from_usable(cfg.battery, soc_now)), 0.0)
@@ -6188,7 +6235,9 @@ def launch_gui():
                  _color_tag(Pmotor, pmax, "max"))
 
         if cfg.motor.max_current:
-            I_motor_est = (Pmotor / max(cfg.num_motors, 1)) / max(Vload, 1.0)
+            # The motor's rating applies to its winding current.
+            I_motor_est = float(m.get("motor_current_A",
+                                      (Pmotor / max(cfg.num_motors, 1)) / max(Vload, 1.0)))
             _ins_row(motor_tv, "Motor current / motor (est)",
                      f"{I_motor_est:.2f} A", f"<= {cfg.motor.max_current:.2f} A",
                      _color_tag(I_motor_est, cfg.motor.max_current, "max"))
@@ -6307,8 +6356,9 @@ def launch_gui():
         _motor_time = _limit_value("motor_max_time_s", None)
         _n_mot = max(int(cfg.num_motors), 1)
         _p_motor_each = float(m.get("motor_power_W", 0.0)) / _n_mot
-        _i_motor_each = (float(m.get("motor_power_W", 0.0))
-                         / max(float(m.get("v_load_V", 0.0)), 1.0) / _n_mot)
+        _i_motor_each = float(m.get(
+            "motor_current_A", float(m.get("motor_power_W", 0.0))
+            / max(float(m.get("v_load_V", 0.0)), 1.0) / _n_mot))
         _dual_limit_row(motor_tv, "Motor current / motor", _i_motor_each,
                         None, getattr(cfg.motor, "max_current", None),
                         "A", _motor_time)

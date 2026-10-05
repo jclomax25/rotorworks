@@ -397,6 +397,36 @@ def test_thermal_equilibrium_is_stable(core):
     assert stepped == pytest.approx(equilibrium, abs=1e-9)
 
 
+def test_winding_current_satisfies_the_motor_equation(core):
+    """Audit M3, F9: at part throttle the winding carries more current than
+    the ESC draws, and P_in = (V_emf + I*R) * I."""
+    p, rpm, kv, r, v_supply = 120.0, 6000.0, 920.0, 0.115, 16.0
+    i_w = core.motor_winding_current_A(p, rpm, kv, r, v_supply)
+    assert (rpm / kv + i_w * r) * i_w == pytest.approx(p, rel=1e-9)
+    assert i_w > p / v_supply
+
+
+def test_winding_current_floors_at_the_supply_current(core):
+    # Unknown RPM or Kv: the supply-side current is the only answer.
+    assert core.motor_winding_current_A(120.0, None, 920.0, 0.1, 16.0) == pytest.approx(7.5)
+    assert core.motor_winding_current_A(120.0, 6000.0, None, 0.1, 16.0) == pytest.approx(7.5)
+    # A back-EMF above the supply cannot be reached: floored.
+    assert core.motor_winding_current_A(120.0, 20000.0, 920.0, 0.1, 16.0) == pytest.approx(7.5)
+    assert core.motor_winding_current_A(0.0, 6000.0, 920.0, 0.1, 16.0) == 0.0
+
+
+def test_forward_rpm_reduces_to_static_and_reproduces_thrust(core):
+    d, pitch, rho, ct = 0.3, 0.2, 1.225, 0.1
+    assert core.rpm_from_thrust_forward(5.0, 0.0, d, pitch, rho, ct) == pytest.approx(
+        core.rpm_from_thrust(5.0, d, rho, ct))
+    v = 20.0
+    rpm = core.rpm_from_thrust_forward(5.0, v, d, pitch, rho, ct)
+    n = rpm / 60.0
+    j, j0 = v / (n * d), pitch / d
+    assert ct * (1.0 - j / j0) * rho * n * n * d ** 4 == pytest.approx(5.0, rel=1e-9)
+    assert n > v / pitch            # faster than pitch speed, or no thrust
+
+
 def test_long_thermal_step_settles_without_overshoot(core):
     """Audit F1: explicit Euler overshot, then diverged, once dt > 2*tau.
     tau here is R*C = 100 s; T_ss = 25 + 10*2 = 45 C."""
