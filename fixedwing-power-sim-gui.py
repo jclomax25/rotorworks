@@ -5336,6 +5336,22 @@ def launch_gui():
         def _scale_wing_area(cfg, f):
             cfg.airframe.wing_area_m2 *= f
 
+        def _scale_payload(cfg, f):
+            """The all-up weight already includes the payload, so changing
+            the payload field alone moved nothing (audit S3)."""
+            delta = (float(getattr(cfg, "payload_mass_g", 0.0) or 0.0)) * (f - 1.0)
+            cfg.payload_mass_g = (getattr(cfg, "payload_mass_g", 0.0) or 0.0) + delta
+            cfg.aircraft_weight_g = cfg.aircraft_weight_g + delta
+
+        def _scale_avionics(cfg, f):
+            """Every non-propulsion load: the regulated rails and the
+            peripheral current, not the peripheral current alone (audit S3)."""
+            cfg.periph_current_A = (getattr(cfg, "periph_current_A", 0.0) or 0.0) * f
+            av = getattr(cfg, "avionics", None)
+            if av is not None and getattr(av, "voltage_tree", None):
+                av.voltage_tree = {v: (float(i) * f, eff)
+                                   for v, (i, eff) in av.voltage_tree.items()}
+
         return [
             ("All-up weight",     lambda c, f: setattr(c, "aircraft_weight_g", c.aircraft_weight_g * f)),
             ("Battery capacity",  _scale_capacity),
@@ -5347,8 +5363,7 @@ def launch_gui():
             ("Motor resistance",  lambda c, f: setattr(c.motor, "resistance", c.motor.resistance * f)),
 
             # Missing before, and each is a real design trade.
-            ("Payload mass",      lambda c, f: setattr(c, "payload_mass_g",
-                                                       (getattr(c, "payload_mass_g", 0.0) or 0.0) * f)),
+            ("Payload mass",      _scale_payload),
             # Span at fixed area changes aspect ratio, which is the single
             # biggest lever on induced drag and therefore on endurance.
             ("Wing span",         lambda c, f: setattr(c.airframe, "wing_span_m",
@@ -5360,8 +5375,7 @@ def launch_gui():
                                                        c.propeller.diameter_in * f)),
             ("Battery resistance", lambda c, f: setattr(c.battery, "resistance_cell",
                                                         float(c.battery.resistance_cell) * f)),
-            ("Avionics draw",     lambda c, f: setattr(c, "periph_current_A",
-                                                       (getattr(c, "periph_current_A", 0.0) or 0.0) * f)),
+            ("Avionics draw",     _scale_avionics),
         ]
 
     def run_sensitivity():

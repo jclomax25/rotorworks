@@ -5835,11 +5835,6 @@ def launch_gui():
         Only quantities a designer can actually trade are listed — swapping a
         battery or a prop is a real decision; the air density is not.
         """
-        def _scale_fom(cfg, f):
-            """Rotor quality. Capped at 1.0 — nothing beats momentum theory."""
-            base = float(getattr(cfg.propeller, "figure_of_merit", 0.65) or 0.65)
-            cfg.propeller.figure_of_merit = min(base * f, 1.0)
-
         def _scale_batt_resistance(cfg, f):
             cfg.battery.resistance_cell = float(cfg.battery.resistance_cell) * f
 
@@ -5851,6 +5846,23 @@ def launch_gui():
             cfg.battery.capacity_mAh *= f
             cfg.battery.capacity_Ah *= f          # Wh is derived from this
 
+        def _scale_payload(cfg, f):
+            """The all-up weight already includes the payload, so changing
+            the payload field alone moved nothing (audit S2)."""
+            delta = (float(getattr(cfg, "payload_mass_g", 0.0) or 0.0)) * (f - 1.0)
+            cfg.payload_mass_g = (getattr(cfg, "payload_mass_g", 0.0) or 0.0) + delta
+            cfg.drone_weight_g = cfg.drone_weight_g + delta
+
+        def _scale_avionics(cfg, f):
+            """Every non-propulsion load: the regulated rails and the
+            peripheral current. Scaling only the peripheral current did
+            nothing on a build whose avionics are entered as rails (audit S2)."""
+            cfg.periph_current = (cfg.periph_current or 0.0) * f
+            av = getattr(cfg, "avionics", None)
+            if av is not None and getattr(av, "voltage_tree", None):
+                av.voltage_tree = {v: (float(i) * f, eff)
+                                   for v, (i, eff) in av.voltage_tree.items()}
+
         return [
             ("All-up weight",      lambda c, f: setattr(c, "drone_weight_g", c.drone_weight_g * f)),
             ("Battery capacity",   _scale_capacity),
@@ -5859,20 +5871,21 @@ def launch_gui():
             ("Prop diameter",      lambda c, f: setattr(c.propeller, "diameter_in", c.propeller.diameter_in * f)),
             ("Parasite area",      lambda c, f: setattr(c, "parasite_area", (c.parasite_area or 0.0) * f)),
             ("Cruise speed",       lambda c, f: setattr(c, "cruise_speed", (c.cruise_speed or 0.0) * f)),
-            ("Avionics draw",      lambda c, f: setattr(c, "periph_current", (c.periph_current or 0.0) * f)),
+            ("Avionics draw",      _scale_avionics),
 
             # Things a designer actually trades that were missing before.
             # Payload is the one most users vary first, and it was only
             # reachable indirectly through all-up weight.
-            ("Payload mass",       lambda c, f: setattr(c, "payload_mass_g",
-                                                        (getattr(c, "payload_mass_g", 0.0) or 0.0) * f)),
+            ("Payload mass",       _scale_payload),
             ("Prop pitch",         lambda c, f: setattr(c.propeller, "pitch_in",
                                                         c.propeller.pitch_in * f)),
             # Air density stands in for altitude and temperature together: a
             # multirotor is far more sensitive to it than a fixed-wing,
             # because hover power scales as 1/sqrt(rho).
             ("Air density",        lambda c, f: setattr(c, "air_density", c.air_density * f)),
-            ("Figure of merit",    _scale_fom),
+            # There is no "Figure of merit" lever: the multicopter has no
+            # figure-of-merit input. The old lever set an attribute nothing
+            # reads, so it always showed a zero swing (audit S2).
             ("Battery resistance", _scale_batt_resistance),
             ("ESC resistance",     _scale_esc_resistance),
             ("Profile area",       lambda c, f: setattr(c, "profile_area",

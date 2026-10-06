@@ -609,6 +609,38 @@ def test_sensitivity_ranks_inputs_by_influence(request, which):
     assert swings == sorted(swings, reverse=True), "rows are not ranked by influence"
 
 
+@pytest.mark.parametrize("which,config", [
+    ("mc", "multicopter_450_survey_4S.json"),
+    ("fw", "fixedwing_2m_survey_4S.json"),
+])
+def test_payload_and_avionics_levers_move_the_answer(request, which, config, paths,
+                                                     monkeypatch):
+    """
+    Audit S2, S3: the all-up weight already includes the payload, so the
+    payload lever moved nothing, and the avionics lever scaled only the
+    peripheral current, which is 0 when avionics are entered as rails.
+    Both showed zero swing, which read as "endurance is insensitive".
+    """
+    import tkinter.messagebox as mb
+    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: True)
+    gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
+    gui.set_open_dialog(os.path.join(paths["configs"], config))
+    assert gui.click("Load Config") == []
+    assert gui.click("Fixed Speed Sweep") == []
+    assert gui.click("Run Sensitivity") == []
+    gui.pump()
+
+    tree = _tree_with(gui, "param", "span")
+    swing = {str(tree.item(r, "values")[0]): float(str(tree.item(r, "values")[6]).split()[0])
+             for r in tree.get_children()}
+    assert swing["Payload mass"] > 0, swing
+    assert swing["Avionics draw"] > 0, swing
+    if which == "mc":
+        # The multicopter has no figure-of-merit input, so it is not offered
+        # as a lever that can only ever read zero.
+        assert "Figure of merit" not in swing
+
+
 @pytest.mark.parametrize("which", ["mc", "fw"])
 def test_sensitivity_needs_a_run_first(request, which):
     """Pressing the button before any run must explain, not raise."""
