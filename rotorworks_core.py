@@ -59,6 +59,7 @@ __all__ = [
     "configure_battery_soc_model", "soc_model_short_label",
     "pack_ocv_from_soc", "pack_resistance_from_soc", "cell_soc_from_usable",
     "pack_voltage_under_load", "solve_pack_for_power", "soc_after_energy_draw",
+    "pack_resistance_at", "pack_draw",
     # wind
     "wind_components_mps", "groundspeed_along_track_mps",
     # rotor inflow
@@ -547,6 +548,42 @@ def solve_pack_for_power(battery, power_W: float,
         return 0.5 * ocv, 0.5 * ocv / r, False
     i = (ocv - math.sqrt(disc)) / (2.0 * r)
     return ocv - i * r, i, True
+
+
+def pack_resistance_at(battery, soc: Optional[float] = None) -> float:
+    """
+    The pack resistance the sag and I^2 R are actually computed with, at a
+    usable-energy state of charge (None = full).
+
+    With a SoC curve this is the base resistance times the curve's scale at
+    that charge, which is not the base figure: a LiPo curve reads 1.5x at
+    full charge. Showing the base figure beside a sag computed at 1.5x of it
+    meant the resistance on screen was not the one in use.
+    """
+    return float(pack_resistance_from_soc(battery, cell_soc_from_usable(battery, soc)))
+
+
+def pack_draw(battery, power_W: float, soc: Optional[float] = None) -> dict:
+    """
+    What a load drawing `power_W` at the pack terminals costs the cells.
+
+    The current is solved against the loaded voltage (solve_pack_for_power),
+    not taken as power over nominal voltage. The cells give up
+    OCV * I = P + I^2 R: the terminal power plus the pack's own loss. That
+    sum, not the terminal power, is what drains the usable energy, so an
+    endurance or a mission that divides the energy by the terminal power is
+    optimistic by the loss fraction.
+
+    Returns a dict with v_load_V, current_A, resistance_ohm, loss_W,
+    cell_power_W and deliverable.
+    """
+    p = max(float(power_W), 0.0)
+    v, i, ok = solve_pack_for_power(battery, p, soc=soc)
+    r = pack_resistance_at(battery, soc)
+    loss = i * i * r
+    return {"v_load_V": float(v), "current_A": float(i),
+            "resistance_ohm": r, "loss_W": float(loss),
+            "cell_power_W": float(p + loss), "deliverable": bool(ok)}
 
 
 def soc_after_energy_draw(battery, soc_now: float, energy_draw_Wh: float) -> float:

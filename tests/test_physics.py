@@ -2464,3 +2464,198 @@ def test_fw_cli_flies_the_mission_file_as_written(fw, tmp_path, monkeypatch):
     assert mission.rth_reserve_Wh == 5.0
     assert (mission.phases[0].course_deg, mission.phases[0].bank_deg) == (0.0, 0.0)
     assert (mission.phases[1].course_deg, mission.phases[1].bank_deg) == (90.0, 20.0)
+
+
+# ----------------------------------------------------------------------
+# Audit B5, F10, M6 and F11: single-point pack current was total power over
+# NOMINAL voltage (overwriting the multicopter's own loaded-voltage solve;
+# the fixed-wing also took ESC current at full-charge voltage), and every
+# endurance and mission divided the energy by terminal power, so the
+# pack's own I^2 R was never drawn from the battery.
+# ----------------------------------------------------------------------
+
+def test_core_pack_draw_charges_the_loss_to_the_cells(mc, mc_quad):
+    core = mc.core
+    batt = mc_quad.battery
+    d = core.pack_draw(batt, 600.0)
+    v, i, ok = core.solve_pack_for_power(batt, 600.0)
+    assert ok and d["deliverable"]
+    assert (d["v_load_V"], d["current_A"]) == (pytest.approx(v), pytest.approx(i))
+    assert d["v_load_V"] * d["current_A"] == pytest.approx(600.0, rel=1e-9)
+    assert d["loss_W"] == pytest.approx(i * i * d["resistance_ohm"], rel=1e-12)
+    # P + I^2 R is exactly what the cells give up: OCV * I.
+    ocv = core.pack_ocv_from_soc(batt, core.cell_soc_from_usable(batt, None))
+    assert d["cell_power_W"] == pytest.approx(ocv * i, rel=1e-9)
+
+
+def test_core_pack_resistance_at_is_the_one_in_use(mc, mc_quad):
+    core = mc.core
+    batt = mc_quad.battery
+    assert batt.soc_nonlinear_enabled
+    r_full = core.pack_resistance_at(batt)
+    # The LiPo curve scales the base figure at full charge; the sag is
+    # computed with the scaled value, so that is the one to show.
+    assert r_full != pytest.approx(batt.pack_resistance)
+    ocv = core.pack_ocv_from_soc(batt, 1.0)
+    assert core.pack_voltage_under_load(batt, 10.0) == pytest.approx(ocv - 10.0 * r_full)
+
+
+def _capture_metrics(monkeypatch, mod, name):
+    seen = []
+    real = getattr(mod, name)
+
+    def spy(cfg, *a, **k):
+        out = real(cfg, *a, **k)
+        seen.append((cfg, out))
+        return out
+
+    monkeypatch.setattr(mod, name, spy)
+    return seen
+
+
+def test_mc_cli_single_point_keeps_the_loaded_voltage_current(mc, monkeypatch, capsys):
+    from test_cli import MC_BASE
+    seen = _capture_metrics(monkeypatch, mc, "compute_operating_metrics")
+    monkeypatch.setattr(sys, "argv", ["sim"] + MC_BASE + [
+        "--orientation", "translating", "--speed", "8", "--climb_rate_mps", "2"])
+    mc.main()
+    cfg, m = [x for x in seen if "climb_rate_cmd_mps" in x[1]][-1]
+    v, i, _ok = mc.core.solve_pack_for_power(cfg.battery, m["total_power_W"])
+    assert m["pack_current_A"] == pytest.approx(i, rel=1e-9)
+    assert m["pack_current_A"] != pytest.approx(
+        m["total_power_W"] / cfg.battery.vnom_pack, rel=1e-3)
+    assert m["v_load_V"] == pytest.approx(v, rel=1e-9)
+    assert m["battery_i2r_loss_W"] == pytest.approx(
+        i * i * mc.core.pack_resistance_at(cfg.battery), rel=1e-9)
+    t_min = cfg.battery.usable_Wh / (m["total_power_W"] + m["battery_i2r_loss_W"]) * 60.0
+    assert f"({'translating'}): {t_min:.1f} min" in capsys.readouterr().out
+
+
+def test_mc_endurance_charges_the_pack_loss(mc, mc_quad):
+    m = mc.compute_operating_metrics(mc_quad, 0.0, "hover")
+    assert m["battery_i2r_loss_W"] > 0
+    assert mc.estimate_flight_time_minutes(mc_quad, 0.0, "hover") == pytest.approx(
+        mc_quad.battery.usable_Wh / (m["total_power_W"] + m["battery_i2r_loss_W"]) * 60.0,
+        rel=1e-9)
+    assert m["cell_power_W"] == pytest.approx(
+        m["total_power_W"] + m["battery_i2r_loss_W"], rel=1e-12)
+
+
+def test_mc_mission_draws_the_pack_loss_from_the_battery(mc, tmp_path):
+    drone = _heavy_lift(mc)
+    path = tmp_path / "hover.json"
+    import json
+    path.write_text(json.dumps({"phases": [
+        {"name": "Hover", "speed": 0.0, "duration": 1200, "altitude": 0}]}))
+    _res, _worst, s = mc.simulate_mission(drone, mc.MissionProfile.from_json(str(path)))
+    k = len(s["t_s"]) // 2
+    drained_W = ((s["battery_energy_Wh"][k] - s["battery_energy_Wh"][k + 1]) * 3600.0
+                 / (s["t_s"][k + 1] - s["t_s"][k]))
+    terminal_W = s["total_power_W"][k + 1]
+    i = s["battery_current_A"][k + 1]
+    r = mc.core.pack_resistance_at(drone.battery, s["battery_soc_frac"][k])
+    assert drained_W == pytest.approx(terminal_W + i * i * r, rel=1e-9)
+    assert drained_W > terminal_W * 1.01
+
+
+def test_fw_single_point_current_is_solved_at_the_loaded_voltage(fw, fw_plane):
+    m = fw.compute_metrics(fw_plane, 19.0)
+    v, i, _ok = fw.core.solve_pack_for_power(fw_plane.battery, m["total_power_W"])
+    assert m["pack_current_A"] == pytest.approx(i, rel=1e-9)
+    assert m["v_load_V"] == pytest.approx(v, rel=1e-9)
+    assert m["battery_loss_W"] == pytest.approx(
+        i * i * fw.core.pack_resistance_at(fw_plane.battery), rel=1e-9)
+    assert m["flight_time_min"] == pytest.approx(
+        fw_plane.battery.usable_Wh / (m["total_power_W"] + m["battery_loss_W"]) * 60.0,
+        rel=1e-9)
+
+
+def test_fw_esc_is_judged_at_the_loaded_voltage(fw, fw_plane):
+    fw_plane.esc = _fw_esc(fw)
+    m = fw.compute_metrics(fw_plane, 25.0)
+    loss_at_load, _ = fw.esc_losses_W(fw_plane, m["v_load_V"], m["motor_power_W"])
+    loss_at_full, _ = fw.esc_losses_W(fw_plane, fw_plane.battery.vmax_pack, m["motor_power_W"])
+    assert loss_at_load != pytest.approx(loss_at_full, rel=1e-6)
+    assert m["esc_loss_W"] == pytest.approx(loss_at_load, rel=1e-6)
+
+
+def test_fw_cli_single_point_keeps_the_loaded_voltage_current(fw, monkeypatch, capsys):
+    from test_cli import FW_BASE
+    seen = _capture_metrics(monkeypatch, fw, "compute_metrics")
+    monkeypatch.setattr(sys, "argv", ["sim"] + FW_BASE + ["--climb_rate_mps", "1.5"])
+    fw.main()
+    cfg, m = [x for x in seen if "climb_rate_cmd_mps" in x[1]][-1]
+    v, i, _ok = fw.core.solve_pack_for_power(cfg.battery, m["total_power_W"])
+    assert m["pack_current_A"] == pytest.approx(i, rel=1e-9)
+    assert m["flight_time_min"] == pytest.approx(
+        cfg.battery.usable_Wh / m["cell_power_W"] * 60.0, rel=1e-9)
+    assert m["cell_power_W"] > m["total_power_W"]
+
+
+def test_fw_mission_draws_the_pack_loss_from_the_battery(fw, fw_plane, tmp_path):
+    profile = _fw_mission(fw, tmp_path, {"phases": [
+        {"name": "Cruise", "speed": 19.0, "duration": 600, "altitude": 120}]})
+    results, _worst, s = fw.simulate_fw_mission(fw_plane, profile)
+    assert results[0][3] == "OK"
+    used_Wh = s["battery_energy_Wh"][0] - s["battery_energy_Wh"][-1]
+    terminal_W = s["total_power_W"][0]
+    i = s["battery_current_A"][0]
+    loss_W = i * i * fw.core.pack_resistance_at(fw_plane.battery, 1.0)
+    assert used_Wh == pytest.approx((terminal_W + loss_W) * 600.0 / 3600.0, rel=1e-9)
+    assert loss_W > 0
+
+
+def test_vtol_single_point_endurance_charges_the_pack_loss(vtol):
+    cfg = vtol.VTOLConfig()
+    m = vtol.compute_metrics(cfg)
+    core = vtol.core
+    for power_key, minutes_key in (("total_power_W", "cruise_endurance_min"),
+                                   ("hover_power_W", "hover_endurance_min"),
+                                   ("station_power_W", "station_endurance_min")):
+        cells = core.pack_draw(cfg.battery, m[power_key])["cell_power_W"]
+        assert cells > m[power_key]
+        assert m[minutes_key] == pytest.approx(
+            cfg.battery.usable_Wh / cells * 60.0, rel=1e-9)
+    assert m["pack_current_A"] == pytest.approx(
+        core.solve_pack_for_power(cfg.battery, m["total_power_W"])[1], rel=1e-9)
+
+
+# ----------------------------------------------------------------------
+# Audit M5 (and F8's second half): without a table the ESC loss was
+# conduction plus idle only, with no switching loss.
+# ----------------------------------------------------------------------
+
+def test_mc_esc_charges_a_switching_loss(mc, mc_quad):
+    mc_quad.esc = _mc_esc(mc)
+    assert mc_quad.esc.switching_loss_pct == mc.ESC_SWITCHING_LOSS_PCT_DEFAULT > 0
+    with_sw, _note, _i = mc.esc_loss_and_checks(mc_quad, 16.0, 400.0)
+    mc_quad.esc.switching_loss_pct = 0.0
+    without, _note, _i = mc.esc_loss_and_checks(mc_quad, 16.0, 400.0)
+    assert with_sw - without == pytest.approx(
+        400.0 * mc.ESC_SWITCHING_LOSS_PCT_DEFAULT / 100.0, rel=1e-9)
+
+
+def test_fw_esc_charges_a_switching_loss(fw, fw_plane):
+    fw_plane.esc = _fw_esc(fw)
+    with_sw, _ = fw.esc_losses_W(fw_plane, 16.0, 300.0)
+    fw_plane.esc.switching_loss_pct = 0.0
+    without, _ = fw.esc_losses_W(fw_plane, 16.0, 300.0)
+    assert with_sw - without == pytest.approx(
+        300.0 * fw.ESC_SWITCHING_LOSS_PCT_DEFAULT / 100.0, rel=1e-9)
+
+
+@pytest.mark.parametrize("which", ["mc", "fw"])
+def test_cli_switching_loss_flag_reaches_the_esc(mc, fw, which, monkeypatch):
+    from test_cli import MC_BASE, FW_BASE
+    mod, base, entry = ((mc, MC_BASE, "compute_operating_metrics") if which == "mc"
+                        else (fw, FW_BASE, "compute_metrics"))
+    seen = _capture_metrics(monkeypatch, mod, entry)
+    monkeypatch.setattr(sys, "argv", ["sim"] + base + [
+        "--esc_cont_current", "40", "--esc_switching_loss_pct", "3.5"])
+    mod.main()
+    assert seen[-1][0].esc.switching_loss_pct == 3.5
+
+
+def test_batch_maps_the_switching_loss_field(rw):
+    assert rw.GUI_TO_CLI_MULTICOPTER["esc_switching_loss"] == "esc_switching_loss_pct"
+    assert rw.GUI_TO_CLI_FIXEDWING["esc_sw"] == "esc_switching_loss_pct"

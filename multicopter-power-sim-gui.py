@@ -361,6 +361,12 @@ class MotorConfig:
 # -------------------------------
 # ESC Model
 # -------------------------------
+# Default ESC switching loss, % of the power passed. Together with typical
+# conduction and idle losses it puts a hobby ESC near 97% efficient, close to
+# the VTOL tool's default 96% (which covers all three).
+ESC_SWITCHING_LOSS_PCT_DEFAULT = 2.0
+
+
 class ESCConfig:
     def __init__(self,
                  voltage_rating: int,  # S rating for ESC compatibility checks
@@ -368,13 +374,21 @@ class ESCConfig:
                  max_current_A: float,
                  idle_current_A: float,
                  resistance: float,
-                 weight_g: Optional[float] = None):
+                 weight_g: Optional[float] = None,
+                 switching_loss_pct: Optional[float] = None):
         self.voltage_rating = int(voltage_rating)
         self.continuous_rating_A = float(continuous_current_A)
         self.max_current_A = float(max_current_A)
         self.idle_current_A = float(idle_current_A)
         self.weight_g = weight_g
         self.resistance = float(resistance)           # Ω
+        # Switching loss as a percentage of the power the ESC passes. The
+        # MOSFETs dissipate V*I for part of every PWM edge, so the loss grows
+        # with the power switched; conduction (I^2 R) alone left the
+        # multicopter charging ~0.5-1.5% where a real ESC loses 2-5% (M5).
+        self.switching_loss_pct = (ESC_SWITCHING_LOSS_PCT_DEFAULT
+                                   if switching_loss_pct is None
+                                   else max(float(switching_loss_pct), 0.0))
 
 # -------------------------------
 # Avionics/Peripherals Model
@@ -500,6 +514,7 @@ def esc_loss_and_checks(config: "DroneConfig", v_pack: float, motor_power_total_
 
     Model:
       - Conduction loss: I^2 * R for each ESC
+      - Switching loss: switching_loss_pct of the power each ESC passes
       - Idle/overhead draw: I_idle * V for each ESC (if provided)
     Assumption:
       Motor/ESC sees pack voltage (no separate motor rail).
@@ -514,8 +529,10 @@ def esc_loss_and_checks(config: "DroneConfig", v_pack: float, motor_power_total_
 
     # Losses per ESC
     p_loss_cond = (i_motor ** 2) * max(float(esc.resistance), 0.0)
+    p_loss_sw = max(p_per_motor, 0.0) * max(float(
+        getattr(esc, "switching_loss_pct", ESC_SWITCHING_LOSS_PCT_DEFAULT)), 0.0) / 100.0
     p_loss_idle = max(float(esc.idle_current_A), 0.0) * v
-    esc_loss_total = (p_loss_cond + p_loss_idle) * int(config.num_motors)
+    esc_loss_total = (p_loss_cond + p_loss_sw + p_loss_idle) * int(config.num_motors)
 
     note_parts = []
     if i_motor > float(esc.max_current_A):
@@ -583,6 +600,12 @@ def total_power_with_esc(config: "DroneConfig",
                        + (0.0 if esc_in_motor_power else float(esc_loss_W))
                        + wire_loss)
 
+    # The loop above solved the pack for the PREVIOUS iteration's total; solve
+    # it once more so the voltage and current returned belong to the total
+    # returned (the pack's I^2 R is charged from this current).
+    v_load, pack_current = solve_pack_voltage_and_current(
+        config.battery, total_power, soc=soc
+    )
     return float(total_power), float(v_load), float(pack_current), esc_note, float(i_motor)
 
 
@@ -604,6 +627,29 @@ def solve_pack_voltage_and_current(battery: "BatteryConfig",
     """
     v, i, _ok = core.solve_pack_for_power(battery, total_power_W, soc=soc)
     return (float(v), float(i))
+
+
+def apply_pack_draw(battery: "BatteryConfig", metrics: dict,
+                    soc: Optional[float] = None) -> dict:
+    """Re-solve the pack for metrics["total_power_W"] after a caller changed
+    it (climb, acceleration), and refresh every pack figure from that one
+    solution.
+
+    Callers used to overwrite the solved current with total power over
+    NOMINAL voltage (audit B5), so the pack current, C-rate, pack I^2 R and
+    the current checks were computed at a voltage the pack was not at.
+
+    Sets v_load_V, pack_current_A, pack_resistance_ohm, battery_loss_W,
+    battery_i2r_loss_W and cell_power_W; returns `metrics`.
+    """
+    d = core.pack_draw(battery, float(metrics.get("total_power_W", 0.0) or 0.0), soc=soc)
+    metrics["v_load_V"] = d["v_load_V"]
+    metrics["pack_current_A"] = d["current_A"]
+    metrics["pack_resistance_ohm"] = d["resistance_ohm"]
+    metrics["battery_loss_W"] = d["loss_W"]
+    metrics["battery_i2r_loss_W"] = d["loss_W"]
+    metrics["cell_power_W"] = d["cell_power_W"]
+    return metrics
 
 
 # -------------------------------
@@ -2028,6 +2074,11 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         # voltage sag in the loaded voltage, but was never itemised.
         "battery_i2r_loss_W":  float(pack_current_A) ** 2
                                * float(drone.battery.resistance_at_soc(_cell_soc)),
+        # The resistance that sag and loss were computed with (not the base
+        # figure when a SoC curve scales it), and what the cells give up:
+        # terminal power plus that loss, which is what drains the energy.
+        "pack_resistance_ohm": float(core.pack_resistance_at(drone.battery, soc_eval)),
+        "cell_power_W":        float(total_power_W) + float(battery_loss_W),
         "esc_note":            str(esc_note),
         "motor_I_per_esc_A":   float(motor_I_esc_A),
         "motor_current_A":     float(motor_current_A),
@@ -2108,9 +2159,10 @@ def compute_operating_metrics(config: DroneConfig,
 def estimate_flight_time_minutes(config: DroneConfig, speed_mps: float, orientation: str = "forward") -> float:
     """
     Returns minutes of flight time based on:
-      usable_energy_Wh / total_power_W
+      usable_energy_Wh / (total_power_W + pack I^2 R)
 
-    Total power includes motor power plus avionics/peripheral draw.
+    Total power includes motor power plus avionics/peripheral draw; the
+    pack's own loss is added because the cells pay for it too.
 
     Avionics draw can be provided either as:
       - Legacy: config.periph_current (A at pack input), OR
@@ -2163,7 +2215,12 @@ def estimate_flight_time_minutes(config: DroneConfig, speed_mps: float, orientat
     if getattr(config, "esc", None) is not None and motor_I_esc_A > config.esc.max_current_A:
         return 0.0
 
-    time_h = config.battery.usable_Wh / total_power_W
+    # The cells give up the terminal power PLUS the pack's own I^2 R; that
+    # sum is what drains the usable energy (audit M6). Dividing by the
+    # terminal power alone was optimistic by the loss fraction.
+    cell_power_W = total_power_W + pack_current_A ** 2 * core.pack_resistance_at(
+        config.battery, soc)
+    time_h = config.battery.usable_Wh / cell_power_W
     return float(time_h * 60.0)
 
 
@@ -2592,12 +2649,7 @@ def simulate_mission(config: DroneConfig,
             m["kinetic_power_W"] = kinetic_power_w
             m["climb_power_add_W"] = potential_power_w + kinetic_power_w
             m["total_power_W"] = total_power_w
-            m["pack_current_A"] = total_power_w / max(float(config.battery.vnom_pack), 1.0)
-            v_solve, i_solve = solve_pack_voltage_and_current(
-                config.battery, total_power_w, soc=soc_state
-            )
-            m["v_load_V"] = float(v_solve)
-            m["pack_current_A"] = float(i_solve)
+            apply_pack_draw(config.battery, m, soc=soc_state)
             gs_mps = groundspeed_along_track_mps(v_eval, headwind_mps, crosswind_mps)
             m["airspeed_mps"] = v_eval
             m["commanded_airspeed_mps"] = target_speed_mps
@@ -2675,12 +2727,7 @@ def simulate_mission(config: DroneConfig,
                     m["kinetic_power_W"] = kinetic_power_w
                     m["climb_power_add_W"] = potential_power_w + kinetic_power_w
                     m["total_power_W"] = total_power_w
-                    m["pack_current_A"] = total_power_w / max(float(config.battery.vnom_pack), 1.0)
-                    v_solve, i_solve = solve_pack_voltage_and_current(
-                        config.battery, total_power_w, soc=soc_state
-                    )
-                    m["v_load_V"] = float(v_solve)
-                    m["pack_current_A"] = float(i_solve)
+                    apply_pack_draw(config.battery, m, soc=soc_state)
                     gs_mps = groundspeed_along_track_mps(v_eval, headwind_mps, crosswind_mps)
                     m["airspeed_mps"] = v_eval
                     m["commanded_airspeed_mps"] = target_speed_mps
@@ -2705,9 +2752,14 @@ def simulate_mission(config: DroneConfig,
                 phase_status = f"ESC over max current: {motor_I_esc_A:.1f}A > {config.esc.max_current_A:.1f}A"
                 break
 
-            energy_used_Wh = total_power_w * (dt_s / 3600.0)
-            if energy_used_Wh > remaining_wh and total_power_w > 1e-9:
-                dt_s = (remaining_wh * 3600.0) / total_power_w
+            # The cells give up the terminal power plus the pack's own I^2 R
+            # (audit M6). Drawing only the terminal power left the loss free:
+            # the thermal model heated the pack with it, but the battery never
+            # paid for it.
+            cell_power_w = float(m.get("cell_power_W", total_power_w))
+            energy_used_Wh = cell_power_w * (dt_s / 3600.0)
+            if energy_used_Wh > remaining_wh and cell_power_w > 1e-9:
+                dt_s = (remaining_wh * 3600.0) / cell_power_w
                 energy_used_Wh = remaining_wh
                 v_next = current_speed_mps + (v_next - current_speed_mps) * min(max(dt_s / max(base_dt_s, 1e-9), 0.0), 1.0)
                 gs_mps = groundspeed_along_track_mps(0.5 * (current_speed_mps + v_next), headwind_mps, crosswind_mps)
@@ -2728,9 +2780,10 @@ def simulate_mission(config: DroneConfig,
             dist_km += step_distance_m / 1000.0
 
             motor_copper_total_w = (float(m.get("motor_current_A", 0.0)) ** 2) * float(getattr(config.motor, "resistance", 0.0)) * max(int(config.num_motors), 1)
-            battery_loss_w = (pack_current_A ** 2) * max(float(getattr(config.battery, "pack_resistance", 0.0)), 0.0)
             m["motor_copper_loss_W"] = motor_copper_total_w
-            m["battery_loss_W"] = battery_loss_w
+            # battery_loss_W is the loss apply_pack_draw solved, at this
+            # step's state of charge; the base resistance it used to be
+            # recomputed with ignored the SoC curve.
 
             motor_temp_c = thermal_step(motor_temp_c, ambient_c, m.get("motor_copper_loss_W", 0.0), 0.35, 240.0, dt_s)
             esc_temp_c = thermal_step(esc_temp_c, ambient_c, m.get("esc_loss_W", 0.0), 0.75, 180.0, dt_s)
@@ -3311,6 +3364,7 @@ def build_drone_from_args(args) -> DroneConfig:
             idle_current_A=float(args.esc_idle_current) if args.esc_idle_current is not None else 0.0,
             resistance=float(args.esc_resistance) if args.esc_resistance is not None else 0.0,
             weight_g=float(args.esc_weight) if args.esc_weight is not None else None,
+            switching_loss_pct=args.esc_switching_loss_pct,
         )
 
     base_weight_g = float(args.weight)
@@ -3956,6 +4010,9 @@ MC_FIELD_HELP = {
                          "Typically 0.02-0.1 A."),
     "esc_r": ("ESC internal resistance in ohms.",
               "Typical 0.001-0.005. Leave default if unknown."),
+    "esc_switching_loss": ("Power lost switching the MOSFETs, as a percentage "
+                           "of the power the ESC passes.",
+                           "Typical 1-3%. Leave the default if unknown."),
     "esc_weight": ("Weight of ONE ESC in grams.", "4-in-1 boards: divide by 4."),
 
     # ---- Avionics ----
@@ -4464,6 +4521,7 @@ def launch_gui():
     v_batt_temp_limit   = sv(55)          # #11
     v_esc_idle_current  = sv(0.5)
     v_esc_r             = sv(0.01)
+    v_esc_switching     = sv(ESC_SWITCHING_LOSS_PCT_DEFAULT)
     v_esc_weight        = sv(36)
 
     # Avionics (string var kept in sync with the treeview)
@@ -4917,6 +4975,7 @@ def launch_gui():
     add_row(tab_esc, r, "Max Current (A)",         v_esc_max_current, key="esc_max_current");    r += 1
     add_row(tab_esc, r, "Idle Current (A)",        v_esc_idle_current, key="esc_idle_current");   r += 1
     add_row(tab_esc, r, "Resistance (Ω)",          v_esc_r, key="esc_r");              r += 1
+    add_row(tab_esc, r, "Switching Loss (%)",      v_esc_switching, key="esc_switching_loss"); r += 1
     add_row(tab_esc, r, "Weight (g)",              v_esc_weight, key="esc_weight");         r += 1
     add_row(tab_esc, r, "Time at Max (s)",         v_esc_max_time_s, key="esc_max_time_s"); r += 1
     add_row(tab_esc, r, "Temp Limit (°C)",         v_esc_temp_limit, key="esc_temp_limit"); r += 1
@@ -5305,6 +5364,7 @@ def launch_gui():
         "esc_voltage_rating": v_esc_voltage_rating, "esc_cont_current": v_esc_cont_current,
         "esc_max_current": v_esc_max_current, "esc_idle_current": v_esc_idle_current,
         "esc_r": v_esc_r, "esc_weight": v_esc_weight,
+        "esc_switching_loss": v_esc_switching,
         "avionics_voltage_tree": v_avionics_voltage_tree,
         "prop_d": v_prop_d, "prop_pitch": v_prop_pitch, "prop_blades": v_prop_blades,
         "prop_max_rpm": v_prop_max_rpm, "prop_max_thrust": v_prop_max_thrust,
@@ -7127,7 +7187,15 @@ def launch_gui():
         _metrics_add("Pack Voltage (no load)", f"{fmt(Vmax,2)} V")
         _metrics_add("Pack Voltage (cutoff)",  f"{fmt(Vmin,2)} V")
         _metrics_add("Pack Voltage (loaded)",  f"{fmt(v_load,2)} V  (sag: {fmt(Vsag,2)} V / {fmt(Vsag/max(Vmax,1e-9)*100,1)}%)")
-        _metrics_add("Pack Resistance",        f"{fmt(getattr(batt,'pack_resistance',0)*1000,1)} mΩ")
+        # The resistance the sag and I^2 R were computed with. With a SoC
+        # curve that is the base figure times the curve's scale at this
+        # charge, so showing the base alone was not the one in use (B5).
+        _r_base = float(getattr(batt, 'pack_resistance', 0.0) or 0.0)
+        _r_used = float(metrics.get("pack_resistance_ohm", _r_base))
+        _metrics_add("Pack Resistance",
+                     f"{fmt(_r_used*1000,1)} mΩ"
+                     + (f"  (base {fmt(_r_base*1000,1)} mΩ × SoC curve)"
+                        if abs(_r_used - _r_base) > 1e-9 else ""))
         _metrics_add("Pack I2R Loss",
                      f"{fmf(metrics.get('battery_i2r_loss_W', float('nan')),2)} W",
                      "Heat in the pack's own resistance. It is why the loaded "
@@ -7727,6 +7795,8 @@ def launch_gui():
                 idle_current_A       = parse_float_opt("ESC idle current", v_esc_idle_current.get(), 0.0),
                 resistance           = parse_float_opt("ESC resistance", v_esc_r.get(), 0.0),
                 weight_g             = parse_float_opt("ESC weight", v_esc_weight.get()),
+                switching_loss_pct   = parse_float_opt("ESC switching loss", v_esc_switching.get(),
+                                                       ESC_SWITCHING_LOSS_PCT_DEFAULT),
             )
         avionics = AvionicsConfig(voltage_tree=_get_voltage_tree_from_table())
 
@@ -7907,8 +7977,9 @@ def launch_gui():
             metrics["potential_power_W"] = potential_power_w
             metrics["climb_power_add_W"] = potential_power_w
             metrics["total_power_W"] = adj_total_w
-            metrics["pack_current_A"] = adj_total_w / max(float(drone.battery.vnom_pack), 1.0)
-            metrics["v_load_V"] = battery_voltage_under_load(drone.battery, metrics["pack_current_A"])
+            # Solved against the loaded voltage, as the metrics themselves
+            # were; total over nominal voltage overwrote that (audit B5).
+            apply_pack_draw(drone.battery, metrics)
             reserve_target_wh = max(
                 drone.battery.usable_Wh * (parse_float("Reserve percent", v_reserve_percent.get()) / 100.0),
                 parse_float("RTH reserve", v_rth_reserve_Wh.get()) + parse_float("Diversion reserve", v_div_reserve_Wh.get()),
@@ -7917,7 +7988,8 @@ def launch_gui():
             metrics["reserve_margin_Wh"] = drone.battery.usable_Wh - reserve_target_wh
             metrics["reserve_breached"] = bool(metrics["reserve_margin_Wh"] < 0)
             if adj_total_w > 0:
-                t_min = drone.battery.usable_Wh / adj_total_w * 60.0
+                # The cells pay the pack's own I^2 R as well (audit M6).
+                t_min = drone.battery.usable_Wh / metrics["cell_power_W"] * 60.0
             else:
                 t_min = 0.0
             d_km = float(metrics.get("groundspeed_mps", 0.0)) * (t_min * 60.0) / 1000.0
@@ -8612,6 +8684,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esc_idle_current", type=float, required=False)
     parser.add_argument("--esc_resistance", type=float, required=False)
     parser.add_argument("--esc_weight", type=float, required=False)
+    parser.add_argument("--esc_switching_loss_pct", type=float, default=None,
+                        help=f"ESC switching loss, %% of the power passed "
+                             f"(default {ESC_SWITCHING_LOSS_PCT_DEFAULT:g})")
 
     # Avionics
     parser.add_argument("--avionics_voltage_tree", type=str, default=None, help="Voltage tree for avionics power draw, e.g., '5.0:(2,0.9), 12.0:(1.5,0.85)' means 2A at 5V with 90 percent efficiency, and 1.5A at 12V with 85 percent efficiency")
@@ -8833,8 +8908,8 @@ def main():
             metrics["motor_power_W"] = float(metrics.get("motor_power_W", 0.0)) * scale
             metrics["esc_loss_W"] = float(metrics.get("esc_loss_W", 0.0)) * scale
         metrics["total_power_W"] = adj_total_w
-        metrics["pack_current_A"] = adj_total_w / max(float(drone.battery.vnom_pack), 1.0)
-        metrics["v_load_V"] = battery_voltage_under_load(drone.battery, metrics["pack_current_A"])
+        # Solved against the loaded voltage, as in the GUI (audit B5).
+        apply_pack_draw(drone.battery, metrics)
         metrics["climb_rate_cmd_mps"] = climb_rate
         metrics["descent_rate_cmd_mps"] = descent_rate
         metrics["potential_power_W"] = potential_power_w
@@ -8845,7 +8920,8 @@ def main():
         metrics["reserve_margin_Wh"] = float(drone.battery.usable_Wh) - float(metrics["reserve_target_Wh"])
         metrics["reserve_breached"] = bool(metrics["reserve_margin_Wh"] < 0.0)
         if adj_total_w > 0:
-            t_min = float(drone.battery.usable_Wh) / adj_total_w * 60.0
+            # The cells pay the pack's own I^2 R as well (audit M6).
+            t_min = float(drone.battery.usable_Wh) / float(metrics["cell_power_W"]) * 60.0
         else:
             t_min = 0.0
         d_km = float(metrics.get("groundspeed_mps", 0.0)) * (t_min * 60.0) / 1000.0

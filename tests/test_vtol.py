@@ -3176,8 +3176,10 @@ def test_a_missing_soc_curve_file_still_fails_loudly(vtol):
 def test_pack_mode_endurance_follows_the_pack_energy(vtol):
     """
     End to end: a pack-mode battery has to drive the flight numbers, not
-    merely construct. Doubling the parallel packs doubles the energy and
-    so, at constant power, the endurance.
+    merely construct. Doubling the parallel packs doubles the energy. The
+    endurance is that energy over what the cells give up, terminal power
+    plus the pack's own I^2 R, and the second pack in parallel also halves
+    the resistance, so the endurance slightly more than doubles.
     """
     one = _cfg(vtol, "lift+cruise")
     one.battery = vtol.VTOLBattery(unit_mode="pack", series_cells=1,
@@ -3191,8 +3193,12 @@ def test_pack_mode_endurance_follows_the_pack_energy(vtol):
     m1 = vtol.compute_metrics(one)
     m2 = vtol.compute_metrics(two)
     assert m2["usable_Wh"] == pytest.approx(2 * m1["usable_Wh"], rel=1e-9)
+    for m in (m1, m2):
+        assert m["cruise_endurance_min"] == pytest.approx(
+            m["usable_Wh"] / m["cell_power_W"] * 60.0, rel=1e-9)
+    assert m2["cruise_endurance_min"] > 2 * m1["cruise_endurance_min"]
     assert m2["cruise_endurance_min"] == pytest.approx(
-        2 * m1["cruise_endurance_min"], rel=1e-6)
+        2 * m1["cruise_endurance_min"], rel=0.05)
 
 
 # --------------------------------------------- batch 3: GUI wiring

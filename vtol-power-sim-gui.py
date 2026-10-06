@@ -1892,7 +1892,7 @@ def best_speeds(cfg: VTOLConfig, v_max: Optional[float] = None,
     best_e, best_r = (0.0, -1.0), (0.0, -1.0)
     for v in speeds:
         p = float(power_at_airspeed(cfg, v)["total_power_W"])
-        minutes = usable / max(p, 1e-9) * 60.0
+        minutes = usable / max(_cell_power_W(cfg, p), 1e-9) * 60.0
         km = minutes * 60.0 * max(core.groundspeed_along_track_mps(
             v, wind_head_mps, wind_cross_mps), 0.0) / 1000.0
         if minutes > best_e[1]:
@@ -2467,6 +2467,12 @@ def make_airframe_diagram_figure(cfg: VTOLConfig, figsize=(9, 7.5)):
     return fig
 
 
+def _cell_power_W(cfg: VTOLConfig, terminal_W: float) -> float:
+    """What the cells give up to deliver `terminal_W` at the pack terminals,
+    at full charge: the terminal power plus the pack's own I^2 R."""
+    return core.pack_draw(cfg.battery, terminal_W)["cell_power_W"]
+
+
 def compute_metrics(cfg: VTOLConfig, airspeed_mps: Optional[float] = None,
                     wind_mps: float = 0.0,
                     wind_direction_deg: float = 0.0,
@@ -2515,22 +2521,29 @@ def compute_metrics(cfg: VTOLConfig, airspeed_mps: Optional[float] = None,
     point["steady_power_W"] = float(point["total_power_W"])
     point["total_power_W"] = max(float(point["total_power_W"]) + climb_add_W, floor_W)
 
-    hover_min = usable_Wh / max(hover["total_power_W"], 1e-9) * 60.0
-    cruise_min = usable_Wh / max(point["total_power_W"], 1e-9) * 60.0
+    # Every endurance divides the usable energy by what the CELLS give up:
+    # the terminal power plus the pack's own I^2 R (core.pack_draw). The
+    # mission already charged that loss; dividing by the terminal power here
+    # made the single point read longer than a mission at the same power.
+    hover_min = usable_Wh / max(_cell_power_W(cfg, hover["total_power_W"]), 1e-9) * 60.0
+    cruise_min = usable_Wh / max(_cell_power_W(cfg, point["total_power_W"]), 1e-9) * 60.0
 
     # Station keeping: zero groundspeed, airspeed equal to the wind. At zero
     # wind power_at_airspeed(cfg, 0) IS hover_power_W(cfg), so every figure
     # below collapses to the still-air one and nothing moves.
     station = power_at_airspeed(cfg, wind)
-    station_min = usable_Wh / max(station["total_power_W"], 1e-9) * 60.0
+    station_min = usable_Wh / max(_cell_power_W(cfg, station["total_power_W"]), 1e-9) * 60.0
 
     groundspeed = core.groundspeed_along_track_mps(v, head, cross)
 
     v_stall = stall_speed_mps(cfg)
     v_trans = transition_speed_mps(cfg)
 
-    pack_I = point["total_power_W"] / max(cfg.battery.vnom_pack, 1e-9)
-    v_load = cfg.battery.voltage_under_load(pack_I)
+    # Solved against the loaded voltage rather than power over nominal
+    # voltage, so the current, the sag and the pack loss agree (audit V9).
+    _draw = core.pack_draw(cfg.battery, point["total_power_W"])
+    pack_I = _draw["current_A"]
+    v_load = _draw["v_load_V"]
 
     metrics: Dict[str, object] = {
         "config_type": cfg.config_type,
@@ -2582,6 +2595,7 @@ def compute_metrics(cfg: VTOLConfig, airspeed_mps: Optional[float] = None,
 
         "pack_current_A": pack_I,
         "v_load_V": v_load,
+        "cell_power_W": _draw["cell_power_W"],
         "usable_Wh": usable_Wh,
         "battery_weight_g": cfg.battery.weight_g,
         "soc_model": core.soc_model_short_label(cfg.battery.soc_model_source),
@@ -2773,7 +2787,8 @@ def _extended_metrics(cfg: VTOLConfig, m: dict, point: dict, hover: dict,
                                     if math.isfinite(ceiling) else float("inf"))
     tr = turn(cfg, v, cfg.bank_deg)
     out.update({f"{k}": val for k, val in tr.items()})
-    out["turn_endurance_min"] = batt.usable_Wh / max(tr["turn_power_W"], 1e-9) * 60.0
+    out["turn_endurance_min"] = batt.usable_Wh / max(
+        _cell_power_W(cfg, tr["turn_power_W"]), 1e-9) * 60.0
     out["loiter_circles"] = (out["turn_endurance_min"] * 60.0 / tr["turn_period_s"]
                              if math.isfinite(tr["turn_period_s"]) else 0.0)
 
@@ -2800,7 +2815,9 @@ def _extended_metrics(cfg: VTOLConfig, m: dict, point: dict, hover: dict,
 
     # ---- battery -------------------------------------------------------
     pack_I = float(m["pack_current_A"])
-    r_pack = batt.pack_resistance
+    # The resistance the sag and loss are computed with (the base figure
+    # times the SoC curve's full-charge scale), not the base figure alone.
+    r_pack = core.pack_resistance_at(batt)
     reserve_pct = cfg.reserve_percent if cfg.reserve_percent is not None else 20.0
     reserve_Wh = batt.usable_Wh * reserve_pct / 100.0
     out.update({
@@ -2817,9 +2834,11 @@ def _extended_metrics(cfg: VTOLConfig, m: dict, point: dict, hover: dict,
         "reserve_percent": reserve_pct,
         "reserve_target_Wh": reserve_Wh,
         "reserve_margin_Wh": batt.usable_Wh - reserve_Wh,
-        "cruise_endurance_to_reserve_min": (batt.usable_Wh - reserve_Wh) / max(total, 1e-9) * 60.0,
+        "cruise_endurance_to_reserve_min": ((batt.usable_Wh - reserve_Wh)
+                                            / max(_cell_power_W(cfg, total), 1e-9) * 60.0),
         "hover_endurance_to_reserve_min": ((batt.usable_Wh - reserve_Wh)
-                                           / max(float(m["hover_power_W"]), 1e-9) * 60.0),
+                                           / max(_cell_power_W(cfg, float(m["hover_power_W"])),
+                                                 1e-9) * 60.0),
     })
 
     # ---- mass fractions --------------------------------------------------
@@ -2907,7 +2926,7 @@ def _detail_metrics(cfg: VTOLConfig, point: dict, hover: dict,
         "drive_efficiency": float(point.get("drive_efficiency", 1.0)),
         "wire_drop_V": pack_I * float(getattr(cfg, "wire_resistance_ohm", 0.0) or 0.0),
         "c_rate": pack_I / max(cfg.battery.capacity_Ah, 1e-9),
-        "hover_pack_current_A": hover_total / max(cfg.battery.vnom_pack, 1e-9),
+        "hover_pack_current_A": core.pack_draw(cfg.battery, hover_total)["current_A"],
         "hover_power_per_lift_motor_W": hover_shaft / max(cfg.num_lift_rotors, 1),
         "cruise_power_per_motor_W": cruise_per_motor,
         "lift_motor_mass_g": cfg.lift_motor_weight_g * cfg.num_lift_rotors,
@@ -6762,7 +6781,8 @@ def launch_gui(args=None) -> None:
             motor_shaft_W=float(m.get("shaft_power_W", 0.0)),
             motor_copper_W=float(m.get("motor_copper_W", 0.0)),
             motor_iron_W=float(m.get("motor_iron_W", 0.0)),
-            battery_i2r_W=pack_I ** 2 * cfg.battery.pack_resistance,
+            battery_i2r_W=float(m.get("battery_loss_W",
+                                      pack_I ** 2 * core.pack_resistance_at(cfg.battery))),
             esc_loss_W=float(m.get("esc_loss_W", 0.0)),
             wire_loss_W=float(m.get("wire_loss_W", 0.0)),
             # Two different direct-from-pack loads share this row: the flat
@@ -8396,7 +8416,7 @@ def launch_gui(args=None) -> None:
             # Endurance and range at a STEADY speed, which is what a
             # fixed-speed sweep describes. A real flight also pays for the
             # climb and the transition; the mission run is what prices those.
-            mins = usable_Wh / max(total, 1e-9) * 60.0
+            mins = usable_Wh / max(_cell_power_W(cfg, total), 1e-9) * 60.0
             data["endurance"].append(mins)
             data["range"].append(mins * 60.0 * core.groundspeed_along_track_mps(
                 v, head, cross) / 1000.0)

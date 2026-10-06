@@ -910,3 +910,28 @@ def test_fw_metrics_auw_counts_the_payload_once(fw_gui, paths, monkeypatch):
     newtons = float(auw.split("(")[1].split()[0])
     assert grams == pytest.approx(3000.0)
     assert newtons == pytest.approx(grams / 1000.0 * 9.80665, rel=1e-3)
+
+
+@pytest.mark.parametrize("which", ["mc", "fw"])
+def test_metrics_pack_resistance_is_the_one_in_use(request, which):
+    """Audit B5: Metrics showed the base pack resistance while the sag was
+    computed at the SoC curve's 1.5x of it at full charge."""
+    gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
+    assert gui.click("Fixed Speed Sweep") == []
+    tree = next(w for w in gui.refresh() if isinstance(w, ttk.Treeview)
+                and [str(c) for c in w.cget("columns")] == ["metric", "value", "note"])
+
+    def walk(node=""):
+        for iid in tree.get_children(node):
+            yield tree.item(iid, "values")
+            yield from walk(iid)
+
+    rows = {str(v[0]): str(v[1]) for v in walk() if v}
+    shown_mohm = float(rows["Pack Resistance"].split()[0])
+    loaded = rows["Pack Voltage (loaded)" if which == "mc" else "Pack Voltage (under load)"]
+    sag_V = float(loaded.split("sag:")[1].split()[0])
+    current_A = float(rows["Pack Current"].split()[0])
+    # The resistance shown must be the one that produced the sag shown:
+    # sag / current, to the rounding of the two displayed figures.
+    implied_mohm = sag_V / current_A * 1000.0
+    assert abs(shown_mohm - implied_mohm) <= 0.005 / current_A * 1000.0 + 0.06

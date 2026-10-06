@@ -406,10 +406,16 @@ class MotorConfig:
 # ============================================================
 # ESC MODEL
 # ============================================================
+# Default ESC switching loss, % of the power passed. With typical conduction
+# and idle losses it puts a hobby ESC near 97% efficient, close to the VTOL
+# tool's default 96% (which covers all three).
+ESC_SWITCHING_LOSS_PCT_DEFAULT = 2.0
+
+
 class ESCConfig:
     """
     Electronic Speed Controller model.
-    Losses:  P_loss = I² × R_esc + I_idle × V  [W per ESC]
+    Losses:  P_loss = I² × R_esc + k_sw × P + I_idle × V  [W per ESC]
     """
     def __init__(self,
                  voltage_rating:      int,
@@ -417,13 +423,20 @@ class ESCConfig:
                  max_current_A:        float,
                  idle_current_A:       float,
                  resistance:           float,
-                 weight_g: Optional[float] = None):
+                 weight_g: Optional[float] = None,
+                 switching_loss_pct: Optional[float] = None):
         self.voltage_rating     = int(voltage_rating)
         self.continuous_rating_A = float(continuous_current_A)
         self.max_current_A      = float(max_current_A)
         self.idle_current_A     = float(idle_current_A)
         self.resistance         = float(resistance)
         self.weight_g           = weight_g
+        # Switching loss, % of the power the ESC passes (audit F8/M5): the
+        # MOSFETs dissipate V*I through every PWM edge, so it scales with
+        # the power switched. Conduction alone charged ~0.5-1.5%.
+        self.switching_loss_pct = (ESC_SWITCHING_LOSS_PCT_DEFAULT
+                                   if switching_loss_pct is None
+                                   else max(float(switching_loss_pct), 0.0))
 
 
 # ============================================================
@@ -1255,8 +1268,9 @@ def table_power_includes_esc(config: FixedWingConfig) -> bool:
 
 def esc_losses_W(config: FixedWingConfig, v_pack: float, motor_P_total_W: float) -> Tuple[float, str]:
     """
-    ESC conduction and idle losses:
+    ESC conduction, switching and idle losses:
         P_esc_cond = I_motor² · R_esc
+        P_esc_sw   = switching_loss_pct/100 · P_motor
         P_esc_idle = I_idle  · V_pack
     Returns (total_esc_loss_W, status_note).
     """
@@ -1267,8 +1281,10 @@ def esc_losses_W(config: FixedWingConfig, v_pack: float, motor_P_total_W: float)
     p_pm     = motor_P_total_W / max(config.num_motors, 1)
     i_motor  = p_pm / v
     p_cond   = i_motor ** 2 * max(esc.resistance, 0.0)
+    p_sw     = max(p_pm, 0.0) * max(getattr(
+        esc, "switching_loss_pct", ESC_SWITCHING_LOSS_PCT_DEFAULT), 0.0) / 100.0
     p_idle   = max(esc.idle_current_A, 0.0) * v
-    total    = (p_cond + p_idle) * config.num_motors
+    total    = (p_cond + p_sw + p_idle) * config.num_motors
     note     = ""
     if i_motor > esc.continuous_rating_A:
         note = f"ESC over cont current ({i_motor:.1f} A > {esc.continuous_rating_A:.1f} A)"
@@ -1952,6 +1968,24 @@ def motor_operating_current(config: FixedWingConfig, motor_input_W: float,
             "copper_W": i_w * i_w * r_m * n_m, "no_load_W": no_load_W}
 
 
+def apply_pack_draw(battery, metrics: dict, soc: Optional[float] = None) -> dict:
+    """Re-solve the pack for metrics["total_power_W"] after a caller changed
+    it (a commanded climb), and refresh every pack figure from that one
+    solution: v_load_V, pack_current_A, pack_resistance_ohm,
+    battery_loss_W and cell_power_W.
+
+    Callers used to set the current to total power over NOMINAL voltage
+    (audit F10), so the current and the sag came from different voltages.
+    """
+    d = core.pack_draw(battery, float(metrics.get("total_power_W", 0.0) or 0.0), soc=soc)
+    metrics["v_load_V"] = d["v_load_V"]
+    metrics["pack_current_A"] = d["current_A"]
+    metrics["pack_resistance_ohm"] = d["resistance_ohm"]
+    metrics["battery_loss_W"] = d["loss_W"]
+    metrics["cell_power_W"] = d["cell_power_W"]
+    return metrics
+
+
 def compute_metrics(config: FixedWingConfig,
                     speed_mps: float,
                     bank_deg: float = 0.0,
@@ -2003,24 +2037,34 @@ def compute_metrics(config: FixedWingConfig,
     # for the ESC current check and temperature, but is not added on top,
     # which counted it twice (audit F8); P_elec is then reduced to the
     # motors' own input so each loss is reported once.
+    #
+    # The pack is solved for the power it actually carries, against its
+    # LOADED voltage (core.solve_pack_for_power), and the ESCs are judged at
+    # that voltage less the lead's drop. The current used to be total power
+    # over NOMINAL voltage while the ESC loss was taken at FULL-charge
+    # voltage, so the pack current, the sag and the pack's I^2 R each came
+    # from a different voltage (audit F10).
     _esc_in_P = table_power_includes_esc(config)
     _wiring = getattr(config, "wiring", None)
     r_wire = _wiring.resistance_ohm if _wiring is not None else 0.0
-    esc_loss, esc_note = esc_losses_W(config, batt.vmax_pack, P_elec)
+    esc_loss, esc_note = 0.0, ""
     wire_loss = 0.0
-    if r_wire > 0:
-        for _ in range(6):
-            pack_I = (P_elec + (0.0 if _esc_in_P else esc_loss)
-                      + P_avionics + wire_loss) / max(batt.vnom_pack, 1.0)
-            wire_loss = pack_I * pack_I * r_wire
-            esc_loss, esc_note = esc_losses_W(
-                config, max(batt.vmax_pack - pack_I * r_wire, 1.0), P_elec)
+    P_total = P_elec + P_avionics
+    for _ in range(8):
+        _v_pack, _i_pack, _ok = core.solve_pack_for_power(batt, P_total)
+        esc_loss, esc_note = esc_losses_W(
+            config, max(_v_pack - _i_pack * r_wire, 1.0), P_elec)
+        wire_loss = _i_pack * _i_pack * r_wire
+        P_total = P_elec + (0.0 if _esc_in_P else esc_loss) + P_avionics + wire_loss
 
-    P_total = P_elec + (0.0 if _esc_in_P else esc_loss) + P_avionics + wire_loss
     if _esc_in_P:
         P_elec = max(P_elec - esc_loss, 0.0)
-    pack_I  = P_total / max(batt.vnom_pack, 1.0)
-    V_load  = batt.voltage_under_load(pack_I)
+    # One solve for the final total, so the voltage, current and pack loss
+    # all belong to the power reported. The cells give up the terminal power
+    # plus that loss (core.pack_draw), which is what drains the energy.
+    _draw = core.pack_draw(batt, P_total)
+    pack_I  = _draw["current_A"]
+    V_load  = _draw["v_load_V"]
     wire = (_wiring.summary(pack_I, ambient_temp_C) if _wiring is not None
             else core.wiring_summary(0.0, 0.0, ambient_C=ambient_temp_C))
     V_esc = V_load - wire["drop_V"]
@@ -2049,7 +2093,8 @@ def compute_metrics(config: FixedWingConfig,
     # Flight time/range at this operating point.
     # Ground distance uses along-track groundspeed (airspeed corrected for wind vector).
     if P_total > 0 and pack_I <= batt.discharge_max_A and V_load >= batt.vmin_pack:
-        t_min = (batt.usable_Wh / P_total) * 60.0
+        # The cells pay the pack's own I^2 R too (audit F11).
+        t_min = (batt.usable_Wh / _draw["cell_power_W"]) * 60.0
         gs_track = groundspeed_along_track_mps(V, wind_head_mps, wind_cross_mps)
         d_km  = gs_track * (t_min * 60.0) / 1000.0
     else:
@@ -2081,7 +2126,8 @@ def compute_metrics(config: FixedWingConfig,
     motor_i_per_motor = P_elec / max(V_esc, 1.0) / max(config.num_motors, 1)
     _mop = motor_operating_current(config, P_elec, T_req, V, V_esc)
     motor_copper_loss_W = _mop["copper_W"]
-    battery_loss_W = (pack_I ** 2) * max(config.battery.pack_resistance, 0.0)
+    # At the resistance the sag was computed with, not the base figure.
+    battery_loss_W = _draw["loss_W"]
     motor_temp_est_C = ambient_temp_C + (motor_copper_loss_W + _mop["no_load_W"]) * 0.35
     esc_temp_est_C = ambient_temp_C + esc_loss * 0.70
     battery_temp_est_C = ambient_temp_C + battery_loss_W * 0.25
@@ -2152,6 +2198,8 @@ def compute_metrics(config: FixedWingConfig,
         # Battery
         pack_current_A     = pack_I,
         v_load_V           = V_load,
+        pack_resistance_ohm = _draw["resistance_ohm"],
+        cell_power_W       = _draw["cell_power_W"],
         # Propeller
         rpm_est            = rpm_est,
         tip_speed_mps      = V_tip,
@@ -2898,7 +2946,6 @@ def simulate_fw_mission(
             m["motor_power_W"] = float(m.get("motor_power_W", 0.0)) * scale
             m["esc_loss_W"] = float(m.get("esc_loss_W", 0.0)) * scale
         m["total_power_W"] = total_P
-        m["pack_current_A"] = total_P / max(cfg.battery.vnom_pack, 1.0)
         # Evaluate the pack at its CURRENT state of charge, so voltage sag and
         # the rise in internal resistance late in the flight are captured.
         soc_now = (max(remaining_Wh, 0.0) / max(usable_Wh, 1e-9)) if usable_Wh > 0 else 1.0
@@ -2906,23 +2953,24 @@ def simulate_fw_mission(
         m["soc_percent"] = soc_now * 100.0
         m["soc_model_source"] = _soc_model_short_label(
             getattr(cfg.battery, "soc_model_source", None))
-        m["v_load_V"] = cfg.battery.voltage_under_load(m["pack_current_A"], soc=soc_now)
+        # Current solved against the loaded voltage at this charge, not total
+        # power over nominal voltage (audit F10); the cell power it returns,
+        # terminal power plus the pack's I^2 R, is what the phase draws
+        # from the battery (audit F11).
+        apply_pack_draw(cfg.battery, m, soc=soc_now)
         _mop = motor_operating_current(
             cfg, m["motor_power_W"], m.get("thrust_required_N", m.get("drag_N", 0.0)),
             V_air, max(m["v_load_V"], 1.0))
         m["motor_current_A"] = _mop["current_A"]
         m["motor_no_load_loss_W"] = _mop["no_load_W"]
         motor_copper_loss_W = _mop["copper_W"]
-        battery_loss_W = (m["pack_current_A"] ** 2) * max(
-            cfg.battery.resistance_at_soc(
-                core.cell_soc_from_usable(cfg.battery, soc_now)), 0.0)
         m["motor_copper_loss_W"] = motor_copper_loss_W
-        m["battery_loss_W"] = battery_loss_W
         m["reserve_margin_Wh"] = remaining_Wh - reserve_target_Wh
         worst = _merge_worst(worst, m)
         _last_instant = m
 
         total_P   = float(m.get("total_power_W", 0.0))
+        cell_P    = float(m.get("cell_power_W", total_P))
         pack_I    = float(m.get("pack_current_A", 0.0))
         V_load    = float(m.get("v_load_V", 0.0))
 
@@ -2989,7 +3037,9 @@ def simulate_fw_mission(
                 gs_step = groundspeed_along_track_mps(v_eval, headwind_mps, crosswind_mps)
                 ramp_s += dt_step
                 ramp_km += gs_step * dt_step / 1000.0
-                ramp_Wh += p_step * (dt_step / 3600.0)
+                # The cells pay this step's pack I^2 R as well.
+                ramp_Wh += (core.pack_draw(cfg.battery, p_step, soc=soc_now)["cell_power_W"]
+                            * (dt_step / 3600.0))
                 v_now = v_next
 
             current_speed_mps = v_now
@@ -3019,10 +3069,10 @@ def simulate_fw_mission(
         if phase.duration is not None:
             # The ramp already consumed part of this phase's time.
             dur_s      = max(float(phase.duration) - ramp_s, 0.0)
-            energy_Wh  = total_P * (dur_s / 3600.0)
+            energy_Wh  = cell_P * (dur_s / 3600.0)
             if energy_Wh > remaining_Wh:
                 # Battery runs out mid-phase
-                actual_s   = (remaining_Wh / total_P) * 3600.0 if total_P > 0 else 0.0
+                actual_s   = (remaining_Wh / cell_P) * 3600.0 if cell_P > 0 else 0.0
                 actual_km  = V_gs * actual_s / 1000.0
                 t_s       += actual_s;  dist_km += actual_km;  remaining_Wh = 0.0
                 motor_temp_C = thermal_step(motor_temp_C, ambient_c, m.get("motor_copper_loss_W", 0.0), 0.35, 240.0, actual_s)
@@ -3047,9 +3097,9 @@ def simulate_fw_mission(
             # The ramp already covered part of this phase's distance.
             dist_m  = max(float(phase.distance) - ramp_km * 1000.0, 0.0)
             time_s  = dist_m / V_gs if V_gs > 1e-9 else 0.0
-            energy_Wh = total_P * (time_s / 3600.0)
+            energy_Wh = cell_P * (time_s / 3600.0)
             if energy_Wh > remaining_Wh:
-                actual_s  = (remaining_Wh / total_P) * 3600.0 if total_P > 0 else 0.0
+                actual_s  = (remaining_Wh / cell_P) * 3600.0 if cell_P > 0 else 0.0
                 actual_km = V_gs * actual_s / 1000.0
                 t_s      += actual_s;  dist_km += actual_km;  remaining_Wh = 0.0
                 motor_temp_C = thermal_step(motor_temp_C, ambient_c, m.get("motor_copper_loss_W", 0.0), 0.35, 240.0, actual_s)
@@ -3597,6 +3647,8 @@ FW_FIELD_HELP = {
     "esc_max": ("Burst current per ESC in amps.", "Usually 1.3-2x continuous."),
     "esc_idle": ("Current the ESC itself draws doing nothing.", "0.02-0.1 A."),
     "esc_r": ("ESC internal resistance in ohms.", "Typical 0.001-0.005."),
+    "esc_sw": ("Power lost switching the MOSFETs, as a percentage of the "
+               "power the ESC passes.", "Typical 1-3%. Blank uses 2%."),
     "esc_wt": ("Weight of ONE ESC in grams.", "60 A ESC ~60 g."),
 
     # ---- Avionics ----
@@ -4230,6 +4282,7 @@ def launch_gui():
     v_batt_temp_limit = sv(55)       # #11
     v_esc_idle     = sv("")
     v_esc_r        = sv("")
+    v_esc_sw       = sv("")
     v_esc_wt       = sv("")
 
     # Avionics
@@ -4324,7 +4377,7 @@ def launch_gui():
         motor_size=v_motor_size,
         esc_vrating=v_esc_vrating, esc_cont=v_esc_cont,
         esc_max=v_esc_max, esc_idle=v_esc_idle,
-        esc_r=v_esc_r, esc_wt=v_esc_wt,
+        esc_r=v_esc_r, esc_wt=v_esc_wt, esc_sw=v_esc_sw,
         avionics_str=v_avionics_str,
         prop_d=v_prop_d, prop_pitch=v_prop_pitch, prop_blades=v_prop_blades,
         prop_maxrpm=v_prop_maxrpm, prop_maxthr=v_prop_maxthr,
@@ -4569,6 +4622,7 @@ def launch_gui():
     add_row(tab_esc, r, "Max Current (A)",        v_esc_max, key="esc_max");    r += 1
     add_row(tab_esc, r, "Idle Current (A)",       v_esc_idle, key="esc_idle");   r += 1
     add_row(tab_esc, r, "Resistance (Ω)",         v_esc_r, key="esc_r");      r += 1
+    add_row(tab_esc, r, "Switching Loss (%)",     v_esc_sw, key="esc_sw");    r += 1
     add_row(tab_esc, r, "Weight (g)",             v_esc_wt, key="esc_wt");     r += 1
     add_row(tab_esc, r, "Time at Max (s)",        v_esc_max_time_s, key="esc_max_time_s"); r += 1
     add_row(tab_esc, r, "Temp Limit (°C)",        v_esc_temp_limit, key="esc_temp_limit"); r += 1
@@ -6820,7 +6874,13 @@ def launch_gui():
         _ins_metric("Pack Voltage (no load)",    f"{batt.vmax_pack:.2f} V")
         _ins_metric("Pack Voltage (min cutoff)", f"{batt.vmin_pack:.2f} V")
         _ins_metric("Pack Voltage (under load)", f"{Vload:.2f} V  (sag: {Vsag:.2f} V / {Vsag/max(batt.vmax_pack,1e-9)*100:.1f}%)")
-        _ins_metric("Pack Resistance",           f"{batt.pack_resistance*1000:.1f} mΩ  ({batt.resistance_cell*1000:.1f} mΩ/cell)")
+        # The resistance the sag and I^2 R were computed with; with a SoC
+        # curve that is the base figure times the curve's scale here.
+        _r_used = float(m.get("pack_resistance_ohm", batt.pack_resistance))
+        _ins_metric("Pack Resistance",
+                    f"{_r_used*1000:.1f} mΩ  ({batt.resistance_cell*1000:.1f} mΩ/cell"
+                    + (f", base {batt.pack_resistance*1000:.1f} mΩ × SoC curve"
+                       if abs(_r_used - batt.pack_resistance) > 1e-9 else "") + ")")
         _ins_metric("Pack Current",              f"{Ipack:.2f} A")
         cap_Ah = batt.capacity_Ah
         if cap_Ah > 0:
@@ -7161,6 +7221,8 @@ def launch_gui():
                 idle_current_A      = safe_float(v_esc_idle.get(), 0.1),
                 resistance          = safe_float(v_esc_r.get(), 0.01),
                 weight_g            = parse_float("ESC wt", v_esc_wt.get()),
+                switching_loss_pct  = safe_float(v_esc_sw.get(),
+                                                 ESC_SWITCHING_LOSS_PCT_DEFAULT),
             )
 
         avionics = AvionicsConfig(
@@ -7242,11 +7304,12 @@ def launch_gui():
                 m["motor_power_W"] = float(m.get("motor_power_W", 0.0)) * scale
                 m["esc_loss_W"] = float(m.get("esc_loss_W", 0.0)) * scale
             m["total_power_W"] = adj_total
-            m["pack_current_A"] = adj_total / max(cfg.battery.vnom_pack, 1.0)
-            m["v_load_V"] = cfg.battery.voltage_under_load(m["pack_current_A"])
+            # Solved against the loaded voltage, as compute_metrics is.
+            apply_pack_draw(cfg.battery, m)
             m["groundspeed_mps"] = groundspeed_along_track_mps(V_cruise, headwind, crosswind)
             if m["total_power_W"] > 0:
-                m["flight_time_min"] = (cfg.battery.usable_Wh / m["total_power_W"]) * 60.0
+                # The cells pay the pack's own I^2 R too (audit F11).
+                m["flight_time_min"] = (cfg.battery.usable_Wh / m["cell_power_W"]) * 60.0
                 m["flight_range_km"] = m["groundspeed_mps"] * (m["flight_time_min"] * 60.0) / 1000.0
             else:
                 m["flight_time_min"] = 0.0
@@ -7951,6 +8014,9 @@ def build_arg_parser():
                    help="ESC internal resistance (ohms).")
     p.add_argument("--esc_weight", type=float, default=None,
                    help="Weight of ONE ESC (g).")
+    p.add_argument("--esc_switching_loss_pct", type=float, default=None,
+                   help=f"ESC switching loss, %% of the power passed "
+                        f"(default {ESC_SWITCHING_LOSS_PCT_DEFAULT:g}).")
 
     # ---- Environment / propeller extras --------------------------------
     p.add_argument("--cruise_altitude", type=float, default=None,
@@ -8163,6 +8229,7 @@ def main():
             idle_current_A       = (args.esc_idle_current  if args.esc_idle_current  is not None else 0.0),
             resistance           = (args.esc_resistance    if args.esc_resistance    is not None else 0.0),
             weight_g             = args.esc_weight,
+            switching_loss_pct   = args.esc_switching_loss_pct,
         )
 
     # Avionics rails are optional on the CLI; when given they add real load,
@@ -8276,10 +8343,11 @@ def main():
         m["motor_power_W"] = float(m.get("motor_power_W", 0.0)) * scale
         m["esc_loss_W"] = float(m.get("esc_loss_W", 0.0)) * scale
     m["total_power_W"] = adj_total
-    m["pack_current_A"] = adj_total / max(cfg.battery.vnom_pack, 1.0)
-    m["v_load_V"] = cfg.battery.voltage_under_load(m["pack_current_A"])
+    # Solved against the loaded voltage, as in the GUI (audit F10).
+    apply_pack_draw(cfg.battery, m)
     if adj_total > 0:
-        m["flight_time_min"] = (cfg.battery.usable_Wh / adj_total) * 60.0
+        # The cells pay the pack's own I^2 R too (audit F11).
+        m["flight_time_min"] = (cfg.battery.usable_Wh / m["cell_power_W"]) * 60.0
         m["flight_range_km"] = m["groundspeed_mps"] * (m["flight_time_min"] * 60.0) / 1000.0
     else:
         m["flight_time_min"] = 0.0
