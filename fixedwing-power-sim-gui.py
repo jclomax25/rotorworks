@@ -2649,6 +2649,11 @@ class MissionPhase:
     course_deg: float = 0.0
     climb_rate_mps: Optional[float] = None
     descent_rate_mps: Optional[float] = None
+    # Whether the mission file gave this leg a bank and a course. 0 deg is a
+    # real value (wings level; north), and was replaced by the default
+    # because the fill tested the value's truthiness (audit B2).
+    bank_given:   bool = False
+    course_given: bool = False
 
 
 @dataclass
@@ -2693,6 +2698,8 @@ class MissionProfile:
                 course_deg = float(p.get("course_deg", 0.0)),
                 climb_rate_mps = (float(p["climb_rate_mps"]) if "climb_rate_mps" in p else None),
                 descent_rate_mps = (float(p["descent_rate_mps"]) if "descent_rate_mps" in p else None),
+                bank_given = ("bank_deg" in p),
+                course_given = ("course_deg" in p),
             ))
         return MissionProfile(
             phases=phases,
@@ -7356,8 +7363,9 @@ def launch_gui():
             _climb = safe_float(v_climb_rate.get(), 0.0)
             _descent = safe_float(v_descent_rate.get(), 0.0)
             for _p in mission.phases:
-                _p.bank_deg = float(_p.bank_deg if _p.bank_deg else _bank)
-                _p.course_deg = float(_p.course_deg if _p.course_deg else _course)
+                _p.bank_deg = float(_p.bank_deg if (_p.bank_given or _p.bank_deg) else _bank)
+                _p.course_deg = float(_p.course_deg if (_p.course_given or _p.course_deg)
+                                      else _course)
                 if _p.climb_rate_mps is None:
                     _p.climb_rate_mps = _climb
                 if _p.descent_rate_mps is None:
@@ -8151,14 +8159,19 @@ def main():
     # of a single operating point, mirroring "Run Mission (JSON)" in the GUI.
     if getattr(args, "mission", None):
         mission = _load_mission_or_exit(args.mission)
-        # CLI flags act as defaults for any phase that does not set its own.
-        mission.reserve_percent      = float(args.reserve_percent)
-        mission.rth_reserve_Wh       = float(args.rth_reserve_Wh)
-        mission.diversion_reserve_Wh = float(args.diversion_reserve_Wh)
-        mission.wind_direction_deg   = float(args.wind_direction_deg)
+        # CLI flags act as defaults for anything the mission file does not
+        # set. Its own mission-level settings stand unless a flag was
+        # actually typed: the flags' defaults used to replace them (audit B1).
+        _explicit = core.cli_explicit_dests(parser)
+        for _name in ("reserve_percent", "rth_reserve_Wh", "diversion_reserve_Wh",
+                      "wind_direction_deg"):
+            if _name in _explicit:
+                setattr(mission, _name, float(getattr(args, _name)))
         for _p in mission.phases:
-            _p.bank_deg   = float(_p.bank_deg   if _p.bank_deg   else args.bank_deg)
-            _p.course_deg = float(_p.course_deg if _p.course_deg else args.course_deg)
+            _p.bank_deg   = float(_p.bank_deg if (_p.bank_given or _p.bank_deg)
+                                  else args.bank_deg)
+            _p.course_deg = float(_p.course_deg if (_p.course_given or _p.course_deg)
+                                  else args.course_deg)
             if _p.climb_rate_mps is None:
                 _p.climb_rate_mps = float(args.climb_rate_mps)
             if _p.descent_rate_mps is None:

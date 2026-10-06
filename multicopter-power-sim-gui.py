@@ -1004,6 +1004,10 @@ class MissionPhase:
     # different amounts because the presented silhouette differs, and without
     # a per-phase value the mission could not express the difference at all.
     translation_direction_deg: Optional[float] = None
+    # Whether the mission file gave this leg a course. A course of 0 deg
+    # (north) is a real course, and was replaced by the default course
+    # because the fill tested the value's truthiness (audit B2).
+    course_given: bool = False
 
 
 class MissionProfile:
@@ -1049,6 +1053,7 @@ class MissionProfile:
                                            if "translation_direction_deg" in p
                                            else (float(p["translation_direction"])
                                                  if "translation_direction" in p else None)),
+                course_given=("course_deg" in p),
             ))
         return MissionProfile(
             phases,
@@ -8060,7 +8065,8 @@ def launch_gui():
             mission.max_decel_mps2 = parse_float("Max decel", v_max_decel_mps2.get())
             mission.decel_regen_eff = parse_float("Decel regen efficiency", v_decel_regen_eff.get())
             for _p in mission.phases:
-                _p.course_deg = float(_p.course_deg if _p.course_deg else course_deg)
+                _p.course_deg = float(_p.course_deg if (_p.course_given or _p.course_deg)
+                                      else course_deg)
                 if _p.climb_rate_mps is None:
                     _p.climb_rate_mps = climb_rate
                 if _p.descent_rate_mps is None:
@@ -8753,16 +8759,18 @@ def main():
 
     if args.mission:
         mission = _load_mission_or_exit(args.mission)
-        mission.reserve_percent = float(args.reserve_percent)
-        mission.rth_reserve_Wh = float(args.rth_reserve_Wh)
-        mission.diversion_reserve_Wh = float(args.diversion_reserve_Wh)
-        mission.wind_direction_deg = float(args.wind_direction_deg)
-        mission.transient_dt_s = float(args.transient_dt_s)
-        mission.max_accel_mps2 = float(args.max_accel_mps2)
-        mission.max_decel_mps2 = float(args.max_decel_mps2)
-        mission.decel_regen_eff = float(args.decel_regen_eff)
+        # The mission file's own settings stand unless a flag was actually
+        # typed: the flags' defaults used to replace them, so a mission was
+        # not flown as written (audit B1).
+        _explicit = core.cli_explicit_dests(parser)
+        for _name in ("reserve_percent", "rth_reserve_Wh", "diversion_reserve_Wh",
+                      "wind_direction_deg", "transient_dt_s", "max_accel_mps2",
+                      "max_decel_mps2", "decel_regen_eff"):
+            if _name in _explicit:
+                setattr(mission, _name, float(getattr(args, _name)))
         for _p in mission.phases:
-            _p.course_deg = float(_p.course_deg if _p.course_deg else args.course_deg)
+            _p.course_deg = float(_p.course_deg if (_p.course_given or _p.course_deg)
+                                  else args.course_deg)
             if _p.climb_rate_mps is None:
                 _p.climb_rate_mps = float(args.climb_rate_mps)
             if _p.descent_rate_mps is None:

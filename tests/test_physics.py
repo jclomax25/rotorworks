@@ -9,6 +9,7 @@ rather than just "test_foo failed".
 from __future__ import annotations
 
 import os
+import sys
 import math
 
 import pytest
@@ -2397,3 +2398,69 @@ def test_mc_phase_boundaries_carry_a_real_electrical_state(mc, paths):
         assert s["t_s"][i] < s["t_s"][i + 1]
     assert s["altitude_m"][starts[0]] == 0.0
     assert len({len(v) for v in s.values()}) == 1
+
+
+# ----------------------------------------------------------------------
+# Audit B1 and B2: with --mission, the CLIs replaced the mission file's
+# reserves, wind direction and transient limits with their flags'
+# defaults, and treated an explicit 0 deg course (or bank) as unset.
+# ----------------------------------------------------------------------
+
+class _StopAtMission(Exception):
+    pass
+
+
+def _cli_mission(mod, entry, monkeypatch, argv):
+    captured = {}
+
+    def fake(cfg, mission, *a, **k):
+        captured["mission"] = mission
+        raise _StopAtMission
+
+    monkeypatch.setattr(mod, entry, fake)
+    monkeypatch.setattr(sys, "argv", ["sim"] + argv)
+    with pytest.raises(_StopAtMission):
+        mod.main()
+    return captured["mission"]
+
+
+def _mission_json(tmp_path, payload):
+    import json
+    path = tmp_path / "mission.json"
+    path.write_text(json.dumps(payload))
+    return str(path)
+
+
+def test_mc_cli_flies_the_mission_file_as_written(mc, tmp_path, monkeypatch):
+    from test_cli import MC_BASE
+    path = _mission_json(tmp_path, {
+        "reserve_percent": 35, "wind_direction_deg": 270, "max_accel_mps2": 0.8,
+        "phases": [
+            {"name": "North", "speed": 10, "duration": 30, "altitude": 20, "course_deg": 0},
+            {"name": "Unset", "speed": 10, "duration": 30, "altitude": 20}]})
+    mission = _cli_mission(mc, "simulate_mission", monkeypatch, MC_BASE + [
+        "--mission", path, "--course_deg", "90", "--max_decel_mps2", "1.1"])
+    assert mission.reserve_percent == 35.0
+    assert mission.wind_direction_deg == 270.0
+    assert mission.max_accel_mps2 == 0.8
+    assert mission.max_decel_mps2 == 1.1          # typed, so it applies
+    assert mission.phases[0].course_deg == 0.0    # north stays north
+    assert mission.phases[1].course_deg == 90.0   # unset takes the flag
+
+
+def test_fw_cli_flies_the_mission_file_as_written(fw, tmp_path, monkeypatch):
+    from test_cli import FW_BASE
+    path = _mission_json(tmp_path, {
+        "reserve_percent": 35, "wind_direction_deg": 270,
+        "phases": [
+            {"name": "Level north", "speed": 18, "duration": 60, "altitude": 120,
+             "course_deg": 0, "bank_deg": 0},
+            {"name": "Unset", "speed": 18, "duration": 60, "altitude": 120}]})
+    mission = _cli_mission(fw, "simulate_fw_mission", monkeypatch, FW_BASE + [
+        "--mission", path, "--course_deg", "90", "--bank_deg", "20",
+        "--rth_reserve_Wh", "5"])
+    assert mission.reserve_percent == 35.0
+    assert mission.wind_direction_deg == 270.0
+    assert mission.rth_reserve_Wh == 5.0
+    assert (mission.phases[0].course_deg, mission.phases[0].bank_deg) == (0.0, 0.0)
+    assert (mission.phases[1].course_deg, mission.phases[1].bank_deg) == (90.0, 20.0)

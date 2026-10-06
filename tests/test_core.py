@@ -292,6 +292,20 @@ def test_constant_power_solve_reports_an_overload(core):
     assert core.solve_pack_for_power(pack, 0.0) == (pytest.approx(ocv), 0.0, True)
 
 
+def test_cli_explicit_dests_sees_typed_flags_only(core):
+    """Audit B1: a typed flag counts even when it equals the default."""
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--reserve_percent", type=float, default=20.0)
+    parser.add_argument("--wind_direction_deg", type=float, default=0.0)
+    parser.add_argument("--gui", action="store_true")
+    assert core.cli_explicit_dests(parser, ["--reserve_percent", "20"]) == {"reserve_percent"}
+    assert core.cli_explicit_dests(parser, []) == set()
+    assert core.cli_explicit_dests(parser, ["--gui"]) == {"gui"}
+    # The parser's own defaults are untouched afterwards.
+    assert parser.parse_args([]).reserve_percent == 20.0
+
+
 def test_usable_soc_maps_onto_the_cell_curve(core):
     """Audit C2: missions track usable-energy SoC, the curves span the full
     cell capacity. With 80% usable, usable 0.0 is the cell's 0.2."""

@@ -102,13 +102,38 @@ __all__ = [
     # GUI
     "Tooltip",
     # console
-    "make_console_safe",
+    "make_console_safe", "cli_explicit_dests",
 ]
 
 
 # ============================================================
 # CONSOLE
 # ============================================================
+
+def cli_explicit_dests(parser, argv=None) -> set:
+    """
+    The argparse destinations the command line actually set.
+
+    A parsed namespace cannot tell a typed value from a default, so a mission
+    file's reserve, wind direction or acceleration limit used to be replaced
+    by whatever default the flag carried (audit B1). This re-parses the same
+    arguments with every default swapped for a sentinel: whatever comes back
+    as something else was given explicitly, including a value equal to the
+    default.
+    """
+    sentinel = object()
+    saved = [(action, action.default) for action in parser._actions]
+    try:
+        for action, _default in saved:
+            if action.dest != "help":
+                action.default = sentinel
+        namespace, _unknown = parser.parse_known_args(
+            sys.argv[1:] if argv is None else list(argv))
+    finally:
+        for action, default in saved:
+            action.default = default
+    return {dest for dest, value in vars(namespace).items() if value is not sentinel}
+
 
 def make_console_safe() -> None:
     """
