@@ -7324,11 +7324,12 @@ def launch_gui(args=None) -> None:
             return
         try:
             from reportlab.lib.pagesizes import A4
-            from reportlab.lib.styles import getSampleStyleSheet
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
             from reportlab.lib.units import mm
             from reportlab.lib import colors
             from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
                                             Table, TableStyle, Image, PageBreak)
+            from xml.sax.saxutils import escape as _xml_escape
         except ImportError:
             messagebox.showerror(
                 "Report failed",
@@ -7343,6 +7344,29 @@ def launch_gui(args=None) -> None:
 
         import tempfile
         styles = getSampleStyleSheet()
+        cell_style = ParagraphStyle("vtol_cell", parent=styles["Normal"],
+                                    fontSize=7, leading=8.5)
+        head_style = ParagraphStyle("vtol_head", parent=cell_style,
+                                    fontName="Helvetica-Bold", textColor=colors.white)
+        margin = 15 * mm
+        frame_w = A4[0] - 2 * margin
+        frame_h = A4[1] - 2 * margin
+
+        def _col_widths(headers, rows):
+            """Share the frame width by content length. Plain-string cells do
+            not wrap, so the three-column Metrics table used to run off both
+            edges of the page and lose its Metric and Value columns (audit E2)."""
+            weights = []
+            for j in range(len(headers)):
+                cells = [str(headers[j])] + [str(r[j]) for r in rows]
+                weights.append(min(max(max(len(c) for c in cells), 6), 60))
+            total = float(sum(weights)) or 1.0
+            return [frame_w * w / total for w in weights]
+
+        def _cells(row, style, n):
+            row = list(row) + [""] * (n - len(row))
+            return [Paragraph(_xml_escape(str(c)), style) for c in row[:n]]
+
         story = [Paragraph("VTOL Power Simulator report", styles["Title"]),
                  Paragraph(f"{cfg.config_type} &mdash; v{SIM_VERSION}", styles["Normal"]),
                  Paragraph(
@@ -7356,8 +7380,12 @@ def launch_gui(args=None) -> None:
                 if title == "Speed Sweep":
                     continue                    # a figure says it better
                 story.append(Paragraph(title, styles["Heading2"]))
-                data = [headers] + [[str(c) for c in r] for r in rows]
-                table = Table(data, repeatRows=1)
+                n_cols = len(headers)
+                rows = [list(r) + [""] * (n_cols - len(r)) for r in rows]
+                data = ([_cells(headers, head_style, n_cols)]
+                        + [_cells(r, cell_style, n_cols) for r in rows])
+                table = Table(data, repeatRows=1,
+                              colWidths=_col_widths(headers, rows))
                 table.setStyle(TableStyle([
                     ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1F3864")),
                     ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
@@ -7367,11 +7395,26 @@ def launch_gui(args=None) -> None:
                 story.append(table)
                 story.append(Spacer(1, 5 * mm))
 
+            def _on_screen(holder):
+                widget = holder.get("widget")
+                return (lambda: widget.figure) if widget is not None else None
+
             makers = [lambda: make_airframe_diagram_figure(cfg, figsize=(7, 5.8))]
-            if not _export_state["from_mission"] and _export_state.get("metrics"):
-                makers.append(lambda: make_motor_figure(
-                    cfg, _export_state["metrics"], (10, 4.2 * (1 if uses_vectored_thrust(cfg) else 2))))
+            if not _export_state["from_mission"]:
+                # The speed sweep is skipped as a table above because this
+                # figure carries it; the figure itself was never added
+                # (audit E3).
+                makers.append(_on_screen(_canvas))
+                if _export_state.get("metrics"):
+                    makers.append(lambda: make_motor_figure(
+                        cfg, _export_state["metrics"],
+                        (10, 4.2 * (1 if uses_vectored_thrust(cfg) else 2))))
+            else:
+                makers.append(_on_screen(_md_canvas))
+                makers.append(_on_screen(_mplot_canvas))
             for maker in makers:
+                if maker is None:
+                    continue
                 try:
                     fig = maker()
                 except Exception:
@@ -7380,11 +7423,17 @@ def launch_gui(args=None) -> None:
                 handle.close()
                 fig.savefig(handle.name, dpi=130, bbox_inches="tight")
                 temp_files.append(handle.name)
+                w_in, h_in = fig.get_size_inches()
+                width = frame_w
+                height = width * h_in / max(w_in, 1e-6)
+                if height > frame_h - 10 * mm:
+                    height = frame_h - 10 * mm
+                    width = height * w_in / max(h_in, 1e-6)
                 story.append(PageBreak())
-                story.append(Image(handle.name, width=170 * mm, height=130 * mm,
-                                   kind="proportional"))
+                story.append(Image(handle.name, width=width, height=height))
 
-            SimpleDocTemplate(path, pagesize=A4).build(story)
+            SimpleDocTemplate(path, pagesize=A4, leftMargin=margin, rightMargin=margin,
+                              topMargin=margin, bottomMargin=margin).build(story)
             messagebox.showinfo("Report", f"Written to {os.path.basename(path)}")
         except Exception as exc:
             messagebox.showerror("Report failed", str(exc))

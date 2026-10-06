@@ -4497,3 +4497,73 @@ def test_vtol_takeoff_roll_matches_raymer_at_the_textbook_lift_off(vtol):
     net = vtol.forward_thrust_available_N(cfg, 0.707 * v_lof) - cfg.mu_roll * w
     raymer = 1.44 * w ** 2 / (vtol.G0 * cfg.air_density * cfg.wing_area_m2 * cfg.CL_max * net)
     assert vtol.takeoff_roll_m(cfg) == pytest.approx(raymer, rel=1e-6)
+
+
+# ----------------------------------------------------------------------
+# Audit E2 and E3: the report built its tables from plain strings with no
+# column widths, so the Metrics and Status tables ran off both edges of A4
+# and lost their Metric and Value columns; and it never added the
+# performance figure that its skipped Speed Sweep table defers to.
+# ----------------------------------------------------------------------
+
+def _capture_report(gui, tmp_path, monkeypatch):
+    import tkinter.filedialog as filedialog
+    import matplotlib.figure
+    from reportlab.platypus import SimpleDocTemplate, Table
+    from reportlab.lib.pagesizes import A4
+
+    stories, titles = [], []
+    real_build = SimpleDocTemplate.build
+    real_save = matplotlib.figure.Figure.savefig
+
+    def build(doc, story, *a, **k):
+        stories.append((doc, list(story)))
+        return real_build(doc, story, *a, **k)
+
+    def savefig(fig, *a, **k):
+        titles.append([fig._suptitle.get_text() if fig._suptitle else ""]
+                      + [ax.get_title() for ax in fig.axes])
+        return real_save(fig, *a, **k)
+
+    monkeypatch.setattr(SimpleDocTemplate, "build", build)
+    monkeypatch.setattr(matplotlib.figure.Figure, "savefig", savefig)
+    target = tmp_path / "report.pdf"
+    monkeypatch.setattr(filedialog, "asksaveasfilename", lambda *a, **k: str(target))
+    assert gui.click("Generate Report") == [f"INFO Written to {target.name}"]
+    assert target.exists() and target.stat().st_size > 0
+    doc, story = stories[-1]
+    frame_w = A4[0] - doc.leftMargin - doc.rightMargin
+    tables = [f for f in story if isinstance(f, Table)]
+    return frame_w, tables, [" | ".join(t) for t in titles]
+
+
+@pytest.mark.gui
+def test_report_tables_fit_the_page(gui, tmp_path, monkeypatch):
+    from reportlab.platypus import Paragraph
+    assert gui.click("Fixed Speed Sweep") == []
+    frame_w, tables, _titles = _capture_report(gui, tmp_path, monkeypatch)
+    assert tables, "no tables in the report"
+    for table in tables:
+        assert sum(table._colWidths) <= frame_w + 1e-6
+        for row in table._cellvalues:
+            for cell in row:
+                # reportlab stores a flowable cell as a tuple of flowables.
+                parts = cell if isinstance(cell, (list, tuple)) else [cell]
+                assert parts and all(isinstance(c, Paragraph) for c in parts), \
+                    "a cell cannot wrap"
+
+
+@pytest.mark.gui
+def test_report_carries_the_performance_figure(gui, tmp_path, monkeypatch):
+    assert gui.click("Fixed Speed Sweep") == []
+    _w, _t, titles = _capture_report(gui, tmp_path, monkeypatch)
+    assert any("Performance" in t for t in titles), titles
+
+
+@pytest.mark.gui
+def test_mission_report_carries_the_mission_diagram(gui, tmp_path, monkeypatch):
+    _load_mission(gui)
+    assert gui.click("Run Mission") == []
+    _w, _t, titles = _capture_report(gui, tmp_path, monkeypatch)
+    assert any("Ground track" in t for t in titles), titles
+    assert not any("Performance" in t for t in titles), titles
