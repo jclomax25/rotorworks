@@ -864,3 +864,49 @@ def test_a_wired_config_round_trips_and_reaches_status(request, which, tmp_path)
                 "Battery connector current", "Battery connector voltage",
                 "Main lead loss"):
         assert row in text, f"{row!r} missing after a wired run"
+
+
+def test_fw_status_flags_a_temperature_below_ambient(fw, fw_gui, monkeypatch):
+    """Audit G5: only the upper limit was checked, so a diverged -827 C
+    motor temperature showed green as OK."""
+    real = fw.compute_metrics
+
+    def diverged(*a, **k):
+        m = real(*a, **k)
+        m["motor_temp_est_C"] = -827.4
+        return m
+
+    monkeypatch.setattr(fw, "compute_metrics", diverged)
+    assert fw_gui.click("Fixed Speed Sweep") == []
+    rows = [(tv.item(i, "values"), tv.item(i, "tags"))
+            for tv in fw_gui.refresh() if isinstance(tv, ttk.Treeview)
+            for i in tv.get_children()]
+    motor = [(v, t) for v, t in rows if v and str(v[0]) == "Motor temperature (est)"]
+    assert motor, "no motor temperature row"
+    values, tags = motor[0]
+    assert "bad" in tags, (values, tags)
+    assert "impossible" in str(values[3])
+
+
+def test_fw_metrics_auw_counts_the_payload_once(fw_gui, paths, monkeypatch):
+    """Audit F16: aircraft_weight_g already includes the payload; adding it
+    again showed 3,400 g against the 3,000 g the model flies."""
+    import tkinter.messagebox as mb
+    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: True)
+    fw_gui.set_open_dialog(os.path.join(paths["configs"], "fixedwing_2m_survey_4S.json"))
+    assert fw_gui.click("Load Config") == []
+    assert fw_gui.click("Fixed Speed Sweep") == []
+    tree = next(w for w in fw_gui.refresh() if isinstance(w, ttk.Treeview)
+                and [str(c) for c in w.cget("columns")] == ["metric", "value", "note"])
+
+    def walk(node=""):
+        for iid in tree.get_children(node):
+            yield tree.item(iid, "values")
+            yield from walk(iid)
+
+    rows = {str(v[0]): str(v[1]) for v in walk() if v}
+    auw = rows["All-Up Weight (AUW)"]
+    grams = float(auw.split()[0])
+    newtons = float(auw.split("(")[1].split()[0])
+    assert grams == pytest.approx(3000.0)
+    assert newtons == pytest.approx(grams / 1000.0 * 9.80665, rel=1e-3)

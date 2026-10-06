@@ -7291,9 +7291,17 @@ def launch_gui():
                  f"Measured from the loaded table over {_pc['points']} points "
                  f"(spread {_pc['c_t_spread']:.2f}x). T = C_T x rho x n^2 x D^4.")
             if _pc.get("c_p"):
-                _metrics_add("PConst (C_P)", f"{_pc['c_p']:.4f}",
-                     "Measured from the loaded table. P = C_P x rho x n^3 x D^5. "
-                     "Assumes the bench data was taken at sea level.")
+                if _pc.get("c_p_basis") == "shaft":
+                    _metrics_add("PConst (C_P)", f"{_pc['c_p']:.4f}",
+                         "From the table's measured torque, so it is the shaft "
+                         "coefficient. P = C_P x rho x n^3 x D^5. Assumes the bench "
+                         "data was taken at sea level.")
+                else:
+                    _metrics_add("PConst (C_P, electrical)", f"{_pc['c_p']:.4f}",
+                         "From the table's ELECTRICAL power, which includes the "
+                         "motor and ESC losses, so it is 1.2-1.4x the true shaft "
+                         "coefficient. A Torque column in the table gives the "
+                         "shaft value.")
         else:
             _ct_est = core.estimate_prop_thrust_coefficient(
                 drone.propeller.diameter_in, drone.propeller.pitch_in,

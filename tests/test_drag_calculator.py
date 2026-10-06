@@ -539,3 +539,12 @@ def test_detection_is_independent_of_winding_and_start_vertex(dc):
     square = [(0, 0), (10, 0), (10, 10), (0, 10)]
     assert not dc.polygon_self_intersects(list(reversed(square)))
     assert not dc.polygon_self_intersects(square[2:] + square[:2])
+
+
+def test_scale_tip_does_not_recommend_the_diagonal(paths):
+    """Audit D2: the tip said to use the motorbase (the diagonal between
+    opposite motors) as the scale, but a front or side photo of an X frame
+    shows the motors motorbase / sqrt(2) apart."""
+    text = open(paths["dragcalc"], encoding="utf-8").read()
+    assert "Use the motorbase (distance between opposite motors)" not in text
+    assert "motorbase / 1.414" in text

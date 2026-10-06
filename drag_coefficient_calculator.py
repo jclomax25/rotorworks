@@ -1452,8 +1452,12 @@ BODY DRAG WORKFLOW
 
 TIPS
 ----
-• Use the motorbase (distance between opposite motors)
-  as the scale reference — it's easy to measure accurately.
+• Use the distance between two motor centres that both lie
+  across the photo as the scale reference. On an X frame
+  seen from the front or side, the visible motors are
+  motorbase / 1.414 apart (motorbase = the DIAGONAL between
+  opposite motors). Entering the motorbase itself makes the
+  scale 29% low and the area 2x too large.
 • Include landing legs, camera mounts, and payload in
   the outline; exclude rotor blades.
 • A slightly over-estimated area is safer than under.

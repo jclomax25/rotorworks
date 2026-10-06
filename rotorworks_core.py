@@ -1144,16 +1144,22 @@ def estimate_prop_power_coefficient(c_t: float,
         P = C_P * rho * n^3 * D^5
 
     Derived from momentum theory rather than fitted separately, so the two
-    coefficients cannot drift into disagreement:
+    coefficients cannot drift into disagreement. Ideal hover power is
+    T^1.5 / sqrt(2 rho A) with A = pi D^2 / 4; in the propeller convention
+    (T = C_T rho n^2 D^4) that is
 
-        C_P_ideal = C_T^1.5 / sqrt(2)      (per unit disc area)
+        C_P_ideal = C_T^1.5 * sqrt(2 / pi)
 
     divided by a figure of merit for real losses. FM 0.65 is typical of a
     decent UAV propeller in hover; 0.75+ is a very good one.
+
+    The factor used to be 1/sqrt(2), the helicopter form, whose coefficients
+    are normalised by disc area and tip speed instead; mixed with propeller
+    coefficients it made C_P 11.4% low (audit C3).
     """
     ct = max(float(c_t), 1e-6)
     fm = min(max(float(figure_of_merit), 0.2), 0.95)
-    return (ct ** 1.5) / math.sqrt(2.0) / fm
+    return (ct ** 1.5) * math.sqrt(2.0 / math.pi) / fm
 
 
 def load_prop_table(path: str):
@@ -1292,8 +1298,16 @@ def derive_prop_coefficients_from_table(df, diameter_in: float,
     RPM column needed, since without a rotational speed there is no way to
     non-dimensionalise.
 
+    C_P describes the SHAFT power the propeller absorbs. A bench table's
+    Power_W is electrical, measured at the ESC input, so it includes the
+    motor's and ESC's losses; fitting C_P to it overstated the coefficient
+    by 1.2-1.4x (audit C4). Where the table has a measured torque column the
+    shaft power is torque x omega, which is what the fit now uses. Without
+    one, C_P falls back to the electrical power and `c_p_basis` says so.
+
     Returned keys:
         c_t, c_p        mean coefficients across the table
+        c_p_basis       "shaft" (from measured torque) or "electrical"
         c_t_spread      max/min ratio of the per-row C_T values; a well
                         behaved propeller stays near 1.0, and a large spread
                         means the fit is not describing a single regime
@@ -1309,7 +1323,9 @@ def derive_prop_coefficients_from_table(df, diameter_in: float,
     if d_m <= 0 or rho <= 0:
         return None
 
-    have_power = "Power_W" in df
+    torque_col = next((c for c in df.columns
+                       if str(c).strip().lower().startswith("torque")), None)
+    have_power = torque_col is not None or "Power_W" in df
     ct_values, cp_values = [], []
     for _, row in df.iterrows():
         try:
@@ -1323,7 +1339,10 @@ def derive_prop_coefficients_from_table(df, diameter_in: float,
         ct_values.append(thrust_N / (rho * n ** 2 * d_m ** 4))
         if have_power:
             try:
-                power_W = float(row["Power_W"])
+                if torque_col is not None:
+                    power_W = float(row[torque_col]) * 2.0 * math.pi * n
+                else:
+                    power_W = float(row["Power_W"])
             except (TypeError, ValueError):
                 continue
             if power_W > 0:
@@ -1336,6 +1355,7 @@ def derive_prop_coefficients_from_table(df, diameter_in: float,
     return {
         "c_t": c_t,
         "c_p": (sum(cp_values) / len(cp_values)) if cp_values else None,
+        "c_p_basis": "shaft" if torque_col is not None else "electrical",
         "c_t_spread": (max(ct_values) / max(min(ct_values), 1e-9)),
         "points": len(ct_values),
     }

@@ -908,3 +908,40 @@ def test_no_rotor_is_asked_to_pull_downward(core):
         _x_quad(core), 5.0, drag_N=50.0, translation_azimuth_deg=0.0,
         drag_height_above_cg_m=0.5)
     assert all(t >= 0.0 for t in thrusts)
+
+
+def test_power_coefficient_is_the_shaft_coefficient(core, mc):
+    """Audit C4: C_P was fitted to the table's Power_W, electrical power at
+    the ESC input. With a torque column it is the shaft coefficient."""
+    import math
+    prop = mc.PropellerConfig(diameter_in=22, pitch_in=7.2, max_rpm=0,
+                              max_thrust_g=9500, blades=2, weight_g=110,
+                              table_csv=_table_path("motor_prop_table.csv"))
+    fit = core.derive_prop_coefficients_from_table(prop.table, 22.0)
+    assert fit["c_p_basis"] == "shaft"
+    d = 22.0 * 0.0254
+    row = prop.table.iloc[len(prop.table) // 2]
+    n = float(row["RPM"]) / 60.0
+    shaft_cp = float(row["Torque_Nm"]) * 2 * math.pi * n / (1.225 * n ** 3 * d ** 5)
+    elec_cp = float(row["Power_W"]) / (1.225 * n ** 3 * d ** 5)
+    assert shaft_cp < elec_cp
+    assert fit["c_p"] == pytest.approx(shaft_cp, rel=0.25)
+    no_torque = prop.table.drop(columns=["Torque_Nm"])
+    fallback = core.derive_prop_coefficients_from_table(no_torque, 22.0)
+    assert fallback["c_p_basis"] == "electrical"
+    assert fallback["c_p"] > fit["c_p"]
+
+
+def test_power_coefficient_estimate_uses_the_propeller_convention(core):
+    """Audit C3: ideal C_P = C_T^1.5 * sqrt(2/pi) in T = C_T rho n^2 D^4."""
+    import math
+    c_t, fm = 0.08, 0.65
+    assert core.estimate_prop_power_coefficient(c_t, fm) == pytest.approx(
+        c_t ** 1.5 * math.sqrt(2.0 / math.pi) / fm)
+    # Check it against momentum theory directly: P = T^1.5 / sqrt(2 rho A).
+    rho, d, n = 1.225, 0.3, 100.0
+    t = c_t * rho * n ** 2 * d ** 4
+    p_ideal = t ** 1.5 / math.sqrt(2 * rho * math.pi * d * d / 4)
+    # (The figure of merit is capped at 0.95, so compare at that.)
+    assert core.estimate_prop_power_coefficient(c_t, 0.95) == pytest.approx(
+        p_ideal / 0.95 / (rho * n ** 3 * d ** 5), rel=1e-9)

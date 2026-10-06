@@ -6367,24 +6367,34 @@ def launch_gui():
         _lim_esc   = _limit_value("esc_temp_limit", 90.0)
         _lim_batt  = _limit_value("batt_temp_limit", 55.0)
 
+        _ambient = float(m.get("ambient_temp_C", 25.0))
+
+        def _thermal_row(name, temp, limit, note):
+            # The lumped model has no cooling below ambient, so it cannot
+            # legitimately read under it. Only the upper limit used to be
+            # checked, and a diverged -827 C motor showed green as OK
+            # (audit G5).
+            if temp < _ambient - 0.5:
+                _ins_row(motor_tv, name, f"{temp:.1f} °C",
+                         f"{_ambient:.0f} to {limit:.0f} °C", "bad",
+                         f"Below the {_ambient:.0f} °C ambient, which is "
+                         f"physically impossible: the thermal estimate has failed.")
+            else:
+                _ins_row(motor_tv, name, f"{temp:.1f} °C", f"<= {limit:.0f} °C",
+                         _classify(temp, limit), note)
+
         if math.isfinite(T_motor):
-            _ins_row(motor_tv, "Motor temperature (est)",
-                     f"{T_motor:.1f} °C", f"<= {_lim_motor:.0f} °C",
-                     _classify(T_motor, _lim_motor),
-                     f"Headroom: {_lim_motor - T_motor:.1f} °C. Above this the "
-                     f"magnets weaken and the insulation degrades.")
+            _thermal_row("Motor temperature (est)", T_motor, _lim_motor,
+                         f"Headroom: {_lim_motor - T_motor:.1f} °C. Above this the "
+                         f"magnets weaken and the insulation degrades.")
         if math.isfinite(T_esc):
-            _ins_row(motor_tv, "ESC temperature (est)",
-                     f"{T_esc:.1f} °C", f"<= {_lim_esc:.0f} °C",
-                     _classify(T_esc, _lim_esc),
-                     f"Headroom: {_lim_esc - T_esc:.1f} °C. ESCs run hot "
-                     f"because they sit in still air inside the fuselage.")
+            _thermal_row("ESC temperature (est)", T_esc, _lim_esc,
+                         f"Headroom: {_lim_esc - T_esc:.1f} °C. ESCs run hot "
+                         f"because they sit in still air inside the fuselage.")
         if math.isfinite(T_batt):
-            _ins_row(motor_tv, "Battery temperature (est)",
-                     f"{T_batt:.1f} °C", f"<= {_lim_batt:.0f} °C",
-                     _classify(T_batt, _lim_batt),
-                     f"Headroom: {_lim_batt - T_batt:.1f} °C. Cells age far "
-                     f"faster hot, so this is a longevity limit too.")
+            _thermal_row("Battery temperature (est)", T_batt, _lim_batt,
+                         f"Headroom: {_lim_batt - T_batt:.1f} °C. Cells age far "
+                         f"faster hot, so this is a longevity limit too.")
 
         # #28 motor current and power against BOTH ratings, with duration.
         _motor_time = _limit_value("motor_max_time_s", None)
@@ -6685,7 +6695,10 @@ def launch_gui():
 
         # ── Aircraft ─────────────────────────────────────────────────────
         _sep_metric("Aircraft")
-        _auw_g = float(cfg.aircraft_weight_g) + float(getattr(cfg, "payload_mass_g", 0.0) or 0.0)
+        # aircraft_weight_g already includes the payload (FixedWingConfig adds
+        # it); adding it again showed 3,400 g against a 3,000 g weight budget
+        # and skewed both mass fractions (audit F16).
+        _auw_g = float(cfg.aircraft_weight_g)
         _pay_g = float(getattr(cfg, "payload_mass_g", 0.0) or 0.0)
         _batt_g = float(getattr(cfg.battery, "weight_g", 0.0) or 0.0)
         _drive_g = (float(getattr(cfg.motor, "weight_g", 0.0) or 0.0)
@@ -6848,9 +6861,17 @@ def launch_gui():
                  f"Measured from the loaded table over {_pc['points']} points "
                  f"(spread {_pc['c_t_spread']:.2f}x). T = C_T x rho x n^2 x D^4.")
             if _pc.get("c_p"):
-                _ins_metric("PConst (C_P)", f"{_pc['c_p']:.4f}",
-                     "Measured from the loaded table. P = C_P x rho x n^3 x D^5. "
-                     "Assumes the bench data was taken at sea level.")
+                if _pc.get("c_p_basis") == "shaft":
+                    _ins_metric("PConst (C_P)", f"{_pc['c_p']:.4f}",
+                         "From the table's measured torque, so it is the shaft "
+                         "coefficient. P = C_P x rho x n^3 x D^5. Assumes the bench "
+                         "data was taken at sea level.")
+                else:
+                    _ins_metric("PConst (C_P, electrical)", f"{_pc['c_p']:.4f}",
+                         "From the table's ELECTRICAL power, which includes the "
+                         "motor and ESC losses, so it is 1.2-1.4x the true shaft "
+                         "coefficient. A Torque column in the table gives the "
+                         "shaft value.")
         else:
             _ct_est = core.estimate_prop_thrust_coefficient(
                 cfg.propeller.diameter_in, cfg.propeller.pitch_in,
