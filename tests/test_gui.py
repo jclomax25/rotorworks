@@ -305,6 +305,99 @@ def _run_missions(gui, paths, cfg_prefix, mission_prefix):
         assert not errs, f"{os.path.basename(mission)}: {errs[0][:200]}"
 
 
+def _browse_mission(gui, mission_path):
+    """Set the mission file through the Mission tab's own Browse button."""
+    gui.set_open_dialog(mission_path)
+    for nb in [w for w in gui.refresh() if isinstance(w, ttk.Notebook)]:
+        for tab in nb.tabs():
+            if "mission" not in str(nb.tab(tab, "text")).lower():
+                continue
+            for w in gui._walk(gui.root.nametowidget(tab), []):
+                if isinstance(w, ttk.Button) and "browse" in str(w.cget("text")).lower():
+                    w.invoke()
+                    gui.pump()
+                    return
+    raise AssertionError("no Browse button on a Mission tab")
+
+
+@pytest.mark.parametrize("which,first,second,mission,old_tag,new_tag", [
+    ("mc", "multicopter_450_survey_4S.json", "multicopter_7in_longrange_6S.json",
+     "mc_02_takeoff_square_land.json", "10 in props", "7 in props"),
+    ("fw", "fixedwing_2m_survey_4S.json", "fixedwing_3m_endurance_6S_liion.json",
+     "fw_01_takeoff_cruise_land.json", "12 in props", "14 in props"),
+])
+def test_mission_report_shows_the_aircraft_that_flew(request, which, first, second,
+                                                     mission, old_tag, new_tag,
+                                                     paths, monkeypatch, tmp_path):
+    """
+    Audit E1: after a fixed-speed run on one aircraft and a mission on
+    another, the report embedded the first aircraft's sweep and airframe
+    drawing, and never the mission's own diagram.
+    """
+    import tkinter.messagebox as mb
+    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: True)
+    mod = request.getfixturevalue(which)
+    captured = {}
+    monkeypatch.setattr(mod, "_generate_pdf_report", lambda **kw: captured.update(kw))
+    gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
+
+    gui.set_open_dialog(os.path.join(paths["configs"], first))
+    assert gui.click("Load Config") == []
+    assert gui.click("Fixed Speed Sweep") == []
+    gui.set_open_dialog(os.path.join(paths["configs"], second))
+    assert gui.click("Load Config") == []
+    _browse_mission(gui, os.path.join(paths["missions"], mission))
+    assert gui.click("Run Mission") == []
+    gui.set_save_dialog(str(tmp_path / "report.pdf"))
+    assert gui.click("Generate Report") == []
+
+    titles = []
+    for fig in captured["figures"]:
+        if fig._suptitle is not None:
+            titles.append(fig._suptitle.get_text())
+        titles += [ax.get_title() for ax in fig.axes]
+    joined = " | ".join(titles)
+    assert new_tag in joined, joined
+    assert old_tag not in joined, joined
+    assert "Performance" not in joined, "a mission report embedded a fixed-speed sweep"
+    assert "Ground track" in joined, "the mission diagram is missing"
+
+
+@pytest.mark.parametrize("which,cfg,mission", [
+    ("mc", "multicopter_450_survey_4S.json", "mc_02_takeoff_square_land.json"),
+    ("fw", "fixedwing_2m_survey_4S.json", "fw_01_takeoff_cruise_land.json"),
+])
+def test_point_report_drops_an_earlier_mission_plot(request, which, cfg, mission,
+                                                    paths, monkeypatch, tmp_path):
+    """The reverse of audit E1: a mission plot drawn earlier must not ride
+    along into a fixed-speed run's report."""
+    import tkinter.messagebox as mb
+    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: True)
+    mod = request.getfixturevalue(which)
+    captured = {}
+    monkeypatch.setattr(mod, "_generate_pdf_report", lambda **kw: captured.update(kw))
+    gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
+
+    gui.set_open_dialog(os.path.join(paths["configs"], cfg))
+    assert gui.click("Load Config") == []
+    _browse_mission(gui, os.path.join(paths["missions"], mission))
+    assert gui.click("Run Mission") == []
+    listbox = [w for w in gui.refresh() if isinstance(w, tk.Listbox)][0]
+    listbox.selection_set(1)
+    gui.buttons = {str(w.cget("text")): w for w in gui.widgets if isinstance(w, ttk.Button)}
+    assert gui.click("Plot selected") == []
+    assert gui.click("Fixed Speed Sweep") == []
+    gui.set_save_dialog(str(tmp_path / "report.pdf"))
+    assert gui.click("Generate Report") == []
+
+    titles = [f._suptitle.get_text() for f in captured["figures"] if f._suptitle is not None]
+    titles += [ax.get_title() for f in captured["figures"] for ax in f.axes]
+    joined = " | ".join(titles)
+    assert "Mission variables" not in joined, joined
+    assert "Ground track" not in joined, joined
+    assert "Performance" in joined
+
+
 def test_every_multicopter_mission_runs(mc_gui, paths):
     _run_missions(mc_gui, paths, "multicopter", "mc")
 

@@ -7419,6 +7419,11 @@ def launch_gui():
                                                          padx=20, pady=40)
 
     def _clear_fixed_speed_plots():
+        # The figures go with the widgets. Generate Report reads this list,
+        # and a mission report used to embed the sweep of whatever ran
+        # before it, possibly another aircraft (audit E1).
+        _plot_canvases.clear()
+        _current_plot_figs.clear()
         _show_plot_placeholder(
             plot_inner,
             "These plots come from a fixed speed sweep.\n\n"
@@ -7426,6 +7431,8 @@ def launch_gui():
             "Press \u25b6 Run Fixed Speed Sweep to build them.")
 
     def _clear_mission_plots_panel():
+        # Likewise: a point-run report must not embed an earlier mission plot.
+        mission_canvas_ref[0] = None
         _show_plot_placeholder(
             mission_plot_frame,
             "These plots come from a mission run.\n\n"
@@ -8097,6 +8104,13 @@ def launch_gui():
             refresh_comparison()
             _last_run_cfg[0] = drone
             update_weight_budget(drone)
+            # The airframe drawing and per-rotor table follow the aircraft
+            # that flew the mission, not the last fixed-speed run (audit E1).
+            # The table shows the mission's last instant, as Metrics does.
+            _refresh_airframe_diagram(drone)
+            _inst = (worst_metrics or {}).get("_last_instant") or {}
+            if _inst:
+                _refresh_rotor_loading(drone, _inst)
             # #17 A mission produces no fixed-speed sweep, so that tab stays
             # empty with a note. Drawing the sweep here anyway would imply the
             # mission generated it.
@@ -8343,6 +8357,11 @@ def launch_gui():
             figs.extend(_current_plot_figs)
             if mission_canvas_ref[0] is not None:
                 figs.append(mission_canvas_ref[0].figure)
+            # The Mission Diagram, drawn by every mission run and cleared by a
+            # fixed-speed run, so it is present exactly when a mission is.
+            _md = _md_canvas.get("widget")
+            if _md is not None and _md.figure not in figs:
+                figs.append(_md.figure)
             for num in plt.get_fignums():
                 fig = plt.figure(num)
                 if fig not in figs:
