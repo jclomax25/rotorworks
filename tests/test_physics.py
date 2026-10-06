@@ -2372,3 +2372,28 @@ def test_fw_takeoff_roll_is_the_kinematic_roll_to_lift_off(fw, fw_plane):
     v_lof = math.sqrt(2.0 * w / (rho * af.wing_area_m2 * af.CL_takeoff))
     accel = (fw.thrust_available_N(fw_plane, 0.707 * v_lof) - af.mu_roll * w) / (w / fw.G0)
     assert fw.takeoff_distance_m(fw_plane) == pytest.approx(v_lof ** 2 / (2.0 * accel), rel=1e-9)
+
+
+# ----------------------------------------------------------------------
+# Audit G11: each multicopter phase began with a "phase-start" row whose
+# electrical fields were 0, so voltage, current and power dropped to zero
+# at every phase boundary on Mission Plots and in the exports.
+# ----------------------------------------------------------------------
+
+def test_mc_phase_boundaries_carry_a_real_electrical_state(mc, paths):
+    drone = _heavy_lift(mc)
+    mission = mc.MissionProfile.from_json(
+        os.path.join(paths["missions"], "mc_02_takeoff_square_land.json"))
+    _results, _worst, s = mc.simulate_mission(drone, mission)
+    starts = [i for i, kind in enumerate(s["segment_type"]) if kind == "phase-start"]
+    assert len(starts) == len(mission.phases)
+    for key in ("battery_voltage_V", "battery_current_A", "total_power_W",
+                "motor_power_W", "thrust_total_N"):
+        assert min(s[key]) > 0, f"{key} drops to zero"
+    for i in starts:
+        # The boundary takes the new phase's first instant ...
+        assert s["total_power_W"][i] == s["total_power_W"][i + 1]
+        # ... but keeps what it knows itself.
+        assert s["t_s"][i] < s["t_s"][i + 1]
+    assert s["altitude_m"][starts[0]] == 0.0
+    assert len({len(v) for v in s.values()}) == 1

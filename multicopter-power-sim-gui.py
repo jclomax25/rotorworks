@@ -2305,6 +2305,32 @@ def simulate_mission(config: DroneConfig,
     t_s = 0.0
     dist_km = 0.0
 
+    # A "phase-start" row marks each boundary, but it is written before the
+    # phase computes any operating point, so its electrical fields were 0:
+    # voltage, current and power dropped to zero at every phase boundary on
+    # Mission Plots and in the exports (audit G11). Those fields are filled
+    # from the phase's first computed instant instead; the fields the row
+    # does know (time, distance, altitude, commands, energy, temperatures)
+    # are kept.
+    _START_KNOWN = {
+        't_s', 'phase', 'segment_type', 'airspeed_mps', 'commanded_airspeed_mps',
+        'accel_mps2', 'groundspeed_mps', 'headwind_mps', 'crosswind_mps',
+        'distance_km', 'altitude_m', 'climb_rate_cmd_mps', 'descent_rate_cmd_mps',
+        'battery_energy_Wh', 'battery_soc_frac', 'battery_soc_percent',
+        'reserve_target_Wh', 'reserve_margin_Wh', 'reserve_breach',
+        'battery_capacity_mAh', 'motor_temp_est_C', 'esc_temp_est_C',
+        'battery_temp_est_C'}
+    _pending_start = [None]     # index of a phase-start row awaiting its state
+
+    def _fill_phase_start(source_idx: int):
+        idx = _pending_start[0]
+        _pending_start[0] = None
+        if idx is None or source_idx < 0:
+            return
+        for key, values in mission_series.items():
+            if key not in _START_KNOWN and len(values) > max(idx, source_idx):
+                values[idx] = values[source_idx]
+
     def _append_point(phase_name: str,
                       phase_alt_m: float,
                       segment_type: str,
@@ -2313,6 +2339,9 @@ def simulate_mission(config: DroneConfig,
                       dist_km_now: float,
                       remaining_wh_now: float,
                       reserve_hit: bool):
+        if segment_type == "phase-start" and _pending_start[0] is not None:
+            # The previous phase computed nothing: carry the last state on.
+            _fill_phase_start(_pending_start[0] - 1)
         mission_series['t_s'].append(float(t_s_now))
         mission_series['phase'].append(str(phase_name))
         mission_series['segment_type'].append(str(segment_type))
@@ -2364,6 +2393,11 @@ def simulate_mission(config: DroneConfig,
         mission_series['thermal_status'].append(str(m.get('thermal_status', 'OK')))
         mission_series['hover_wind_resistance_mps'].append(float(m.get('hover_wind_resistance_mps', 0.0)))
         mission_series['prop_solidity_sigma'].append(float(m.get('prop_solidity_sigma', 0.0)))
+        last = len(mission_series['t_s']) - 1
+        if segment_type == "phase-start":
+            _pending_start[0] = last
+        elif _pending_start[0] is not None:
+            _fill_phase_start(last)
 
     def _merge_worst(worst: Optional[dict], m: dict) -> dict:
         if worst is None:
@@ -2750,6 +2784,9 @@ def simulate_mission(config: DroneConfig,
     # and the two tabs show one each.
     if worst_metrics is not None:
         worst_metrics["_last_instant"] = dict(last_instant_metrics or {})
+    if _pending_start[0] is not None:
+        # The last phase computed nothing: carry the previous state on.
+        _fill_phase_start(_pending_start[0] - 1)
     return results, worst_metrics, mission_series
 
 
