@@ -4567,3 +4567,37 @@ def test_mission_report_carries_the_mission_diagram(gui, tmp_path, monkeypatch):
     _w, _t, titles = _capture_report(gui, tmp_path, monkeypatch)
     assert any("Ground track" in t for t in titles), titles
     assert not any("Performance" in t for t in titles), titles
+
+
+# ----------------------------------------------------------------------
+# Audit A1: lift_rotor_positions placed n // 2 rotors per side and
+# truncated, so an odd count lost a rotor: three lift rotors were drawn,
+# and loaded in the Per-Rotor table, as two at 1.5x the model's thrust.
+# ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("config_type", ["lift+cruise", "tiltrotor"])
+@pytest.mark.parametrize("n", [1, 2, 3, 4, 5, 6])
+def test_every_lift_rotor_is_placed_and_loaded(vtol, config_type, n):
+    cfg = vtol.VTOLConfig(config_type=config_type)
+    cfg.num_lift_rotors = n
+    positions = vtol.lift_rotor_positions(cfg)
+    assert len(positions) == n
+    assert len(set(positions)) == n, "two rotors share a position"
+    assert sum(x for x, _y in positions) == pytest.approx(0.0, abs=1e-9)
+    if n % 2:
+        # The odd rotor sits on the centreline, where it puts the layout's
+        # centroid on the CG.
+        assert sum(y for _x, y in positions) == pytest.approx(0.0, abs=1e-9)
+    # Still air shares the load evenly, exactly as the power model assumes.
+    each = cfg.weight_N * (1.0 + vtol.hover_download_fraction(cfg)) / n
+    assert vtol.hover_rotor_thrusts(cfg) == pytest.approx([each] * n, rel=1e-6)
+
+
+def test_the_diagram_draws_every_lift_rotor(vtol):
+    cfg = vtol.VTOLConfig(config_type="lift+cruise")
+    cfg.num_lift_rotors = 3
+    fig = vtol.make_airframe_diagram_figure(cfg)
+    lift_discs = [p for p in fig.axes[0].patches
+                  if type(p).__name__ == "Circle"
+                  and abs(p.get_radius() - cfg.lift_prop_diameter_in * 0.0254 / 2) < 1e-9]
+    assert len(lift_discs) == 3

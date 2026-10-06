@@ -2134,7 +2134,7 @@ def lift_rotor_positions(cfg: VTOLConfig) -> List[Tuple[float, float]]:
     chord = max(float(cfg.wing_area_m2) / span, 1e-3)
     lift_r = float(cfg.lift_prop_diameter_in) * 0.0254 / 2.0
     n = max(int(cfg.num_lift_rotors), 1)
-    per_side = max(n // 2, 1)
+    per_side = n // 2
     positions = []
     if uses_vectored_thrust(cfg):
         for side in (-1, 1):
@@ -2148,7 +2148,15 @@ def lift_rotor_positions(cfg: VTOLConfig) -> List[Tuple[float, float]]:
                 fore = 1 if k % 2 == 0 else -1
                 offset = (k // 2 + 1) * (chord / 2.0 + lift_r * 1.15)
                 positions.append((side * boom_x, fore * offset))
-    return positions[:n]
+    if n % 2:
+        # An odd count puts one rotor on the centreline. It used to be
+        # dropped: three lift rotors were drawn, and loaded in the Per-Rotor
+        # table, as two (audit A1). It sits where the layout's centroid
+        # stays on the CG, so a still-air hover shares the load evenly as
+        # the model assumes: aft of a tri layout's front pair, or at the CG
+        # when the side rotors already balance.
+        positions.append((0.0, 0.0 - sum(y for _x, y in positions)))
+    return positions
 
 
 def hover_rotor_thrusts(cfg: VTOLConfig, wind_mps: float = 0.0,
@@ -2303,13 +2311,25 @@ def make_airframe_diagram_figure(cfg: VTOLConfig, figsize=(9, 7.5)):
         for x, y in positions:
             ax.plot([x, x], [0, y], color="#37474F", linewidth=3.0, zorder=1)
         ax.plot([-boom_x, boom_x], [0, 0], color="#37474F", linewidth=3.0, zorder=1)
+    else:
+        # A centreline rotor on a vectored type sits on a tail boom.
+        for x, y in positions:
+            if abs(x) < 1e-9 and abs(y) > chord / 2.0:
+                ax.plot([0, 0], [0, y], color="#37474F", linewidth=3.0, zorder=1)
 
     for idx, (x, y) in enumerate(positions[:n], start=1):
         ax.add_patch(_Circle((x, y), lift_r, fill=False, edgecolor="#2E7D32",
                              linewidth=1.3, zorder=3))
         ax.plot([x], [y], marker="o", markersize=4, color="#2E7D32", zorder=4)
-        ax.annotate(str(idx), (x, y), textcoords="offset points", xytext=(0, 8),
-                    ha="center", fontsize=8, fontweight="bold", color="#2E7D32")
+        # The number goes on the side away from the CG, where no boom runs:
+        # above the hub it sat on the boom of every aft rotor. A white
+        # backing keeps it clear of the disc outline.
+        ax.annotate(str(idx), (x, y), textcoords="offset points",
+                    xytext=(0, 8 if y >= 0 else -9),
+                    ha="center", va="bottom" if y >= 0 else "top",
+                    fontsize=8, fontweight="bold", color="#2E7D32",
+                    bbox=dict(boxstyle="round,pad=0.12", facecolor="white",
+                              edgecolor="none", alpha=0.85), zorder=5)
 
     if not vectored and cfg.num_cruise_motors > 0:
         cruise_r = float(cfg.cruise_prop_diameter_in) * 0.0254 / 2.0
