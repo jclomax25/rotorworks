@@ -633,7 +633,8 @@ commands, runway lengths, minimum climb rate, and hover tilt limits.
 | **Lift rotor table (CSV)** | Measured thrust/power replaces the figure-of-merit guess where the table covers the thrust |
 | **Cruise prop table (CSV)** | Same for the pusher; ignored for the vectored types, whose rotors do the cruising |
 | **SoC curve (CSV)** | A measured discharge curve outranks the chemistry preset |
-| **Max acceleration / deceleration** | Blank ignores transients and each leg starts at its commanded speed |
+| **Max acceleration / deceleration** | Blank uses 1.5 / 2.0 m/s², the fixed-wing's defaults. An unlimited acceleration put an unphysical power spike at every transition |
+| **Lift rotor positions** | Hub positions from the CG, `x,y; x,y; ...` in metres, one pair per rotor. Blank generates a layout, and the Airframe Diagram says the layout is assumed |
 | **Regen efficiency** | Fraction of braking energy recovered. 0 is the honest default for a fixed-pitch propeller |
 | **Motor Kv / Rm / I0** | Drive the motor model; Kv = 0 switches it off |
 | **Extra airframe drag** | Fuselage, booms or payload pod on top of CD0, as Cd·area or from box-body geometry. Blank adds nothing |
@@ -863,7 +864,8 @@ the same answer through each. `--help` lists every flag.
 | `--lift_prop_table`, `--cruise_prop_table` | CSV path | Measured thrust/power |
 | `--soc_curve` | CSV path | Measured pack discharge curve |
 | `--wind`, `--wind_direction` | m/s, degrees FROM | Wind for a mission |
-| `--max_accel`, `--max_decel` | m/s² | 0 ignores transients |
+| `--max_accel`, `--max_decel` | m/s² | 0 or omitted uses 1.5 / 2.0 |
+| `--lift_rotor_positions` | `x,y; ...` m | Lift rotor hubs from the CG; omitted generates a layout |
 | `--regen_eff` | 0–1 | Braking energy recovered; 0 is the honest default |
 | `--wire_length`, `--wire_awg`, `--wire_ohm_per_m` | m, AWG, Ω/m | Main battery lead |
 | `--wire_temp_limit` | °C | Lead insulation limit for the temperature check; default 150 |

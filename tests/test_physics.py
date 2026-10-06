@@ -2841,3 +2841,74 @@ def test_mc_mission_worst_case_merges_attitude_and_totals(mc, tmp_path):
     assert worst["mission_energy_Wh"] == pytest.approx(
         drone.battery.usable_Wh - s["battery_energy_Wh"][-1], rel=1e-9)
     assert worst["peak_motor_temp_C"] == pytest.approx(max(s["motor_temp_est_C"]), rel=1e-9)
+
+
+# ----------------------------------------------------------------------
+# Audit F5: Metrics reported the aerodynamic optimum speeds while
+# find_optimal_speeds reported the electrical ones.
+# ----------------------------------------------------------------------
+
+def test_fw_metrics_best_speeds_are_the_electrical_ones(fw, fw_plane):
+    m = fw.compute_metrics(fw_plane, 19.0)
+    v_be, t_be, v_br, d_br = fw.find_optimal_speeds(fw_plane)
+    assert m["best_endurance_speed_mps"] == pytest.approx(v_be, rel=1e-12)
+    assert m["best_range_speed_mps"] == pytest.approx(v_br, rel=1e-12)
+    # The electrical answer is the endurance actually reported at that speed.
+    assert fw.compute_metrics(fw_plane, v_be)["flight_time_min"] == pytest.approx(t_be, rel=1e-6)
+    for dv in (-0.5, 0.5):
+        assert fw.compute_metrics(fw_plane, v_be + dv)["flight_time_min"] <= t_be + 1e-9
+    # The aerodynamic optima are still reported, under their own names, and
+    # on this aircraft they differ from the electrical answer.
+    assert m["min_power_speed_mps"] < m["best_endurance_speed_mps"] - 0.5
+    assert m["best_ld_speed_mps"] > 0
+
+
+def test_fw_best_range_speed_rises_into_a_headwind(fw, fw_plane):
+    _be, _t, still, _d = fw.find_optimal_speeds(fw_plane)
+    _be, _t, head, _d = fw.find_optimal_speeds(fw_plane, wind_head_mps=6.0)
+    assert head > still
+    m = fw.compute_metrics(fw_plane, 19.0, wind_head_mps=6.0)
+    assert m["best_range_speed_mps"] == pytest.approx(head, rel=1e-12)
+
+
+# ----------------------------------------------------------------------
+# Audit F6: Kv-path static thrust used no-load RPM, C_T = 0.10 P/D and a
+# cap at PITCH speed (P_max / v_pitch).
+# ----------------------------------------------------------------------
+
+def test_fw_kv_static_thrust_uses_the_loaded_rpm_and_core_ct(fw, fw_plane):
+    fw_plane.motor.max_power = 1e6          # take the power cap out of play
+    prop = fw_plane.propeller
+    c_t = fw.core.estimate_prop_thrust_coefficient(prop.diameter_in, prop.pitch_in, prop.blades)
+    n = fw_plane.motor.kv * fw_plane.battery.vnom_pack * 0.85 / 60.0
+    expected = c_t * fw_plane.air_density * n * n * prop.diameter_m ** 4
+    assert fw.max_thrust_N(fw_plane) == pytest.approx(expected * fw_plane.num_motors, rel=1e-9)
+
+
+def test_fw_kv_static_thrust_cap_is_the_static_disc_bound(fw, fw_plane):
+    fw_plane.motor.max_power = 50.0
+    a = fw_plane.propeller.disk_area()
+    cap = (50.0 * math.sqrt(2 * fw_plane.air_density * a)) ** (2.0 / 3.0)
+    assert fw.max_thrust_N(fw_plane) == pytest.approx(cap * fw_plane.num_motors, rel=1e-9)
+
+
+# ----------------------------------------------------------------------
+# Audit F7: thrust available at speed used max power x a fixed 0.75, while
+# the power model used the bench table's measured efficiency.
+# ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("with_table", [True, False])
+def test_fw_thrust_available_spends_exactly_the_max_power(fw, fw_plane, with_table):
+    cfg = _fw_table_config(fw, _FW_TABLE_CSV) if with_table else fw_plane
+    p_max = fw.max_electrical_power_W(cfg)
+    for v in (15.0, 25.0):
+        t = fw.thrust_available_N(cfg, v)
+        if t < fw.max_thrust_N(cfg) * 0.999:
+            assert fw.motor_shaft_power_from_thrust(cfg, t, v) == pytest.approx(p_max, rel=1e-3)
+
+
+def test_fw_climb_power_stays_within_the_bench_maximum(fw):
+    cfg = _fw_table_config(fw, _FW_TABLE_CSV)
+    v_rc, _rc = fw.max_rate_of_climb_mps(cfg)
+    t = fw.thrust_available_N(cfg, v_rc)
+    assert fw.motor_shaft_power_from_thrust(cfg, t, v_rc) <= fw.max_electrical_power_W(cfg) * 1.001

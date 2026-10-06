@@ -618,6 +618,12 @@ class PropellerConfig:
         self._thrust_g_arr = self.table["Thrust_g"].to_numpy(dtype=float)
         if "Power_W" in self.table:
             self._power_w_arr = self.table["Power_W"].to_numpy(dtype=float)
+        # The same rows as plain lists, for _table_power_for_thrust, and the
+        # table they belong to, so a replaced table is never read stale.
+        self._thrust_g_list = self._thrust_g_arr.tolist()
+        self._power_w_list = (self._power_w_arr.tolist()
+                              if self._power_w_arr is not None else None)
+        self._arrays_table_id = id(self.table)
         if self._thrust_g_arr.size:
             self._thrust_g_min = float(self._thrust_g_arr.min())
             self._thrust_g_max = float(self._thrust_g_arr.max())
@@ -857,6 +863,11 @@ class FixedWingConfig:
 # ============================================================
 # PROPULSION PHYSICS
 # ============================================================
+# A loaded motor turns at roughly 85% of its no-load speed Kv x V (the VTOL
+# uses the same figure for its full-throttle thrust).
+KV_LOAD_FACTOR = 0.85
+
+
 def rpm_from_kv_and_throttle(motor: MotorConfig, v_pack: float, throttle: float = 1.0) -> float:
     """
     Approximate no-load RPM at a given throttle fraction:
@@ -869,17 +880,14 @@ def rpm_from_kv_and_throttle(motor: MotorConfig, v_pack: float, throttle: float 
 
 def prop_thrust_from_rpm(propeller: PropellerConfig, rpm: float, rho: float) -> float:
     """
-    Simple momentum-disk thrust estimate from RPM:
+    Static thrust from RPM:
 
         T = CT · ρ · n² · D⁴
 
-    where n = RPM/60 [rev/s] and CT is estimated from pitch ratio.
-
-    Approximation for a standard fixed-pitch prop:
-        CT ≈ 0.12 × (pitch/diameter) × (1 – advance_ratio)
-    clamped above zero.
-
-    If TConst is supplied, CT is taken directly from it.
+    where n = RPM/60 [rev/s]. CT is TConst when supplied, otherwise the
+    core's estimate calibrated against measured tables
+    (core.estimate_prop_thrust_coefficient), which the multicopter and VTOL
+    use too. The old 0.10 x pitch/D ran about 44% below it (audit F6).
     """
     if rpm <= 0:
         return 0.0
@@ -890,9 +898,8 @@ def prop_thrust_from_rpm(propeller: PropellerConfig, rpm: float, rho: float) -> 
     if propeller.TConst is not None:
         CT = float(propeller.TConst)
     else:
-        # Empirical estimate from pitch/diameter ratio
-        ratio = propeller.pitch_m / max(D, 1e-6)
-        CT = 0.10 * ratio            # rough approximation
+        CT = core.estimate_prop_thrust_coefficient(
+            propeller.diameter_in, propeller.pitch_in, propeller.blades)
 
     T = CT * rho * (n ** 2) * D4
     return max(T, 0.0)
@@ -932,11 +939,24 @@ def _table_power_for_thrust(df, thrust_N: float, prop_cache=None) -> Optional[fl
     last measured point rather than extrapolated, because a motor past its
     tested limit is not something to guess about.
     """
-    if df is None or "Thrust_g" not in df or "Power_W" not in df:
+    if df is None:
         return None
+    # The propeller's cached rows when they belong to this table: thrust
+    # available now solves the power model by bisection inside the climb and
+    # ceiling searches, and reading the DataFrame on every evaluation made a
+    # single metrics run take most of a second.
+    t_list = p_list = None
+    if prop_cache is not None and getattr(prop_cache, "_arrays_table_id", None) == id(df):
+        t_list = getattr(prop_cache, "_thrust_g_list", None)
+        p_list = getattr(prop_cache, "_power_w_list", None)
+    if not t_list or not p_list:
+        if "Thrust_g" not in df or "Power_W" not in df:
+            return None
+        t_list = df["Thrust_g"].values.tolist()
+        p_list = df["Power_W"].values.tolist()
     thrust_g = max(float(thrust_N), 0.0) * 1000.0 / G0
-    lo = float(df["Thrust_g"].iloc[0])
-    hi = float(df["Thrust_g"].iloc[-1])
+    lo = float(t_list[0])
+    hi = float(t_list[-1])
 
     if thrust_g < lo:
         # BELOW the measured range. A polynomial fitted to the measured band
@@ -958,13 +978,18 @@ def _table_power_for_thrust(df, thrust_N: float, prop_cache=None) -> Optional[fl
 
         # No usable fit (too few rows, or a negative fixed term): fall back to
         # pure momentum scaling anchored on the lowest measured point.
-        p_lo = float(df["Power_W"].iloc[0])
+        p_lo = float(p_list[0])
         if lo > 0 and p_lo > 0:
             return max(p_lo * (thrust_g / lo) ** 1.5, 1e-6)
         return p_lo
     if thrust_g >= hi:
-        return float(df["Power_W"].iloc[-1])
-    return float(_interp1d(df["Thrust_g"].values, df["Power_W"].values, thrust_g))
+        return float(p_list[-1])
+    import bisect
+    idx = max(1, min(bisect.bisect_left(t_list, thrust_g), len(t_list) - 1))
+    x0, x1 = t_list[idx - 1], t_list[idx]
+    y0, y1 = p_list[idx - 1], p_list[idx]
+    t = (thrust_g - x0) / (x1 - x0) if x1 != x0 else 0.0
+    return float(y0 + t * (y1 - y0))
 
 
 def motor_shaft_power_from_thrust(config: FixedWingConfig, thrust_N: float,
@@ -1194,12 +1219,16 @@ def max_thrust_N(config: FixedWingConfig) -> float:
     """
     Maximum static thrust available from the motor/prop system.
 
-    For KV-based model at full throttle (advance ratio = 0, static):
-        T_max = prop_thrust_from_rpm(RPM_max, rho)
-    where RPM_max = KV × V_nom_pack (conservative — full throttle at nominal V).
+    For the Kv model at full throttle (static, advance ratio 0):
+        RPM_max = Kv × V_nom_pack × 0.85
+        T_max   = CT · ρ · n² · D⁴              (prop_thrust_from_rpm)
+    The 0.85 is the speed a loaded motor reaches against its no-load
+    Kv x V, as in the VTOL.
 
-    Clamped by motor max power:
-        T_limited = min(T_max, P_max / V_pitch_speed)
+    Capped by what the motor's max power can make statically, the
+    actuator-disc bound  T = (P_max · sqrt(2ρA))^(2/3).
+    The cap used to be P_max / V_pitch, which is the thrust at PITCH speed,
+    not static, and the RPM ran at no load (audit F6).
     """
     motor = config.motor
     prop  = config.propeller
@@ -1213,17 +1242,12 @@ def max_thrust_N(config: FixedWingConfig) -> float:
         return float(max_g) * G0 / 1000.0 * config.num_motors
 
     if motor.kv is not None:
-        rpm_max = motor.kv * batt.vnom_pack
+        rpm_max = motor.kv * batt.vnom_pack * KV_LOAD_FACTOR
         T_ideal = prop_thrust_from_rpm(prop, rpm_max, rho)
-
-        # Limit by motor max power:
-        #   T = P_shaft / v_pitch_speed  (at full throttle pitch speed)
-        n_max        = rpm_max / 60.0
-        v_pitch      = prop.pitch_m * n_max      # pitch speed [m/s]
-        if v_pitch > 1.0:
-            T_pmax = motor.max_power / v_pitch
+        if getattr(motor, "max_power", None):
+            A = prop.disk_area()
+            T_pmax = (float(motor.max_power) * math.sqrt(2 * rho * A)) ** (2.0 / 3.0)
             T_ideal = min(T_ideal, T_pmax)
-
         return T_ideal * config.num_motors
 
     # Fallback: actuator-disk at max power
@@ -1631,21 +1655,32 @@ def electrical_power_required_W(config: FixedWingConfig, speed_mps: float) -> fl
     return P_mech
 
 
-def max_shaft_power_W(config: FixedWingConfig) -> float:
-    """Best available shaft power across all motors [W]."""
+def max_electrical_power_W(config: FixedWingConfig) -> float:
+    """Most electrical power the propulsion can draw, all motors [W]: the
+    bench table's highest Power_W, else the motor's max power; 0 if neither
+    is known."""
     prop = config.propeller
     n_motors = max(int(getattr(config, "num_motors", 1) or 1), 1)
-
     p_elec_per_motor = None
     if prop.table is not None and "Power_W" in prop.table:
-        p_elec_per_motor = float(prop.table["Power_W"].max())
+        # The cached rows when they belong to this table (a pandas max on
+        # every call dominated a new aircraft's ceiling search).
+        cached = (getattr(prop, "_power_w_list", None)
+                  if getattr(prop, "_arrays_table_id", None) == id(prop.table) else None)
+        p_elec_per_motor = (float(max(cached)) if cached
+                            else float(prop.table["Power_W"].max()))
     elif getattr(config.motor, "max_power", None):
         p_elec_per_motor = float(config.motor.max_power)
     if not p_elec_per_motor or p_elec_per_motor <= 0:
         return 0.0
+    return p_elec_per_motor * n_motors
 
+
+def max_shaft_power_W(config: FixedWingConfig) -> float:
+    """Best available shaft power across all motors [W]: the maximum
+    electrical power through the propeller efficiency."""
     eta = max(float(config.airframe.prop_efficiency), 0.10)
-    return p_elec_per_motor * n_motors * eta
+    return max_electrical_power_W(config) * eta
 
 
 def thrust_available_N(config: FixedWingConfig,
@@ -1661,63 +1696,104 @@ def thrust_available_N(config: FixedWingConfig,
     power was 2469 W against a measured maximum of 1680 W, so it violated
     energy conservation outright.
 
-    Momentum theory bounds it properly. For the available shaft power P:
+    The thrust at speed is the largest the power model can make within the
+    propulsion's maximum ELECTRICAL power (the bench table's highest
+    Power_W, else the motor's max power):
 
-        P = T * (V + vi),   vi = -V/2 + sqrt((V/2)^2 + T/(2*rho*A))
+        motor_shaft_power_from_thrust(T, V) = P_elec_max
 
-    which is solved here for T by bisection. At V = 0 this returns the static
-    result; as V rises, T falls roughly as P/V. The answer is additionally
-    capped by the static thrust, since forward flight cannot beat it.
+    solved for T by bisection. The power model is forward-flight momentum
+    theory, T * (V + vi), over the measured or modelled efficiency, so the
+    thrust available and the power required now come from the same model.
+    It used to hold P_elec_max x a fixed prop_efficiency, while the power
+    model used the bench table's measured efficiency: at the top of the
+    range the power model then needed about 2,500 W per motor against a
+    bench maximum of 1,680 W, and climb rate and ceiling were optimistic
+    (audit F7). At V = 0 this returns the static result; as V rises, T falls
+    roughly as P/V. It is capped by the static thrust.
     """
-    static_T = max_thrust_N(config)
     V = max(float(airspeed_mps), 0.0)
     if V < 0.1:
-        return static_T
+        return max_thrust_N(config)
 
     # Cache by speed. The searches evaluate the same handful of speeds
-    # repeatedly, and the signature guards against reusing a result after the
-    # aircraft or the air has changed.
-    signature = (round(static_T, 6), round(float(config.air_density), 6),
+    # repeatedly, and the signature (every input the static thrust and the
+    # power model read) guards against reusing a result after the aircraft or
+    # the air has changed.
+    prop, motor = config.propeller, config.motor
+    signature = (round(float(config.air_density), 6),
                  int(getattr(config, "num_motors", 1) or 1),
-                 round(float(config.propeller.diameter_in), 4),
-                 round(float(config.airframe.prop_efficiency), 4))
-    cache = getattr(config, "_thrust_avail_cache", None)
-    if cache is None or cache.get("signature") != signature:
-        cache = {"signature": signature}
-        config._thrust_avail_cache = cache
+                 round(float(prop.diameter_in), 4), round(float(prop.pitch_in), 4),
+                 int(prop.blades), prop.TConst, id(prop.table),
+                 round(float(config.airframe.prop_efficiency), 4),
+                 str(getattr(config.airframe, "prop_eff_model", "")),
+                 motor.kv, getattr(motor, "max_power", None),
+                 round(float(config.battery.vnom_pack), 4),
+                 round(float(config.battery.vmax_pack), 4))
+    # Several signatures are kept: the ceiling search changes the air
+    # density and comes back, and a single-entry cache was flushed by it on
+    # every metrics run.
+    caches = getattr(config, "_thrust_avail_caches", None)
+    if caches is None:
+        caches = config._thrust_avail_caches = {}
+    cache = caches.get(signature)
+    if cache is None:
+        if len(caches) >= 64:
+            caches.pop(next(iter(caches)))
+        cache = caches[signature] = {}
     key = round(V, 3)
     if key in cache:
         return cache[key]
+    static_T = max_thrust_N(config)
 
-    P_shaft = max_shaft_power_W(config)
-    if P_shaft <= 0.0:
+    P_elec = max_electrical_power_W(config)
+    if P_elec <= 0.0:
         cache[key] = static_T
         return static_T
 
-    rho = max(float(config.air_density), 1e-9)
     n_motors = max(int(getattr(config, "num_motors", 1) or 1), 1)
-    A = config.propeller.disk_area()
-    P_per_motor = P_shaft / n_motors
+    P_per_motor = P_elec / n_motors
 
-    def power_needed(thrust_per_motor: float) -> float:
-        vi = _induced_velocity_forward(thrust_per_motor, V, rho, A)
-        return thrust_per_motor * (V + vi)
+    if prop.table is None:
+        # Off the table the power model is T (V + vi) / eta(V), and eta
+        # depends on the speed alone, so the electrical limit is simply a
+        # shaft-power limit P_elec_max x eta(V): the cheap momentum bisection.
+        rho = max(float(config.air_density), 1e-9)
+        A = prop.disk_area()
+        P_per_motor *= max(propeller_efficiency_at_speed(config, V), 0.10)
 
-    # Bisection: power_needed is monotonic in thrust. This runs inside the
-    # climb-rate and best-speed searches, so it is called on the order of a
-    # thousand times per evaluation — stop as soon as the bracket is tight
-    # rather than burning a fixed 60 iterations.
+        def power_needed(thrust_per_motor: float) -> float:
+            return thrust_per_motor * (V + _induced_velocity_forward(thrust_per_motor, V, rho, A))
+    else:
+        def power_needed(thrust_per_motor: float) -> float:
+            return motor_shaft_power_from_thrust(config, thrust_per_motor * n_motors, V) / n_motors
+
+    # power_needed is monotonic in thrust, so the root is bracketed by 0 and
+    # the static thrust. Regula falsi with the Illinois modification
+    # converges in a handful of evaluations where bisection took about 14;
+    # this runs inside the climb-rate and ceiling searches, thousands of
+    # times for a new aircraft.
     lo, hi = 0.0, max(static_T / n_motors, 1e-6)
-    if power_needed(hi) <= P_per_motor:
+    f_lo, f_hi = -P_per_motor, power_needed(hi) - P_per_motor
+    if f_hi <= 0.0:
         cache[key] = min(static_T, hi * n_motors)
         return cache[key]
-    for _ in range(40):
-        mid = 0.5 * (lo + hi)
-        if power_needed(mid) > P_per_motor:
-            hi = mid
+    side = 0
+    t = lo
+    for _ in range(60):
+        t = (lo * f_hi - hi * f_lo) / (f_hi - f_lo)
+        f_t = power_needed(t) - P_per_motor
+        if f_t > 0.0:
+            hi, f_hi = t, f_t
+            if side == 1:
+                f_lo *= 0.5
+            side = 1
         else:
-            lo = mid
-        if hi - lo < 1e-4 * hi:          # 0.01% is far finer than the inputs
+            lo, f_lo = t, f_t
+            if side == -1:
+                f_hi *= 0.5
+            side = -1
+        if hi - lo < 1e-4 * hi or abs(f_t) < 1e-9 * P_per_motor:
             break
     cache[key] = min(static_T, lo * n_motors)
     return cache[key]
@@ -1986,37 +2062,20 @@ def apply_pack_draw(battery, metrics: dict, soc: Optional[float] = None) -> dict
     return metrics
 
 
-def compute_metrics(config: FixedWingConfig,
-                    speed_mps: float,
-                    bank_deg: float = 0.0,
-                    ambient_temp_C: float = 25.0,
-                    wind_head_mps: float = 0.0,
-                    wind_cross_mps: float = 0.0,
-                    glide_altitude_m: Optional[float] = None) -> dict:
+def _steady_power_chain(config: FixedWingConfig, motor_W: float) -> dict:
     """
-    Compute all performance metrics at the given cruise airspeed.
-    Returns a dict matching the eCalc-style output columns.
+    Everything between the motors' electrical demand and the cells, for one
+    steady operating point: avionics, ESC loss, the main wire run and the
+    pack, solved together. Shared by compute_metrics and the best-speed scan
+    (find_optimal_speeds), so the two price a speed identically.
+
+    Returns avionics_W, esc_loss_W, esc_note, wire_loss_W, total_W (at the
+    pack terminals), motor_W (the motors' own input; less than the demand
+    when a bench table already contains the ESC's loss) and draw
+    (core.pack_draw at full charge).
     """
-    rho  = config.air_density
-    W    = config.weight_N
-    af   = config.airframe
     batt = config.battery
-    motor= config.motor
-
-    # Coordinated turn load factor raises required lift and therefore CL/CD and stall speed.
-    n_turn  = bank_load_factor(bank_deg)
-    V_stall = stall_speed(config)
-    V_stall_turn = V_stall * math.sqrt(max(n_turn, 1.0))
-    V       = max(speed_mps, V_stall_turn + 0.01)
-    CL      = af.cl_at_speed(W * n_turn, V, rho)
-    CD      = af.cd_at_cl(CL)
-    LD      = af.ld_ratio(CL)
-    d_induced, d_parasitic, D = drag_components_N(config, V, load_factor=n_turn)
-    P_prop  = D * V                                # shaft / propulsive power  [W]
-    T_req   = D                                    # thrust required [N]
-    T_avail = thrust_available_N(config, V)
-    P_elec  = motor_shaft_power_from_thrust(config, T_req, V)  # motor electrical [W]
-
+    P_elec = float(motor_W)
     # Avionics / peripheral power
     # Regulated rails and direct-from-pack peripherals are independent loads
     # and ADD. Treating peripheral current as a fallback for "no rails
@@ -2055,7 +2114,12 @@ def compute_metrics(config: FixedWingConfig,
         esc_loss, esc_note = esc_losses_W(
             config, max(_v_pack - _i_pack * r_wire, 1.0), P_elec)
         wire_loss = _i_pack * _i_pack * r_wire
+        _prev = P_total
         P_total = P_elec + (0.0 if _esc_in_P else esc_loss) + P_avionics + wire_loss
+        # Converged: with no ESC or lead the first pass is already exact, and
+        # the best-speed scan runs this chain a few hundred times per call.
+        if abs(P_total - _prev) <= 1e-12 * max(abs(P_total), 1.0):
+            break
 
     if _esc_in_P:
         P_elec = max(P_elec - esc_loss, 0.0)
@@ -2063,8 +2127,58 @@ def compute_metrics(config: FixedWingConfig,
     # all belong to the power reported. The cells give up the terminal power
     # plus that loss (core.pack_draw), which is what drains the energy.
     _draw = core.pack_draw(batt, P_total)
+    return {"avionics_W": P_avionics, "esc_loss_W": esc_loss, "esc_note": esc_note,
+            "wire_loss_W": wire_loss, "total_W": P_total, "motor_W": P_elec,
+            "draw": _draw}
+
+
+def compute_metrics(config: FixedWingConfig,
+                    speed_mps: float,
+                    bank_deg: float = 0.0,
+                    ambient_temp_C: float = 25.0,
+                    wind_head_mps: float = 0.0,
+                    wind_cross_mps: float = 0.0,
+                    glide_altitude_m: Optional[float] = None,
+                    optimal_speeds: Optional[Tuple[float, float, float, float]] = None) -> dict:
+    """
+    Compute all performance metrics at the given cruise airspeed.
+
+    `optimal_speeds` is find_optimal_speeds' result for this configuration
+    and wind. It depends on neither the airspeed nor the bank, so a loop
+    over speeds can compute it once and pass it in.
+    Returns a dict matching the eCalc-style output columns.
+    """
+    rho  = config.air_density
+    W    = config.weight_N
+    af   = config.airframe
+    batt = config.battery
+    motor= config.motor
+
+    # Coordinated turn load factor raises required lift and therefore CL/CD and stall speed.
+    n_turn  = bank_load_factor(bank_deg)
+    V_stall = stall_speed(config)
+    V_stall_turn = V_stall * math.sqrt(max(n_turn, 1.0))
+    V       = max(speed_mps, V_stall_turn + 0.01)
+    CL      = af.cl_at_speed(W * n_turn, V, rho)
+    CD      = af.cd_at_cl(CL)
+    LD      = af.ld_ratio(CL)
+    d_induced, d_parasitic, D = drag_components_N(config, V, load_factor=n_turn)
+    P_prop  = D * V                                # shaft / propulsive power  [W]
+    T_req   = D                                    # thrust required [N]
+    T_avail = thrust_available_N(config, V)
+    P_elec  = motor_shaft_power_from_thrust(config, T_req, V)  # motor electrical [W]
+
+    # Avionics, ESC, wiring and the pack, solved together (_steady_power_chain).
+    _chain = _steady_power_chain(config, P_elec)
+    P_avionics = _chain["avionics_W"]
+    esc_loss, esc_note = _chain["esc_loss_W"], _chain["esc_note"]
+    wire_loss = _chain["wire_loss_W"]
+    P_total = _chain["total_W"]
+    P_elec = _chain["motor_W"]
+    _draw = _chain["draw"]
     pack_I  = _draw["current_A"]
     V_load  = _draw["v_load_V"]
+    _wiring = getattr(config, "wiring", None)
     wire = (_wiring.summary(pack_I, ambient_temp_C) if _wiring is not None
             else core.wiring_summary(0.0, 0.0, ambient_C=ambient_temp_C))
     V_esc = V_load - wire["drop_V"]
@@ -2073,8 +2187,14 @@ def compute_metrics(config: FixedWingConfig,
     rpm_est = motor.kv * V_esc if motor.kv else 0.0
 
     # Performance metrics
-    V_be, P_be = best_endurance_speed(config, V_stall)
-    V_br, LD_br = best_range_speed(config, V_stall)
+    # Best endurance and range on the electrical answer, in this run's wind,
+    # the same as find_optimal_speeds (audit F5). The aerodynamic optima
+    # (minimum D x V, maximum L/D) are kept under their own names.
+    V_be, _t_be, V_br, _d_br = (optimal_speeds if optimal_speeds is not None else
+                                find_optimal_speeds(config, wind_head_mps=wind_head_mps,
+                                                    wind_cross_mps=wind_cross_mps))
+    V_min_P, _P_min = best_endurance_speed(config, V_stall)
+    V_ld, LD_br = best_range_speed(config, V_stall)
     v_rc_max, rc_max = max_rate_of_climb_mps(config)
     rc_at_V         = rate_of_climb_mps(config, V)
     v_gamma, gamma  = best_angle_of_climb_speed(config)
@@ -2214,6 +2334,8 @@ def compute_metrics(config: FixedWingConfig,
         best_endurance_speed_mps  = V_be,
         best_range_speed_mps      = V_br,
         best_ld_ratio             = LD_br,
+        best_ld_speed_mps         = V_ld,
+        min_power_speed_mps       = V_min_P,
         min_sink_speed_mps        = V_min_sink,
         min_sink_rate_mps         = sink_min,
         service_ceiling_m         = service_ceiling_abs_m,
@@ -2265,24 +2387,87 @@ def flight_range_km(config: FixedWingConfig, speed_mps: float) -> float:
     return compute_metrics(config, speed_mps)["flight_range_km"]
 
 
+def _steady_endurance_min(config: FixedWingConfig, speed_mps: float) -> float:
+    """Endurance in straight, level, still-air flight at `speed_mps` (min),
+    0 where the speed is below the stall or a pack limit is breached. The
+    same power chain and limits as compute_metrics, without its other
+    metrics, so a speed scan stays cheap."""
+    v = float(speed_mps)
+    if v < stall_speed(config):
+        return 0.0
+    v = max(v, stall_speed(config) + 0.01)
+    drag = drag_N(config, v)
+    chain = _steady_power_chain(config, motor_shaft_power_from_thrust(config, drag, v))
+    d = chain["draw"]
+    batt = config.battery
+    if (chain["total_W"] <= 0 or d["current_A"] > batt.discharge_max_A
+            or d["v_load_V"] < batt.vmin_pack):
+        return 0.0
+    return batt.usable_Wh / d["cell_power_W"] * 60.0
+
+
 def find_optimal_speeds(config: FixedWingConfig,
-                        v_max: float = 80.0) -> Tuple[float, float, float, float]:
+                        v_max: float = 80.0,
+                        wind_head_mps: float = 0.0,
+                        wind_cross_mps: float = 0.0,
+                        n_steps: int = 120) -> Tuple[float, float, float, float]:
     """
-    Numerical scan for best endurance and best range speeds.
+    Best endurance and best range speeds on the ELECTRICAL answer: maximum
+    flight time, and maximum distance over the ground in the given wind,
+    with every pack limit applied.
+
+    Metrics used to report the aerodynamic optimum instead (minimum D x V,
+    maximum L/D), so the tool gave two answers for the same aircraft
+    (audit F5). For a battery aircraft the electrical one is the one that
+    matters: the motor, propeller and ESC efficiencies all vary with speed.
+    compute_metrics now reports this one too.
+
+    A coarse scan from the stall to `v_max`, then a golden-section search
+    on the bracket around the best grid point.
     Returns (V_be, t_max_min, V_br, d_max_km).
     """
-    V_s      = stall_speed(config)
-    v_lo     = max(V_s, 1.0)
-    n_steps  = 500
-    best_t   = -1.0;  best_vt = v_lo
-    best_d   = -1.0;  best_vd = v_lo
-    for i in range(n_steps + 1):
-        V = v_lo + (v_max - v_lo) * i / n_steps
-        t = flight_time_min(config, V)
-        d = flight_range_km(config, V)
-        if t > best_t: best_t = t; best_vt = V
-        if d > best_d: best_d = d; best_vd = V
-    return best_vt, best_t, best_vd, best_d
+    v_lo = max(stall_speed(config), 1.0)
+    v_hi = max(float(v_max), v_lo + 1.0)
+
+    def t_at(v):
+        return _steady_endurance_min(config, v)
+
+    def d_at(v):
+        gs = max(groundspeed_along_track_mps(v, wind_head_mps, wind_cross_mps), 0.0)
+        return gs * t_at(v) * 60.0 / 1000.0
+
+    grid = [v_lo + (v_hi - v_lo) * i / n_steps for i in range(n_steps + 1)]
+    times = [t_at(v) for v in grid]
+    dists = [max(groundspeed_along_track_mps(v, wind_head_mps, wind_cross_mps), 0.0)
+             * t * 60.0 / 1000.0 for v, t in zip(grid, times)]
+
+    def refine(f, values):
+        k = max(range(len(values)), key=values.__getitem__)
+        best_v, best_f = grid[k], values[k]
+        a, b = grid[max(k - 1, 0)], grid[min(k + 1, len(grid) - 1)]
+        g = (math.sqrt(5.0) - 1.0) / 2.0
+        c, d = b - g * (b - a), a + g * (b - a)
+        fc, fd = f(c), f(d)
+        for _ in range(20):
+            for v, fv in ((c, fc), (d, fd)):
+                if fv > best_f:
+                    best_v, best_f = v, fv
+            if fc >= fd:
+                b, d, fd = d, c, fc
+                c = b - g * (b - a)
+                fc = f(c)
+            else:
+                a, c, fc = c, d, fd
+                d = a + g * (b - a)
+                fd = f(d)
+        for v, fv in ((c, fc), (d, fd)):
+            if fv > best_f:
+                best_v, best_f = v, fv
+        return best_v, best_f
+
+    v_be, t_best = refine(t_at, times)
+    v_br, d_best = refine(d_at, dists)
+    return v_be, t_best, v_br, d_best
 
 
 # ============================================================
@@ -2326,11 +2511,12 @@ def make_performance_figure(config: FixedWingConfig,
     rho  = config.air_density
     W    = config.weight_N
 
+    _opt = find_optimal_speeds(config)
     for V in speeds:
         # One evaluation per speed gives the endurance, range and the pack
         # power they are computed from, so the power panel's electrical
         # curve is exactly the number the endurance curve divides into.
-        m_v = compute_metrics(config, V)
+        m_v = compute_metrics(config, V, optimal_speeds=_opt)
         times.append(m_v["flight_time_min"])
         ranges.append(m_v["flight_range_km"])
         powers_elec.append(float(m_v["total_power_W"]))
@@ -2926,6 +3112,10 @@ def simulate_fw_mission(
                     descent_cmd = -est_vz
         potential_power_W = cfg.weight_N * (climb_cmd - descent_cmd)
 
+        # Best speeds depend on this phase's air and wind, not on the
+        # speed, so the ramp below reuses them.
+        _phase_opt = find_optimal_speeds(cfg, wind_head_mps=headwind_mps,
+                                         wind_cross_mps=crosswind_mps)
         m = compute_metrics(
             cfg,
             V_air,
@@ -2934,6 +3124,7 @@ def simulate_fw_mission(
             wind_head_mps=headwind_mps,
             wind_cross_mps=crosswind_mps,
             glide_altitude_m=float(phase.altitude),
+            optimal_speeds=_phase_opt,
         )
         m["climb_rate_cmd_mps"] = climb_cmd
         m["descent_rate_cmd_mps"] = descent_cmd
@@ -3027,6 +3218,7 @@ def simulate_fw_mission(
                     wind_head_mps=headwind_mps,
                     wind_cross_mps=crosswind_mps,
                     glide_altitude_m=float(phase.altitude),
+                    optimal_speeds=_phase_opt,
                 )
                 p_kin = kinetic_power_term_W(
                     cfg.aircraft_weight_g, v_now, v_next, dt_step,
@@ -6514,7 +6706,7 @@ def launch_gui():
 
         _ins_row(aero_tv, "L/D ratio (cruise)",
                  f"{LD:.2f}", "—", "na",
-                 f"Max L/D: {m.get('best_ld_ratio', 0.0):.2f} @ {m.get('best_range_speed_mps',0):.1f} m/s")
+                 f"Max L/D: {m.get('best_ld_ratio', 0.0):.2f} @ {m.get('best_ld_speed_mps',0):.1f} m/s")
 
         RC_mpm = RC * 60.0
         _ins_row(aero_tv, "Rate of climb",
@@ -6802,7 +6994,7 @@ def launch_gui():
         _ins_metric("CD parasitic (CD0)",        f"{af.CD0:.5f}")
         _ins_metric("Induced / Parasitic ratio", f"{af.k*m.get('CL',0)**2/max(af.CD0,1e-9):.3f}")
         _ins_metric("L/D Ratio",                 f"{m.get('LD_ratio',0):.2f}")
-        _ins_metric("Max L/D (analytic)",        f"{m.get('best_ld_ratio',0):.2f}  @ {m.get('best_range_speed_mps',0):.1f} m/s")
+        _ins_metric("Max L/D (analytic)",        f"{m.get('best_ld_ratio',0):.2f}  @ {m.get('best_ld_speed_mps',0):.1f} m/s")
         _ins_metric("Induced Drag",              f"{m.get('induced_drag_N',0):.3f} N  ({m.get('induced_drag_N',0)/max(m.get('induced_drag_N',0)+m.get('parasitic_drag_N',1e-9),1e-9)*100:.0f}%)")
         _ins_metric("Parasitic Drag",            f"{m.get('parasitic_drag_N',0):.3f} N  ({m.get('parasitic_drag_N',0)/max(m.get('induced_drag_N',0)+m.get('parasitic_drag_N',1e-9),1e-9)*100:.0f}%)")
         _ins_metric("Total Drag", f"{m.get('drag_N',0):.3f} N  ({m.get('drag_N',0)/9.81*1000:.0f} g)")
@@ -6986,8 +7178,13 @@ def launch_gui():
         Vbe = m.get('best_endurance_speed_mps', 0.0)
         Vbr = m.get('best_range_speed_mps',     0.0)
         Vms = m.get('min_sink_speed_mps',       0.0)
-        _ins_metric("Best Endurance (Vy-equiv)", f"{Vbe:.1f} m/s  ({Vbe*3.6:.1f} km/h)  — min power")
-        _ins_metric("Best Range (max L/D)",      f"{Vbr:.1f} m/s  ({Vbr*3.6:.1f} km/h)  — max L/D")
+        # Electrical optima: most minutes and most kilometres from the pack,
+        # every efficiency in the chain included (audit F5). The aerodynamic
+        # ones, minimum D x V and maximum L/D, sit lower and are shown below.
+        _ins_metric("Best Endurance",            f"{Vbe:.1f} m/s  ({Vbe*3.6:.1f} km/h)  — max flight time")
+        _ins_metric("Best Range",                f"{Vbr:.1f} m/s  ({Vbr*3.6:.1f} km/h)  — max distance")
+        _ins_metric("Min Power (aerodynamic)",   f"{m.get('min_power_speed_mps',0):.1f} m/s  — min D × V")
+        _ins_metric("Max L/D (aerodynamic)",     f"{m.get('best_ld_speed_mps',0):.1f} m/s")
         _ins_metric("Min Sink (best glide time)",f"{Vms:.1f} m/s  ({Vms*3.6:.1f} km/h)  — min power/W")
         _ins_metric("Min Sink Rate",             f"{m.get('min_sink_rate_mps',0):.3f} m/s  ({m.get('min_sink_rate_mps',0)*196.85:.1f} fpm)")
         _ins_metric("Max L/D Ratio",             f"{m.get('best_ld_ratio',0):.2f}")
@@ -7368,7 +7565,8 @@ def launch_gui():
                        for i in range(301)]
             _sp_vs = [max(v, 0.1) for v in _sp_vs]
             # One evaluation per speed, shared by every column that needs it.
-            _sp_m = [compute_metrics(cfg, v) for v in _sp_vs]
+            _sp_opt = find_optimal_speeds(cfg)
+            _sp_m = [compute_metrics(cfg, v, optimal_speeds=_sp_opt) for v in _sp_vs]
             _last_run_sweep.clear()
             _last_run_sweep.update({
                 "Speed (m/s)":           _sp_vs,
@@ -8410,7 +8608,10 @@ def main():
         print(f"  {_lead}")
     print(f"{'='*55}\n")
 
-    V_be, t_best, V_br, d_best = find_optimal_speeds(cfg)
+    # In the run's wind, so this agrees with the Best Range Speed above.
+    V_be, t_best, V_br, d_best = find_optimal_speeds(
+        cfg, wind_head_mps=float(m.get("wind_head_mps", 0.0)),
+        wind_cross_mps=float(m.get("wind_cross_mps", 0.0)))
     print(f"  Best endurance: {V_be:.1f} m/s → {t_best:.1f} min")
     print(f"  Best range    : {V_br:.1f} m/s → {d_best:.2f} km")
 

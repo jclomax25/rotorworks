@@ -347,9 +347,15 @@ def test_mission_energy_split_is_reported(vtol, aircraft, tmp_path):
         assert totals[key] > 0, f"{key} should be non-zero for this mission"
 
 
+# An acceleration limit large enough to make every speed change immediate.
+# Blank now means the default limits (audit G10), so the tests that pin the
+# instantaneous case ask for it.
+INSTANT = 1e9
+
+
 def test_a_distance_leg_takes_the_expected_time(vtol, aircraft, tmp_path):
     mission = vtol.VTOLMission.from_json(_mission_file(tmp_path))
-    results, _totals = vtol.simulate_mission(aircraft, mission)
+    results, _totals = vtol.simulate_mission(aircraft, mission, max_accel_mps2=INSTANT)
     cruise = next(r for r in results if r[0] == "Cruise")
     assert cruise[1] == pytest.approx(8000 / 22.0 / 60.0, rel=1e-6)
     assert cruise[2] == pytest.approx(8.0, rel=1e-6)
@@ -1543,7 +1549,7 @@ def test_transients_change_the_flight_without_changing_the_track(vtol, tmp_path,
     So the honest invariants are the track and the time, not the energy.
     """
     mission = _legs_mission(vtol, tmp_path)
-    _r, instant = vtol.simulate_mission(aircraft, mission)
+    _r, instant = vtol.simulate_mission(aircraft, mission, max_accel_mps2=INSTANT)
     _r, ramped = vtol.simulate_mission(aircraft, mission, max_accel_mps2=1.5)
 
     assert ramped["time_s"] > instant["time_s"], \
@@ -1577,7 +1583,7 @@ def test_regen_recovers_some_braking_energy(vtol, tmp_path, aircraft):
 
 
 def test_zero_acceleration_is_exactly_the_old_behaviour(vtol, tmp_path, aircraft):
-    """The default must reproduce the previous numbers bit for bit."""
+    """Blank and 0 mean the same thing: the default limits (audit G10)."""
     mission = _legs_mission(vtol, tmp_path)
     _r, default = vtol.simulate_mission(aircraft, mission)
     _r, explicit = vtol.simulate_mission(aircraft, mission, max_accel_mps2=0.0)
@@ -1708,8 +1714,9 @@ def test_the_transition_pays_for_its_acceleration(vtol, tmp_path, aircraft):
         path.write_text(json.dumps({"reserve_percent": 20, "phases": [
             {"name": "Transition", "kind": "transition", "duration": duration,
              "speed": 22.0, "altitude": 60}]}))
+        # Unlimited, so the phase's own duration sets the acceleration.
         results, _totals = vtol.simulate_mission(
-            aircraft, vtol.VTOLMission.from_json(str(path)))
+            aircraft, vtol.VTOLMission.from_json(str(path)), max_accel_mps2=INSTANT)
         return results[0][3]
 
     quick, slow = transition_power(8), transition_power(20)
@@ -3900,7 +3907,8 @@ def test_station_keeping_matches_what_a_mission_charges_for_a_hover(vtol):
     mission = vtol.VTOLMission(phases=[
         vtol.VTOLPhase(name="Hold", kind="hover", duration_s=60.0,
                        altitude_m=0.0)])
-    _results, totals = vtol.simulate_mission(cfg, mission, wind_mps=wind)
+    _results, totals = vtol.simulate_mission(cfg, mission, wind_mps=wind,
+                                             max_accel_mps2=INSTANT)
     series = totals["series"]
 
     # The steady sample, past the first step's acceleration transient.
@@ -3945,7 +3953,8 @@ def test_holding_station_costs_the_acceleration_to_get_there(vtol):
     mission = vtol.VTOLMission(phases=[
         vtol.VTOLPhase(name="Hold", kind="hover", duration_s=60.0,
                        altitude_m=0.0)])
-    _results, totals = vtol.simulate_mission(cfg, mission, wind_mps=7.0)
+    _results, totals = vtol.simulate_mission(cfg, mission, wind_mps=7.0,
+                                             max_accel_mps2=INSTANT)
     power = totals["series"]["total_power_W"]
     assert power[0] > power[5] * 2,         "no acceleration cost on the first step of a hold in wind"
 
@@ -4607,3 +4616,150 @@ def test_the_diagram_draws_every_lift_rotor(vtol):
                   if type(p).__name__ == "Circle"
                   and abs(p.get_radius() - cfg.lift_prop_diameter_in * 0.0254 / 2) < 1e-9]
     assert len(lift_discs) == 3
+
+
+# ----------------------------------------------------------------------
+# Audit V4: forward thrust available held the IDEAL static power, while
+# the fixed-wing holds its maximum electrical power.
+# ----------------------------------------------------------------------
+
+def test_forward_thrust_spends_the_rated_power(vtol):
+    cfg = _cfg(vtol, "lift+cruise", cruise_motor_max_power_W=400.0)
+    static_T, _src = vtol.static_thrust_available_N(cfg, "cruise")
+    limit = vtol._forward_power_limit_W(cfg, static_T)
+    n = cfg.num_cruise_motors
+    op = vtol.motor_operating_point(cfg, "cruise", static_T / n,
+                                    vtol._forward_shaft_W(cfg, static_T, 0.0) / n, 0.0)
+    assert limit == pytest.approx(400.0 * n * op["efficiency"], rel=1e-9)
+    for v in (15.0, 25.0):
+        t = vtol.forward_thrust_available_N(cfg, v)
+        assert t < static_T
+        assert vtol._forward_shaft_W(cfg, t, v) == pytest.approx(limit, rel=1e-4)
+
+
+def test_forward_thrust_rises_with_the_rated_power(vtol):
+    low = vtol.forward_thrust_available_N(_cfg(vtol, "lift+cruise", cruise_motor_max_power_W=200.0), 20.0)
+    high = vtol.forward_thrust_available_N(_cfg(vtol, "lift+cruise", cruise_motor_max_power_W=800.0), 20.0)
+    assert high > low
+
+
+# ----------------------------------------------------------------------
+# Audit V2: glide ratio and distance used the wing-only analytic L/D_max.
+# ----------------------------------------------------------------------
+
+def test_glide_ratio_counts_the_stopped_rotors_and_body(vtol):
+    cfg = vtol.VTOLConfig()
+    m = vtol.compute_metrics(cfg)
+    lo = vtol.stall_speed_mps(cfg) * 1.05
+    best = max(cfg.weight_N / vtol.wingborne_drag_N(cfg, lo + 40.0 * i / 300) for i in range(301))
+    assert m["glide_ratio"] == pytest.approx(best, rel=1e-9)
+    assert m["glide_ratio"] < m["ld_max_analytic"] * 0.95
+    assert m["glide_distance_km"] == pytest.approx(
+        m["glide_reference_altitude_m"] * m["glide_ratio"] / 1000.0, rel=1e-12)
+
+
+# ----------------------------------------------------------------------
+# Audit V5: with a bench table, "shaft power" was the motor INPUT.
+# ----------------------------------------------------------------------
+
+def test_a_table_reports_shaft_output_not_motor_input(vtol):
+    cfg = _table_aircraft(vtol, lift_prop_table_csv=TABLE)
+    hover = vtol.hover_power_W(cfg)
+    lift = hover["lift_motor"]
+    assert lift["measured"]
+    assert hover["shaft_power_W"] == pytest.approx(cfg.num_lift_rotors * lift["shaft_W"], rel=1e-12)
+    assert hover["shaft_power_W"] < hover["motor_input_W"] * 0.98
+    m = vtol.compute_metrics(cfg)
+    assert m["hover_shaft_W"] == pytest.approx(hover["shaft_power_W"], rel=1e-12)
+
+
+def test_without_a_table_shaft_power_is_unchanged(vtol):
+    cfg = vtol.VTOLConfig()
+    hover = vtol.hover_power_W(cfg)
+    thrust = cfg.weight_N * (1.0 + vtol.hover_download_fraction(cfg))
+    assert hover["shaft_power_W"] == pytest.approx(vtol.rotor_power_W(cfg, thrust), rel=1e-12)
+
+
+# ----------------------------------------------------------------------
+# Audit G10: blank acceleration limits meant instantaneous speed changes.
+# ----------------------------------------------------------------------
+
+def test_blank_acceleration_uses_the_default_limits(vtol, tmp_path, aircraft):
+    mission = _legs_mission(vtol, tmp_path)
+    _r, blank = vtol.simulate_mission(aircraft, mission)
+    _r, explicit = vtol.simulate_mission(
+        aircraft, mission, max_accel_mps2=vtol.DEFAULT_MAX_ACCEL_MPS2,
+        max_decel_mps2=vtol.DEFAULT_MAX_DECEL_MPS2)
+    _r, instant = vtol.simulate_mission(aircraft, mission, max_accel_mps2=INSTANT)
+    assert blank["energy_Wh"] == pytest.approx(explicit["energy_Wh"], rel=1e-12)
+    assert max(blank["series"]["total_power_W"]) < 0.8 * max(instant["series"]["total_power_W"])
+
+
+# ----------------------------------------------------------------------
+# Audit A2: the rotor layout was generated, never taken from inputs, and
+# the drawing called it "to scale".
+# ----------------------------------------------------------------------
+
+def test_rotor_positions_parse(vtol):
+    assert vtol.parse_rotor_positions("") is None
+    assert vtol.parse_rotor_positions("0.6,0.45; -0.6,-0.45") == [(0.6, 0.45), (-0.6, -0.45)]
+    assert vtol.parse_rotor_positions("(0.5, 1e-1), (-.5, -0.1)") == [(0.5, 0.1), (-0.5, -0.1)]
+    with pytest.raises(ValueError):
+        vtol.parse_rotor_positions("0.6, 0.45, 0.1")
+
+
+def test_entered_rotor_positions_drive_the_layout_and_loading(vtol):
+    pts = [(0.7, 0.5), (0.7, -0.4), (-0.7, 0.5), (-0.7, -0.4)]
+    cfg = vtol.VTOLConfig(lift_rotor_positions_m=pts)
+    assert vtol.lift_rotor_positions_entered(cfg)
+    assert vtol.lift_rotor_positions(cfg) == pts
+    generated = vtol.VTOLConfig()
+    assert vtol.lift_rotor_positions(generated) != pts
+    # Held in a wind with the drag above the CG, the rotors counter the
+    # moment with uneven thrust, and longer arms need less of it: the
+    # Per-Rotor Loading reads the entered positions.
+    def spread(points):
+        c = vtol.VTOLConfig(lift_rotor_positions_m=points, drag_cg_offset_m=0.15,
+                            profile_drag_cd=1.0, profile_area_m2=0.15,
+                            parasite_drag_cd=1.0, parasite_area_m2=0.08)
+        t = vtol.hover_rotor_thrusts(c, wind_mps=8.0)
+        return max(t) - min(t)
+    wide = [(2 * x, 2 * y) for x, y in pts]
+    assert spread(pts) > 0
+    assert spread(wide) < spread(pts) * 0.7
+
+
+def test_the_diagram_says_when_the_layout_is_assumed(vtol):
+    import matplotlib.pyplot as plt
+    assumed = vtol.make_airframe_diagram_figure(vtol.VTOLConfig())
+    assert "assumed" in assumed.axes[0].get_title()
+    r = vtol.VTOLConfig().lift_prop_diameter_in * 0.0254 / 2.0
+    pts = [(0.8, 2.5 * r), (0.8, -2.5 * r), (-0.8, 2.5 * r), (-0.8, -2.5 * r)]
+    entered = vtol.make_airframe_diagram_figure(vtol.VTOLConfig(lift_rotor_positions_m=pts))
+    assert "assumed" not in entered.axes[0].get_title()
+    texts = " ".join(t.get_text() for t in entered.axes[0].texts)
+    assert f"{(5.0 * r - 2 * r) * 1000:+.0f} mm" in texts
+    plt.close("all")
+
+
+def test_the_overlap_check_covers_every_pair(vtol):
+    import matplotlib.pyplot as plt
+    r = vtol.VTOLConfig().lift_prop_diameter_in * 0.0254 / 2.0
+    # The two starboard rotors clear each other; a port rotor overlaps the
+    # starboard front one across the centreline.
+    pts = [(1.2 * r, 3 * r), (1.2 * r, -3 * r), (-0.6 * r, 3 * r), (-3 * r, -3 * r)]
+    fig = vtol.make_airframe_diagram_figure(vtol.VTOLConfig(lift_rotor_positions_m=pts))
+    texts = " ".join(t.get_text() for t in fig.axes[0].texts)
+    assert "ROTOR DISCS OVERLAP" in texts
+    plt.close("all")
+
+
+def test_cli_rotor_positions_reach_the_config(vtol):
+    args = vtol.build_arg_parser().parse_args(
+        ["--lift_rotor_positions", "0.7,0.5;0.7,-0.4;-0.7,0.5;-0.7,-0.4"])
+    cfg = vtol.config_from_args(args)
+    assert cfg.lift_rotor_positions_m == [(0.7, 0.5), (0.7, -0.4), (-0.7, 0.5), (-0.7, -0.4)]
+
+
+def test_batch_maps_the_rotor_positions(rw):
+    assert rw.gui_to_cli_vtol()["lift_positions"] == "lift_rotor_positions"

@@ -39,10 +39,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -406,6 +407,10 @@ class VTOLConfig:
                  arm_length_m: Optional[float] = None,
                  arm_width_m: Optional[float] = None,
                  drag_cg_offset_m: float = 0.0,
+                 # Lift rotor hub positions from the CG, (x starboard, y
+                 # nose) in metres, one per lift rotor. None: a layout is
+                 # generated from the span and chord.
+                 lift_rotor_positions_m: Optional[Sequence[Tuple[float, float]]] = None,
                  # --- hover attitude limits ------------------------------
                  max_tilt_deg: float = 25.0,
                  max_pitch_deg: Optional[float] = None,
@@ -580,6 +585,8 @@ class VTOLConfig:
         self.arm_length_m = _opt(arm_length_m)
         self.arm_width_m = _opt(arm_width_m)
         self.drag_cg_offset_m = float(drag_cg_offset_m or 0.0)
+        self.lift_rotor_positions_m = ([(float(x), float(y)) for x, y in lift_rotor_positions_m]
+                                       if lift_rotor_positions_m else None)
 
         self.max_tilt_deg = min(max(float(max_tilt_deg or 25.0), 1.0), 85.0)
         self.max_pitch_deg = _opt(max_pitch_deg)
@@ -1328,7 +1335,21 @@ def drive_chain(cfg: VTOLConfig,
             if op.get("v_term_V", 0.0) > 0 and math.isfinite(op.get("throttle", float("nan"))):
                 op["throttle"] = op["v_term_V"] / supply
                 op["saturated"] = op["v_term_V"] > supply
+    # What the shafts actually deliver. A group a bench table covers was
+    # handed its motor INPUT (the table already contains the motor), and
+    # motor_operating_point splits that into shaft output and loss; the
+    # regimes reported the input as "shaft power", so with a table the
+    # hover shaft, hover figure of merit, the Power Budget's motor shaft
+    # power and the plot's shaft curve all carried the motor's losses
+    # (audit V5). The regimes' point.update(chain) replaces their shaft
+    # keys with these; the totals are untouched.
+    rotor_shaft_out = n_lift * float(lift["shaft_W"]) if float(rotor_shaft_W) > 0 else 0.0
+    cruise_shaft_out = (n_cruise * float(cruise["shaft_W"])
+                        if n_cruise and float(cruise_shaft_W) > 0 else 0.0)
     return {
+        "rotor_shaft_W": rotor_shaft_out,
+        "cruise_shaft_W": cruise_shaft_out,
+        "shaft_power_W": rotor_shaft_out + cruise_shaft_out,
         "total_power_W": base + wire,
         "motor_input_W": motor_in,
         "motor_loss_W": motor_loss,
@@ -1759,38 +1780,85 @@ def static_thrust_available_N(cfg: VTOLConfig, group: str) -> Tuple[float, str]:
     return 0.0, "unknown"
 
 
+def _forward_shaft_W(cfg: VTOLConfig, thrust_N: float, airspeed_mps: float) -> float:
+    """Shaft power for the propulsors to push `thrust_N` at `airspeed_mps`,
+    through the same model cruise is charged with: the cruise propeller, or
+    a vectored type's rotors tilted fully forward."""
+    if uses_vectored_thrust(cfg):
+        return vectored_rotor_power_W(cfg, thrust_N, 90.0, airspeed_mps)
+    return cruise_prop_power_W(cfg, thrust_N, airspeed_mps)
+
+
+def _forward_power_limit_W(cfg: VTOLConfig, static_T: float) -> float:
+    """
+    The most power the propulsors can put on their shafts, all together, in
+    the units _forward_shaft_W returns.
+
+    A bench table's highest power, through the ESC: the table's power is the
+    ESC input, and the model prices a table-covered thrust at the motor
+    input. Else the motor's rated power through its own efficiency at the
+    static maximum. Else nothing is rated, and the shaft power at the static
+    maximum is held.
+    """
+    g = _group(cfg, "cruise")
+    n = max(int(g["n"]), 1)
+    table = g["table"]
+    if table is not None and "Power_W" in table:
+        return float(table["Power_W"].max()) * cfg.esc_efficiency * n
+    shaft_static = _forward_shaft_W(cfg, static_T, 0.0)
+    if g["pmax"]:
+        op = motor_operating_point(cfg, g["name"], static_T / n, shaft_static / n, 0.0)
+        eff = float(op["efficiency"]) if op.get("modelled") else 1.0
+        return float(g["pmax"]) * n * min(max(eff, 0.3), 1.0)
+    return shaft_static
+
+
 def forward_thrust_available_N(cfg: VTOLConfig, airspeed_mps: float) -> float:
     """
     Thrust available for forward flight at an airspeed, all propulsors.
 
-    The fixed-wing's momentum bound: the ideal power the propeller absorbs
-    at its static maximum is held fixed, and at speed the thrust is whatever
-    that power buys, T (V + vi) = P. At zero airspeed this is the static
-    figure; as the speed rises the thrust falls roughly as P / V.
+    The largest thrust whose forward-flight shaft power (_forward_shaft_W,
+    the model cruise is priced with) stays within the propulsors' maximum
+    (_forward_power_limit_W): the motors' rated or measured power where it
+    is known. It used to hold the IDEAL static power constant, while the
+    fixed-wing holds its maximum electrical power, so for the same hardware
+    the VTOL assumed about a third less power at speed, and climb rate, Vy,
+    ceiling and thrust margin disagreed between the tools (audit V4). At
+    zero airspeed this is the static figure; as the speed rises the thrust
+    falls roughly as P / V. It never exceeds the static figure.
     """
     static_T, _src = static_thrust_available_N(cfg, "cruise")
     v = max(float(airspeed_mps), 0.0)
     if static_T <= 0 or v < 0.1:
         return static_T
-    g = _group(cfg, "cruise")
-    n = max(int(g["n"]), 1)
-    rho = max(float(cfg.air_density), 1e-9)
-    area = math.pi / 4.0 * (float(g["d_in"]) * 0.0254) ** 2
-    t_static = static_T / n
-    p_ideal = t_static * math.sqrt(t_static / (2.0 * rho * area))
+    limit = _forward_power_limit_W(cfg, static_T)
+    if limit <= 0:
+        return static_T
 
-    def power_needed(t):
-        vi = -v / 2.0 + math.sqrt((v / 2.0) ** 2 + t / (2.0 * rho * area))
-        return t * (v + vi)
+    def excess(t):
+        return _forward_shaft_W(cfg, t, v) - limit
 
-    lo, hi = 0.0, t_static
-    for _ in range(50):
-        mid = 0.5 * (lo + hi)
-        if power_needed(mid) > p_ideal:
-            hi = mid
+    lo, hi = 0.0, static_T
+    f_lo, f_hi = -limit, excess(hi)
+    if f_hi <= 0:
+        return static_T
+    side = 0
+    for _ in range(60):
+        t = (lo * f_hi - hi * f_lo) / (f_hi - f_lo)
+        f_t = excess(t)
+        if f_t > 0:
+            hi, f_hi = t, f_t
+            if side == 1:
+                f_lo *= 0.5
+            side = 1
         else:
-            lo = mid
-    return lo * n
+            lo, f_lo = t, f_t
+            if side == -1:
+                f_hi *= 0.5
+            side = -1
+        if hi - lo < 1e-5 * hi or abs(f_t) < 1e-9 * limit:
+            break
+    return lo
 
 
 def wingborne_drag_N(cfg: VTOLConfig, airspeed_mps: float, load_factor: float = 1.0) -> float:
@@ -1905,21 +1973,29 @@ def best_speeds(cfg: VTOLConfig, v_max: Optional[float] = None,
 
 def glide(cfg: VTOLConfig) -> Dict[str, float]:
     """
-    Unpowered glide, rotors stopped: the fixed-wing's min-sink search and the
-    analytic best-L/D speed, against the VTOL's full drag.
+    Unpowered glide, rotors stopped: minimum sink and best L/D, both searched
+    against the VTOL's full drag (wing, stopped rotors and body).
+
+    The glide ratio and best-glide speed used to come from the wing-only
+    analytic L/D_max, 0.5 sqrt(pi AR e / CD0), which leaves out the stopped
+    rotors and the body, although the min-sink search beside it included
+    them: on the default aircraft 13.1 against a true 10.8, so the glide
+    distance was 21% optimistic (audit V2). The analytic figure is kept as
+    `ld_max_analytic`, the wing's own ceiling.
     """
     v_lo = max(stall_speed_mps(cfg) * 1.05, 1.0)
     best_v, best_sink = v_lo, float("inf")
+    best_ld_v, best_ld = v_lo, 0.0
     for i in range(301):
         v = v_lo + 40.0 * i / 300
         ld = cfg.weight_N / max(wingborne_drag_N(cfg, v), 1e-9)
         sink = v / ld
         if sink < best_sink:
             best_v, best_sink = v, sink
-    q_s = 2.0 * cfg.weight_N / (cfg.air_density * cfg.wing_area_m2)
-    v_md = math.sqrt(q_s) * (cfg.induced_drag_factor / max(cfg.CD0, 1e-9)) ** 0.25
+        if ld > best_ld:
+            best_ld_v, best_ld = v, ld
     return {"min_sink_speed_mps": best_v, "min_sink_rate_mps": best_sink,
-            "best_glide_speed_mps": max(v_md, v_lo),
+            "best_glide_speed_mps": best_ld_v, "ld_max": best_ld,
             "ld_max_analytic": 0.5 * math.sqrt(math.pi * cfg.aspect_ratio * cfg.oswald
                                                / max(cfg.CD0, 1e-9))}
 
@@ -2123,13 +2199,42 @@ VTOL_SIMPLE_FIELDS = {
 }
 
 
+def parse_rotor_positions(text: Optional[str]) -> Optional[List[Tuple[float, float]]]:
+    """
+    Parse rotor hub positions written "x,y; x,y; ..." (metres from the CG,
+    x to starboard, y toward the nose). Brackets are optional, so
+    "(0.6, 0.45), (0.6, -0.45)" reads the same. Blank returns None.
+    """
+    if text is None or not str(text).strip():
+        return None
+    nums = [float(t) for t in re.findall(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?",
+                                        str(text))]
+    if len(nums) % 2:
+        raise ValueError(f"Lift rotor positions: {len(nums)} numbers do not make "
+                         "x,y pairs.")
+    return [(nums[i], nums[i + 1]) for i in range(0, len(nums), 2)]
+
+
+def lift_rotor_positions_entered(cfg: VTOLConfig) -> bool:
+    """True when the lift rotor positions come from the user, one per rotor."""
+    entered = getattr(cfg, "lift_rotor_positions_m", None)
+    return bool(entered) and len(entered) == max(int(cfg.num_lift_rotors), 1)
+
+
 def lift_rotor_positions(cfg: VTOLConfig) -> List[Tuple[float, float]]:
     """
     Where the lift rotors sit, in metres from the CG: x to starboard, y
     toward the nose — the plan view's axes. One layout, shared by the
     Airframe Diagram and the Per-Rotor Loading table, so the numbering on
     the drawing is the numbering in the table.
+
+    The entered positions when there is one per rotor. Otherwise a layout is
+    GENERATED from the span and chord: booms at 30% of the span with rotors
+    fore and aft for a lift+cruise, evenly along the span for a vectored
+    type. The drawing and its clearance verdict say which (audit A2).
     """
+    if lift_rotor_positions_entered(cfg):
+        return list(cfg.lift_rotor_positions_m)
     span = max(float(cfg.wing_span_m), 1e-3)
     chord = max(float(cfg.wing_area_m2) / span, 1e-3)
     lift_r = float(cfg.lift_prop_diameter_in) * 0.0254 / 2.0
@@ -2306,8 +2411,11 @@ def make_airframe_diagram_figure(cfg: VTOLConfig, figsize=(9, 7.5)):
 
     vectored = uses_vectored_thrust(cfg)
     positions = lift_rotor_positions(cfg)
+    entered = lift_rotor_positions_entered(cfg)
     if not vectored:
-        boom_x = span * 0.30
+        # Booms run fore and aft through each rotor, joined by a spar across
+        # the wing at the rotors' own lateral station, entered or generated.
+        boom_x = max((abs(x) for x, _y in positions), default=0.0)
         for x, y in positions:
             ax.plot([x, x], [0, y], color="#37474F", linewidth=3.0, zorder=1)
         ax.plot([-boom_x, boom_x], [0, 0], color="#37474F", linewidth=3.0, zorder=1)
@@ -2339,14 +2447,19 @@ def make_airframe_diagram_figure(cfg: VTOLConfig, figsize=(9, 7.5)):
         ax.annotate("cruise", (0.0, nose), textcoords="offset points",
                     xytext=(0, 9), ha="center", fontsize=8, color="#EF6C00")
 
-    # Gap between adjacent discs on the same side. Negative means they
-    # overlap, which is exactly what a plan view is for catching.
+    # Smallest gap between any two discs. Negative means they overlap, which
+    # is exactly what a plan view is for catching. It used to measure only
+    # the first two starboard rotors. Rotors at the same plan position are a
+    # coaxial stack, not an overlap.
     gap_note = ""
     discs_overlap = False
-    same_side = [pt for pt in positions if pt[0] > 0]
-    if len(same_side) >= 2:
-        gap = math.dist(same_side[0], same_side[1]) - lift_d
-        gap_note = f"\nTip-to-tip gap   {gap * 1000:+.0f} mm"
+    gaps = [math.dist(a, b) - lift_d
+            for i, a in enumerate(positions) for b in positions[i + 1:]
+            if math.dist(a, b) > 1e-6]
+    if gaps:
+        gap = min(gaps)
+        gap_note = (f"\nTip-to-tip gap   {gap * 1000:+.0f} mm"
+                    + ("" if entered else " (assumed layout)"))
         # Drawn later, once the dimension bands are known: placed here it
         # landed on top of the span dimension on the vectored layouts.
         discs_overlap = gap < 0
@@ -2442,7 +2555,8 @@ def make_airframe_diagram_figure(cfg: VTOLConfig, figsize=(9, 7.5)):
     y_warn = y_span
     if discs_overlap:
         y_warn = y_span - margin * 0.85
-        ax.text(0, y_warn, "ROTOR DISCS OVERLAP", ha="center", va="top",
+        ax.text(0, y_warn, "ROTOR DISCS OVERLAP"
+                + ("" if entered else " (assumed layout)"), ha="center", va="top",
                 color="#B71C1C", fontsize=10, fontweight="bold", zorder=8)
 
     # What is left in the box is only what the drawing does NOT annotate,
@@ -2461,7 +2575,15 @@ def make_airframe_diagram_figure(cfg: VTOLConfig, figsize=(9, 7.5)):
     ax.set_aspect("equal", adjustable="box")
     ax.set_xlabel("metres (starboard +)")
     ax.set_ylabel("metres (nose +)")
-    ax.set_title(f"{cfg.config_type} — plan view, to scale")
+    # The rotor positions are the user's only when entered. Otherwise the
+    # drawing is to scale but the layout is the generator's, and saying
+    # "to scale" alone presented an aircraft the user did not specify (A2).
+    _given = len(getattr(cfg, "lift_rotor_positions_m", None) or [])
+    ax.set_title(f"{cfg.config_type} — plan view, to scale"
+                 + ("" if entered else
+                    (f"; {_given} rotor positions entered for {n} rotors, layout assumed"
+                     if _given else "; rotor positions assumed (enter them "
+                     "on the Lift Rotors tab)")))
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     return fig
@@ -2751,7 +2873,8 @@ def _extended_metrics(cfg: VTOLConfig, m: dict, point: dict, hover: dict,
         "drag_induced_N": d_induced, "drag_parasite_N": d_parasite,
         "drag_stopped_rotor_N": d_stopped, "drag_body_N": d_body,
         "drag_total_N": d_total, "ld_cruise": ld,
-        "ld_max": gl["ld_max_analytic"],
+        "ld_max": gl["ld_max"],
+        "ld_max_analytic": gl["ld_max_analytic"],
         "aoa_deg": math.degrees(cl / max(lift_slope, 1e-9)),
         "lift_curve_slope": lift_slope, "mean_chord_m": chord,
         "reynolds_number": cfg.air_density * v * chord / MU_AIR,
@@ -2759,9 +2882,9 @@ def _extended_metrics(cfg: VTOLConfig, m: dict, point: dict, hover: dict,
         "min_sink_speed_mps": gl["min_sink_speed_mps"],
         "min_sink_rate_mps": gl["min_sink_rate_mps"],
         "best_glide_speed_mps": gl["best_glide_speed_mps"],
-        "glide_ratio": gl["ld_max_analytic"],
+        "glide_ratio": gl["ld_max"],
         "glide_reference_altitude_m": glide_alt,
-        "glide_distance_km": glide_alt * gl["ld_max_analytic"] / 1000.0,
+        "glide_distance_km": glide_alt * gl["ld_max"] / 1000.0,
         "extra_drag_source": extra_drag_areas(cfg)["source"],
         "extra_frontal_CdA_m2": extra_drag_areas(cfg)["frontal_CdA"],
         "extra_side_CdA_m2": extra_drag_areas(cfg)["side_CdA"],
@@ -3004,6 +3127,11 @@ class VTOLMission:
             reserve_percent=float(data.get("reserve_percent", 20.0)),
             transition_time_s=float(data.get("transition_time_s", 12.0)),
         )
+
+
+# Mission acceleration limits when none are entered, the fixed-wing's.
+DEFAULT_MAX_ACCEL_MPS2 = 1.5
+DEFAULT_MAX_DECEL_MPS2 = 2.0
 
 
 def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
@@ -3277,11 +3405,20 @@ def simulate_mission(cfg: VTOLConfig, mission: VTOLMission,
         else:
             duration_goal = None
 
-        max_decel = max_decel_mps2 or max_accel_mps2
-        # With no limit set, a phase reaches its speed at once — the old
-        # behaviour, and still the default.
-        accel_limit = max_accel_mps2 if max_accel_mps2 > 0 else 1e9
-        decel_limit = max_decel if max_decel > 0 else 1e9
+        # Blank or 0 means the default limits, not none. With no limit a
+        # phase reached its speed at once, which on the shipped example made a
+        # 4.9 kW, 181 A, 18 C spike at the transition, and Status and Compare
+        # read their peak power, current and C-rate from that artefact
+        # (audit G10). The defaults are the fixed-wing's: the VTOL cruises
+        # wing-borne.
+        accel_limit = (max_accel_mps2 if max_accel_mps2 and max_accel_mps2 > 0
+                       else DEFAULT_MAX_ACCEL_MPS2)
+        if max_decel_mps2 and max_decel_mps2 > 0:
+            decel_limit = max_decel_mps2
+        elif max_accel_mps2 and max_accel_mps2 > 0:
+            decel_limit = max_accel_mps2
+        else:
+            decel_limit = DEFAULT_MAX_DECEL_MPS2
 
         # --- step it ---------------------------------------------------
         phase_t = 0.0
@@ -3499,6 +3636,7 @@ FIELD_TO_CLI: Dict[str, Optional[str]] = {
     # lift rotors
     "n_lift": "num_lift_rotors", "lift_layout": "lift_rotor_layout",
     "coax_spacing": "coaxial_spacing_m",
+    "lift_positions": "lift_rotor_positions",
     "lift_d": "lift_prop_diameter", "lift_p": "lift_prop_pitch",
     "lift_blades": "lift_prop_blades", "lift_kv": "lift_motor_kv",
     "lift_rm": "lift_motor_resistance", "lift_i0": "lift_motor_i0",
@@ -3783,6 +3921,7 @@ def config_from_fields(values: dict, config_type: str = "lift+cruise") -> VTOLCo
         esc_rating_min=opt("esc_s_min"), esc_rating_max=opt("esc_s_max"),
         lift_rotor_layout=text("lift_layout", "flat"),
         coaxial_spacing_m=opt("coax_spacing"),
+        lift_rotor_positions_m=parse_rotor_positions(raw("lift_positions")),
         inflow_map_enabled=flag("inflow_map_enabled", False),
         inflow_mu_bp=_parse_float_list(raw("inflow_mu_bp")),
         inflow_eff_bp=_parse_float_list(raw("inflow_eff_bp")),
@@ -3893,6 +4032,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add("num_lift_rotors", int)
     add("lift_rotor_layout", str, "flat | coaxial", choices=["flat", "coaxial"])
     add("coaxial_spacing_m", help_text="Vertical spacing of a coaxial pair (m).")
+    add("lift_rotor_positions", str,
+        help_text="Lift rotor hubs from the CG, 'x,y; x,y; ...' in metres "
+                  "(x starboard, y nose), one pair per rotor. Omitted: a "
+                  "layout is generated from the span and chord.")
     add("lift_prop_diameter"); add("lift_prop_pitch"); add("lift_prop_blades", int)
     add("lift_motor_kv", help_text="0 turns the motor electrical model off.")
     add("lift_motor_resistance"); add("lift_motor_i0", help_text="No-load current (A).")
@@ -3998,8 +4141,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     add("climb_rate_mps", help_text="Commanded climb at the cruise point (m/s).")
     add("descent_rate_mps", help_text="Commanded descent at the cruise point (m/s).")
     add("reserve_percent", help_text="Energy reserve (%). Overrides the mission file's.")
-    add("max_accel", help_text="Acceleration limit (m/s^2). 0 ignores transients.")
-    add("max_decel", help_text="Deceleration limit (m/s^2). Defaults to --max_accel.")
+    add("max_accel", help_text="Acceleration limit (m/s^2). 0 or omitted uses "
+        f"{DEFAULT_MAX_ACCEL_MPS2:g}.")
+    add("max_decel", help_text="Deceleration limit (m/s^2). Defaults to --max_accel, "
+        f"else {DEFAULT_MAX_DECEL_MPS2:g}.")
     add("regen_eff", help_text="Fraction of braking energy recovered (0-1).")
     add("transient_dt_s", help_text="Mission time step (s).")
     add("min_climb_mps", help_text="Required climb rate, checked on Status (m/s).")
@@ -4850,14 +4995,16 @@ def launch_gui(args=None) -> None:
                 ("accel", "decel", "regen", "transient_dt"))
     _append_row(tab_env, "Max acceleration (m/s²)", "accel", "",
                 "Limits how fast the aircraft may change speed between legs.\n\n"
-                "Blank ignores transients entirely and each leg starts at its "
-                "commanded speed, as before. Given a value, accelerating costs "
-                "power on top of steady drag — a survey flown as short legs "
-                "with a speed change at each end pays that many times over.\n\n"
+                f"Blank uses {DEFAULT_MAX_ACCEL_MPS2:g} m/s², as the fixed-wing "
+                "does. Accelerating costs power on top of steady drag — a "
+                "survey flown as short legs with a speed change at each end "
+                "pays that many times over. An unlimited acceleration would "
+                "put a large, unphysical power spike at every transition.\n\n"
                 "If a leg is too short to reach its speed, the phase status "
                 "says so rather than pretending it fits.")
     _append_row(tab_env, "Max deceleration (m/s²)", "decel", "",
-                "Blank uses the acceleration limit. A VTOL can usually slow "
+                f"Blank uses the acceleration limit, else {DEFAULT_MAX_DECEL_MPS2:g} m/s². "
+                "A VTOL can usually slow "
                 "harder than it can speed up, but assuming so without data "
                 "would flatter the model.")
     _append_row(tab_env, "Regen efficiency (0-1)", "regen", "0",
@@ -5297,7 +5444,7 @@ def launch_gui(args=None) -> None:
 
     # ---- Lift rotors: layout, propeller, ratings --------------------------
     add_section(tab_lift, "Layout and Propeller",
-                ("lift_layout", "coax_spacing", "lift_blades"))
+                ("lift_layout", "coax_spacing", "lift_positions", "lift_blades"))
     add_combo_row(tab_lift, "Lift rotor layout", "lift_layout", ("flat", "coaxial"),
                   "flat",
                   "coaxial: the lift rotors are stacked in pairs, one above the "
@@ -5308,6 +5455,15 @@ def launch_gui(args=None) -> None:
     _append_row(tab_lift, "Coaxial spacing (m)", "coax_spacing", "",
                 "Vertical gap between the two rotors of a pair. Blank assumes "
                 "0.2 x diameter. Wider spacing costs less.")
+    _append_row(tab_lift, "Lift rotor positions (m)", "lift_positions", "",
+                "Where each lift rotor's hub sits, from the CG: x to "
+                "starboard, y toward the nose, written 'x,y; x,y; ...' with "
+                "one pair per rotor, numbered as on the Airframe Diagram.\n\n"
+                "Blank generates a layout from the span and chord: booms at "
+                "30% of the span for a lift+cruise, rotors evenly along the "
+                "span for a vectored type. The diagram's tip-to-tip gap, its "
+                "overlap warning and the Per-Rotor Loading then describe that "
+                "assumed layout, and the drawing says so.")
     _append_row(tab_lift, "Lift prop blades", "lift_blades", "2",
                 "Blade count. More blades raise the thrust coefficient, so the "
                 "rotor makes the same thrust at lower RPM.")
@@ -8237,8 +8393,10 @@ def launch_gui(args=None) -> None:
                          "Drag beyond CD0 from the Extra Airframe Drag inputs.")
             _metrics_row("Total drag", f"{m['drag_total_N']:.2f} N")
             _metrics_row("L/D at cruise", f"{m['ld_cruise']:.2f}")
-            _metrics_row("Max L/D (analytic)", f"{m['ld_max']:.2f}",
-                         "0.5 sqrt(pi AR e / CD0): the wing and CD0 alone.")
+            _metrics_row("Max L/D", f"{m['ld_max']:.2f}",
+                         "Searched against the full drag: wing, stopped rotors and body.")
+            _metrics_row("Max L/D (wing alone)", f"{m['ld_max_analytic']:.2f}",
+                         "0.5 sqrt(pi AR e / CD0): the wing and CD0 alone, an upper bound.")
             _metrics_row("Angle of attack", f"{m['aoa_deg']:.1f} deg",
                          "CL over the finite-wing lift slope 2 pi AR / (AR + 2), "
                          "measured from zero lift.")
