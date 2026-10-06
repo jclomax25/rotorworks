@@ -849,6 +849,11 @@ class DroneConfig:
                  inflow_map_enabled: bool = True,
                  inflow_mu_bp: Optional[List[float]] = None,
                  inflow_eff_bp: Optional[List[float]] = None,
+                 # Plan (top-view) area, seen from directly above. A
+                 # translating multirotor is tilted, so the airflow sees
+                 # part of it (audit D1). 0 or None: derived from the
+                 # geometry when the other drag terms are, otherwise unused.
+                 top_area: Optional[float] = None,
                  ):
         self.num_motors = int(num_motors)
         self.battery = battery
@@ -862,6 +867,7 @@ class DroneConfig:
         self.parasite_drag_coefficient = float(parasite_drag_coefficient) if parasite_drag_coefficient is not None else 0.0
         self.parasite_area = float(parasite_area) if parasite_area is not None else 0.0
         self.frontal_area = float(frontal_area) if frontal_area is not None else 0.0
+        self.top_area = float(top_area) if top_area not in (None, "") else 0.0
 
         self.cruise_speed = float(cruise_speed)
         self.periph_current = float(periph_current)
@@ -1022,6 +1028,15 @@ class DroneConfig:
         # Frontal area stored separately if you want to use it elsewhere
         self.frontal_area = A_body
 
+        # Plan area: the body seen from above plus the arms at their full
+        # width. Translating, the aircraft tilts and the airflow sees
+        # A_front*cos(tilt) + A_top*sin(tilt) (audit D1). An entered top
+        # area is kept.
+        if not self.top_area or self.top_area <= 0:
+            A_top_body = float(self.body_length_m or 0.0) * float(self.body_width_m or 0.0)
+            A_top_arms = num_arms * ARM_TUBE_SIDE_M * float(self.arm_length_m or 0.0)
+            self.top_area = A_top_body + A_top_arms
+
         self._derived_drag_from_geometry = True
 
 
@@ -1142,12 +1157,48 @@ def drag_force_required(config: DroneConfig, speed_mps: float, orientation: str)
     # Translating nose-first shows the frontal silhouette; translating
     # sideways shows the side silhouette, which on most airframes is larger.
     # Treating every translation as nose-first understated sideways drag.
+    drag_N, _tilt = _translating_drag_and_tilt(config, speed_mps)
+    return drag_N
+
+
+def _translating_drag_and_tilt(config: DroneConfig, speed_mps: float) -> Tuple[float, float]:
+    """
+    Drag (N) and tilt (rad) of a multirotor translating at `speed_mps`.
+
+    The tilt balances drag against weight, tan(theta) = D / W, and the drag
+    depends on the tilt: tilted, the aircraft presents
+    A_level*cos(theta) + A_top*sin(theta) (core.tilted_drag_area), not its
+    level silhouette alone (audit D1). The two are solved together by
+    bisection on W*tan(theta) - D(theta), which is negative at 0 and grows
+    without bound towards 90 deg, so it has exactly one root. With no top
+    area it reduces to the level-silhouette drag it replaced.
+    """
+    config.derive_drag_from_geometry_if_missing()
+    q = 0.5 * config.air_density * float(speed_mps) ** 2
+    cd = float(config.parasite_drag_coefficient)
+    # The presented area depends on WHICH WAY the aircraft is travelling.
+    # Translating nose-first shows the frontal silhouette; translating
+    # sideways shows the side silhouette, which on most airframes is larger.
     _azimuth = float(getattr(config, "translation_direction_deg", 0.0) or 0.0)
     if abs(_azimuth) > 1e-6:
-        _area = core.translation_drag_area(
+        a_level = core.translation_drag_area(
             config.parasite_area, config.profile_area, _azimuth)
-        return q * _area * config.parasite_drag_coefficient
-    return q * config.parasite_area * config.parasite_drag_coefficient
+    else:
+        a_level = float(config.parasite_area)
+    a_top = max(float(getattr(config, "top_area", 0.0) or 0.0), 0.0)
+    weight_N = max(config.drone_weight_g * 9.81 / 1000.0, 1e-9)
+    if a_top <= 0.0 or q <= 0.0:
+        drag = q * a_level * cd
+        return drag, math.atan2(drag, weight_N)
+    lo, hi = 0.0, 0.5 * math.pi - 1e-9
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        if weight_N * math.tan(mid) < q * cd * core.tilted_drag_area(a_level, a_top, mid):
+            lo = mid
+        else:
+            hi = mid
+    tilt = 0.5 * (lo + hi)
+    return q * cd * core.tilted_drag_area(a_level, a_top, tilt), tilt
 
 
 def required_tilt_deg(config: DroneConfig, speed_mps: float, orientation: str) -> float:
@@ -1290,23 +1341,33 @@ def hover_ideal_induced_power_W(config: DroneConfig,
     return (T ** 1.5) / math.sqrt(2.0 * rho * area)
 
 
-def hover_figure_of_merit(config: DroneConfig,
-                          total_thrust_N: float,
-                          actual_induced_power_W: float) -> float:
+def hover_drive_efficiency(config: DroneConfig,
+                           total_thrust_N: float,
+                           electrical_propulsion_power_W: float) -> float:
     """
-    Figure of merit based on induced power:
-      FM = P_ideal / P_actual_induced
+    Hover drive efficiency: momentum-theory ideal power over the ELECTRICAL
+    power the propulsion draws, rotor, motor, ESC and wiring losses together.
+
+        eta_drive = P_ideal / P_electrical
+
+    This used to be reported as the "figure of merit", which is a ROTOR
+    figure, ideal power over rotor SHAFT power. This number includes every
+    loss in the drivetrain, so it cannot be compared with published rotor
+    figures of merit (audit M7). It is not clamped: a value above 1.0 means
+    the inputs promise more than momentum theory allows, and is flagged in
+    Status rather than capped silently (it used to be capped at 1.5).
     """
-    p_actual = max(float(actual_induced_power_W), 1e-9)
+    p_actual = max(float(electrical_propulsion_power_W), 1e-9)
     p_ideal = hover_ideal_induced_power_W(config, total_thrust_N)
-    return min(p_ideal / p_actual, 1.5)
+    return p_ideal / p_actual
 
 
 def hover_wind_resistance_mps(config: DroneConfig) -> float:
     """
     Estimate maximum hover wind resistance from available horizontal thrust:
-      V_max = sqrt(2 * T_horizontal / (rho * C_D * A_frontal))
-    Uses thrust margin, tilt limit, and frontal drag model.
+      V_max = sqrt(2 * T_horizontal / (rho * C_D * A(theta)))
+    Uses thrust margin, tilt limit, and the area presented at the limiting
+    lean, A_front*cos(theta) + A_top*sin(theta).
     """
     rho = max(float(config.air_density), 1e-9)
     Cd = max(float(getattr(config, "parasite_drag_coefficient", 0.0)), 0.2)
@@ -1345,7 +1406,12 @@ def hover_wind_resistance_mps(config: DroneConfig) -> float:
 
     if t_horizontal <= 0:
         return 0.0
-    return math.sqrt((2.0 * t_horizontal) / (rho * Cd * A_frontal))
+    # Holding against the wind the aircraft leans at the limiting tilt, and
+    # presents part of its plan area too (audit D1).
+    _tilt = min(math.atan2(t_horizontal, weight_N), math.radians(tilt_lim))
+    A_presented = core.tilted_drag_area(
+        A_frontal, float(getattr(config, "top_area", 0.0) or 0.0), _tilt)
+    return math.sqrt((2.0 * t_horizontal) / (rho * Cd * A_presented))
 
 
 def compute_air_density(altitude_m: float,
@@ -1548,7 +1614,8 @@ def interpolate_motor_power(config: DroneConfig, thrust_per_motor_N: float) -> f
 
 def motor_power_from_params(config: DroneConfig, thrust_per_motor_N: float,
                             airspeed_mps: float = 0.0,
-                            disk_incidence_rad: float = 0.0) -> float:
+                            disk_incidence_rad: float = 0.0,
+                            extra_shaft_W: float = 0.0) -> float:
     """
     Estimate electrical input power required for a given thrust per motor.
 
@@ -1596,7 +1663,10 @@ def motor_power_from_params(config: DroneConfig, thrust_per_motor_N: float,
             return 0.0
 
         n = rpm_solution / 60.0
-        mech_power_W = config.propeller.PConst * rho * (n**3) * (D**5)
+        # extra_shaft_W: the profile power that grows with advance ratio in
+        # edgewise flow (profile_power_growth_W; audit M8).
+        mech_power_W = (config.propeller.PConst * rho * (n**3) * (D**5)
+                        + max(float(extra_shaft_W), 0.0))
         omega = 2.0 * math.pi * n
         torque_Nm = mech_power_W / max(omega, 1e-9)
     else:
@@ -1610,7 +1680,8 @@ def motor_power_from_params(config: DroneConfig, thrust_per_motor_N: float,
         # Dropping it (as an induced-only model does) makes power fall without
         # bound at speed; at V = 0 it vanishes and hover is unchanged.
         v_through = max(float(airspeed_mps), 0.0) * math.sin(float(disk_incidence_rad))
-        mech_power_W = thrust_per_motor_N * (v_through + vi)
+        mech_power_W = (thrust_per_motor_N * (v_through + vi)
+                        + max(float(extra_shaft_W), 0.0))
         # crude omega/torque estimate from Kv and voltage
         omega = (config.battery.vnom_pack * config.motor.kv) * (2.0 * math.pi / 60.0)
         torque_Nm = mech_power_W / max(omega, 1e-9)
@@ -1722,6 +1793,106 @@ def power_required(config: DroneConfig,
     return motor_power_W * config.num_motors
 
 
+def ideal_rotor_power_W(config: DroneConfig, speed_mps: float,
+                        orientation: str = "forward",
+                        load_factor: float = 1.0) -> float:
+    """
+    Momentum-theory power the rotors must put into the air, all rotors (W).
+
+        P_ideal = T * (V * sin(alpha) + v_i)
+
+    with v_i from the forward-flight inflow solution: the propulsive power
+    that beats drag plus the ideal induced power. Every real loss (rotor
+    profile power, motor, ESC, wiring) comes on top of it.
+
+    power_required() is ELECTRICAL motor input power. The performance figure
+    plotted it as "Mechanical (to the air)", so the gap it showed as the
+    drivetrain loss was only ESC, avionics and wire (audit M1).
+    """
+    total_thrust_N = thrust_required(config, speed_mps, orientation,
+                                     load_factor=load_factor)
+    n = max(int(config.num_motors), 1)
+    t_pm = total_thrust_N / n
+    v = max(float(speed_mps), 0.0)
+    if orientation in ("forward", "translating") and v > 1e-9:
+        incidence = math.radians(required_tilt_deg(config, v, "forward"))
+    else:
+        incidence = 0.0
+    area = disk_area(config.propeller.diameter_in)
+    v_hover = math.sqrt(max(t_pm, 0.0) / max(2.0 * config.air_density * area, 1e-9))
+    v_i = induced_velocity_forward_flight(v_hover, v, incidence)
+    return n * t_pm * (v * math.sin(incidence) + v_i)
+
+
+# Blade section profile-drag coefficient for the profile-power estimate.
+# Helicopter rotors run about 0.008-0.011; small UAV propellers sit at low
+# Reynolds number, where 0.015 is typical.
+PROFILE_CD0 = 0.015
+# Growth of profile power with advance ratio, P0(mu) = P0 (1 + K mu^2). The
+# classical value K = 3 rises to about 4.65 once the radial flow along an
+# edgewise blade is allowed for.
+PROFILE_POWER_K = 4.65
+
+
+def _rotor_rpm_at_thrust(config: DroneConfig, thrust_per_motor_N: float) -> Optional[float]:
+    """RPM one rotor turns at to make `thrust_per_motor_N`: the bench table's
+    RPM if it has one, else the static thrust law with TConst or a C_T
+    estimated from the propeller's geometry."""
+    prop = config.propeller
+    if prop.table is not None and "RPM" in getattr(prop.table, "columns", ()):
+        try:
+            rpm = float(interpolate_motor_point(config, thrust_per_motor_N).get("RPM", 0.0))
+            if math.isfinite(rpm) and rpm > 0:
+                return rpm
+        except Exception:
+            pass
+    d_m = float(prop.diameter_in) * 0.0254
+    c_t = (float(prop.TConst) if prop.TConst else
+           core.estimate_prop_thrust_coefficient(prop.diameter_in, prop.pitch_in,
+                                                 getattr(prop, "blades", 2)))
+    return core.rpm_from_thrust(thrust_per_motor_N, d_m, config.air_density, c_t)
+
+
+def _hover_profile_power_W(config: DroneConfig,
+                           thrust_per_motor_N: float) -> Tuple[float, float]:
+    """Blade profile (shaft) power of ONE rotor at zero advance ratio, and
+    its tip speed:  P0 = (sigma * Cd0 / 8) * rho * A * (Omega R)^3.
+    (0, 0) when no rotor speed can be estimated."""
+    if thrust_per_motor_N <= 0:
+        return 0.0, 0.0
+    rpm = _rotor_rpm_at_thrust(config, thrust_per_motor_N)
+    if rpm is None or not math.isfinite(rpm) or rpm <= 0:
+        return 0.0, 0.0
+    r_m = float(config.propeller.diameter_in) * 0.0254 / 2.0
+    tip = 2.0 * math.pi * rpm / 60.0 * r_m
+    sigma = propeller_solidity(config.propeller.diameter_in, config.propeller.blades)
+    return ((sigma * PROFILE_CD0 / 8.0) * config.air_density
+            * math.pi * r_m * r_m * tip ** 3), tip
+
+
+def profile_power_growth_W(config: DroneConfig, thrust_per_motor_N: float,
+                           airspeed_mps: float, disk_incidence_rad: float = 0.0) -> float:
+    """
+    Extra blade profile (shaft) power for ONE rotor in edgewise flow, over
+    its hover value (audit M8):
+
+        dP0(mu) = P0 * K * mu^2,   mu = V cos(alpha) / (Omega R)
+
+    The forward-flight model applied the measured or assumed efficiency to
+    momentum-theory power only, so the profile power that grows with
+    advance ratio was missing: high-speed power was optimistic and the
+    best-range speed was pushed up. Zero in hover, so hover is unchanged.
+    """
+    v = max(float(airspeed_mps), 0.0)
+    if v <= 0.5:
+        return 0.0
+    p0_hover, tip = _hover_profile_power_W(config, thrust_per_motor_N)
+    if tip <= 1e-6:
+        return 0.0
+    mu = v * math.cos(float(disk_incidence_rad)) / tip
+    return p0_hover * PROFILE_POWER_K * mu * mu
+
+
 def motor_power_per_motor_W(config: DroneConfig, thrust_per_motor_N: float,
                             speed_mps: float, orientation: str) -> float:
     """
@@ -1774,20 +1945,34 @@ def motor_power_per_motor_W(config: DroneConfig, thrust_per_motor_N: float,
                 v_hover, airspeed_for_inflow, incidence_rad)
             v_through = airspeed_for_inflow * math.sin(incidence_rad)
             motor_power_W = (thrust_per_motor_N * (v_through + vi)) / eta_measured
+            # Profile power that grows with advance ratio (audit M8), through
+            # the drive alone: the table's hover power is ideal plus hover
+            # profile power over the motor and ESC, so their efficiency is
+            # (ideal + P0_hover) / table power.
+            d_p0 = profile_power_growth_W(config, thrust_per_motor_N,
+                                          airspeed_for_inflow, incidence_rad)
+            if d_p0 > 0:
+                p0_h, _tip = _hover_profile_power_W(config, thrust_per_motor_N)
+                eta_drive = min(max((ideal_hover + p0_h) / static_power_W, 0.30), 0.95)
+                motor_power_W += d_p0 / eta_drive
         else:
             motor_power_W = static_power_W
     elif config.motor.kv is not None:
         motor_power_W = motor_power_from_params(
             config, thrust_per_motor_N,
             airspeed_mps=airspeed_for_inflow,
-            disk_incidence_rad=incidence_rad)
+            disk_incidence_rad=incidence_rad,
+            extra_shaft_W=profile_power_growth_W(
+                config, thrust_per_motor_N, airspeed_for_inflow, incidence_rad))
     else:
         A = disk_area(config.propeller.diameter_in)
         v_hover = math.sqrt(max(thrust_per_motor_N, 0.0) /
                             max(2.0 * config.air_density * A, 1e-9))
         vi = induced_velocity_forward_flight(v_hover, airspeed_for_inflow, incidence_rad)
         v_through = airspeed_for_inflow * math.sin(incidence_rad)
-        motor_power_W = (thrust_per_motor_N * (v_through + vi)) / 0.85
+        motor_power_W = (thrust_per_motor_N * (v_through + vi)
+                         + profile_power_growth_W(config, thrust_per_motor_N,
+                                                  airspeed_for_inflow, incidence_rad)) / 0.85
 
     # Apply motor-configuration penalty (e.g., coaxial interference)
     motor_power_W *= motor_configuration_power_multiplier(
@@ -1964,7 +2149,7 @@ def _compute_operating_metrics_core(drone: DroneConfig,
     A_total = total_disk_area(drone)
     p_ideal_hover = hover_ideal_induced_power_W(drone, hover_thrust_total_N)
     p_actual_induced = hover_propulsion_power_W
-    fm_hover = hover_figure_of_merit(drone, hover_thrust_total_N, p_actual_induced)
+    drive_eff_hover = hover_drive_efficiency(drone, hover_thrust_total_N, p_actual_induced)
 
     tip_speed = tip_speed_mps_from_rpm(drone.propeller.diameter_in, float(rpm_est)) if rpm_est is not None else float("nan")
     tip_mach = tip_speed / 340.0 if tip_speed == tip_speed else float("nan")
@@ -2095,7 +2280,9 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         "hover_propulsion_power_W": float(hover_propulsion_power_W),
         "hover_ideal_power_W": float(p_ideal_hover),
         "actual_induced_power_W": float(p_actual_induced),
-        "figure_of_merit":     float(fm_hover),
+        # Ideal / electrical: the whole drivetrain, not a rotor figure of
+        # merit (audit M7).
+        "hover_drive_efficiency": float(drive_eff_hover),
         "disk_loading_N_m2":   float(dl),
         "total_disk_area_m2":  float(A_total),
         "tip_speed_mps":       (float(tip_speed) if math.isfinite(tip_speed) else None),
@@ -2350,7 +2537,7 @@ def simulate_mission(config: DroneConfig,
         'periph_power_W': [],
         'esc_loss_W': [],
         'hover_efficiency_gW': [],
-        'figure_of_merit': [],
+        'hover_drive_efficiency': [],
         'disk_loading_N_m2': [],
         'tip_mach': [],
         'advance_ratio_mu': [],
@@ -2443,7 +2630,7 @@ def simulate_mission(config: DroneConfig,
         mission_series['periph_power_W'].append(float(m.get('periph_power_W', 0.0)))
         mission_series['esc_loss_W'].append(float(m.get('esc_loss_W', 0.0)))
         mission_series['hover_efficiency_gW'].append(float(m.get('hover_efficiency_gW', 0.0)))
-        mission_series['figure_of_merit'].append(float(m.get('figure_of_merit', 0.0)))
+        mission_series['hover_drive_efficiency'].append(float(m.get('hover_drive_efficiency', 0.0)))
         mission_series['disk_loading_N_m2'].append(float(m.get('disk_loading_N_m2', 0.0)))
         mission_series['tip_mach'].append(float(m.get('tip_mach')) if m.get('tip_mach') is not None else float('nan'))
         mission_series['advance_ratio_mu'].append(float(m.get('advance_ratio_mu', 0.0)))
@@ -2475,6 +2662,21 @@ def simulate_mission(config: DroneConfig,
                   "accel_mps2", "commanded_airspeed_mps", "advance_ratio_mu",
                   "wire_loss_W", "wire_drop_V", "wire_temp_C"):
             worst[k] = max(float(worst.get(k, 0.0)), float(m.get(k, 0.0)))
+        # Attitude, tip speed and the itemised losses are worst-case too.
+        # Unmerged, they kept the FIRST step's values, so Compare mixed the
+        # mission's worst case with its first instant (audit S6). NaN (an
+        # unknown) never replaces a known value.
+        for k in ("tilt_required_deg", "pitch_required_deg", "roll_required_deg",
+                  "tip_mach", "battery_i2r_loss_W", "battery_loss_W", "cell_power_W",
+                  "motor_copper_loss_W", "motor_copper_loss_W_per_motor"):
+            vals = [float(v) for v in (worst.get(k), m.get(k))
+                    if v is not None and math.isfinite(float(v))]
+            if vals:
+                worst[k] = max(vals)
+        _ta = [float(v) for v in (worst.get("thrust_available_N"), m.get("thrust_available_N"))
+               if v is not None and math.isfinite(float(v))]
+        if _ta:
+            worst["thrust_available_N"] = min(_ta)
         worst["v_load_V"] = min(float(worst.get("v_load_V", 1e9)), float(m.get("v_load_V", 1e9)))
         worst["esc_input_voltage_V"] = min(float(worst.get("esc_input_voltage_V", 1e9)),
                                            float(m.get("esc_input_voltage_V", 1e9)))
@@ -2823,6 +3025,17 @@ def simulate_mission(config: DroneConfig,
             break
 
     if worst_metrics is not None:
+        # Mission totals, which a design change is usually meant to move,
+        # and the peak temperatures before they are replaced below by the
+        # end-of-mission values (audit S6).
+        worst_metrics["mission_time_min"] = t_s / 60.0
+        worst_metrics["mission_distance_km"] = dist_km
+        worst_metrics["mission_energy_Wh"] = usable_wh - remaining_wh
+        worst_metrics["energy_remaining_Wh"] = remaining_wh
+        worst_metrics["min_soc_pct"] = soc_state * 100.0
+        worst_metrics["peak_motor_temp_C"] = float(worst_metrics.get("motor_temp_est_C", motor_temp_c))
+        worst_metrics["peak_esc_temp_C"] = float(worst_metrics.get("esc_temp_est_C", esc_temp_c))
+        worst_metrics["peak_battery_temp_C"] = float(worst_metrics.get("battery_temp_est_C", battery_temp_c))
         worst_metrics["reserve_target_Wh"] = reserve_target_wh
         worst_metrics["reserve_min_Wh"] = reserve_min_wh
         worst_metrics["reserve_margin_Wh"] = reserve_min_wh - reserve_target_wh
@@ -2897,26 +3110,32 @@ def make_performance_figure(config: DroneConfig,
     ax.legend(handles=[l1, l2], loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.4)
 
-    # 2. Power — mechanical and electrical, both in forward flight.
-    # The old "hover attitude" trace was ambiguous: it was neither hover nor
-    # the flight being simulated. Showing shaft power against pack power is
-    # far more useful, because the gap between them IS the drivetrain loss.
+    # 2. Power, in forward flight, at three points along the chain.
+    # power_required() is the ELECTRICAL power into the motors. It used to be
+    # drawn as "Mechanical (to the air)", so the gap shown as the drivetrain
+    # loss was only ESC, avionics and wiring (audit M1). Now: pack power, the
+    # motors' electrical input, and the momentum-theory ideal the rotors
+    # must put into the air. Pack to motor input is the ESC, avionics and
+    # wiring; motor input to ideal is the motors and the rotors' own losses.
     ax = axes[0, 1]
     pwr_elec = []
-    for V, p_shaft in zip(speeds, pwr_fwd):
+    pwr_ideal = [ideal_rotor_power_W(config, V, "forward") for V in speeds]
+    for V, p_motor in zip(speeds, pwr_fwd):
         # Rails and direct-from-pack peripherals add.
         periph_P = (avionics_input_power_W(getattr(config, "avionics", None))
                     + config.battery.vnom_pack * max(config.periph_current, 0.0))
         tot, _, _, _, _ = total_power_with_esc(
-            config, motor_power_W=p_shaft, periph_power_W=periph_P)
+            config, motor_power_W=p_motor, periph_power_W=periph_P)
         pwr_elec.append(tot)
     ax.plot(speeds, [p / 1000 for p in pwr_elec], color="crimson",
             label="Electrical (from pack)")
     ax.plot(speeds, [p / 1000 for p in pwr_fwd], color="#1565C0",
-            label="Mechanical (to the air)", linestyle="--")
+            label="Motor input (electrical)", linestyle="--")
+    ax.plot(speeds, [p / 1000 for p in pwr_ideal], color="#2E7D32",
+            label="Ideal rotor power (to the air)", linestyle=":")
     ax.axvline(cruise, color="gray", linestyle="-.", linewidth=1.0, alpha=0.7)
     ax.set_xlabel("Speed (m/s)"); ax.set_ylabel("Power (kW)")
-    ax.set_title("Power Required vs Speed — mechanical and electrical")
+    ax.set_title("Power Required vs Speed — pack, motors and ideal")
     ax.legend(fontsize=8); ax.grid(True, alpha=0.4)
 
     # 3. Thrust — resolved into its components.
@@ -3380,6 +3599,7 @@ def build_drone_from_args(args) -> DroneConfig:
         parasite_drag_coefficient=args.parasite_drag,
         parasite_area=args.parasite_area,
         frontal_area=args.area,
+        top_area=args.top_area,
         cruise_speed=args.speed,
         periph_current=args.periph_current,
         esc=esc,
@@ -3899,6 +4119,11 @@ MC_FIELD_HELP = {
                       "Blunt multirotor bodies are about 1.0-1.3."),
     "parasite_area": ("FRONT silhouette area, seen from directly ahead.",
                       "From the drag calculator's Front View, or width x height."),
+    "top_area": ("PLAN area, seen from directly above. Translating, the "
+                 "aircraft tilts and the airflow sees part of it: "
+                 "A_front x cos(tilt) + A_top x sin(tilt).",
+                 "From the drag calculator's Top View, or length x width plus "
+                 "the arms. Blank: estimated from the body and arms."),
     "body_length_m": ("Length of the central body, front to back. Used by the "
                       "auto drag estimate.", "Excludes arms. 5in quad ~0.12 m."),
     "body_width_m": ("Width of the central body, side to side.",
@@ -4113,7 +4338,7 @@ MC_SIMPLE_FIELDS = {
     "num_motors", "weight", "payload_mass_g", "speed", "motor_configuration",
     "max_tilt_deg", "drag_model_mode", "coaxial_spacing_m",
     "body_length_m", "body_width_m", "body_height_m", "arm_length_m", "arm_width_m",
-    "parasite_drag", "parasite_area", "profile_drag", "profile_area",
+    "parasite_drag", "parasite_area", "profile_drag", "profile_area", "top_area",
     # Battery
     "batt_unit_mode", "batt_vmin", "batt_vnom", "batt_vmax",
     "batt_cell_capacity", "batt_pack_capacity",
@@ -4441,6 +4666,7 @@ def launch_gui():
     v_profile_area      = sv(0.01)
     v_parasite_drag     = sv(0.9)
     v_parasite_area     = sv(0.05)
+    v_top_area          = sv("")
     v_drag_model_mode   = sv("auto")
     v_body_length_m     = sv("")
     v_body_width_m      = sv("")
@@ -4842,6 +5068,7 @@ def launch_gui():
     add_row(tab_drone, r, "Profile Area (m²)",       v_profile_area, key="profile_area");      r += 1
     add_row(tab_drone, r, "Parasite Cd",             v_parasite_drag, key="parasite_drag");     r += 1
     add_row(tab_drone, r, "Parasite Area (m²)",      v_parasite_area, key="parasite_area");     r += 1
+    add_row(tab_drone, r, "Top Area (m²)",           v_top_area, key="top_area");              r += 1
     add_row(tab_drone, r, "Drag Height above CG (m)", v_drag_cg_offset_m,
             key="drag_cg_offset_m"); r += 1
 
@@ -5338,6 +5565,7 @@ def launch_gui():
         "batt_temp_limit": v_batt_temp_limit,
         "profile_drag": v_profile_drag, "profile_area": v_profile_area,
         "parasite_drag": v_parasite_drag, "parasite_area": v_parasite_area,
+        "top_area": v_top_area,
         "body_length_m": v_body_length_m, "body_width_m": v_body_width_m,
         "body_height_m": v_body_height_m, "arm_length_m": v_arm_length_m,
         "arm_width_m": v_arm_width_m, "coaxial_spacing_m": v_coaxial_spacing_m,
@@ -6123,7 +6351,7 @@ def launch_gui():
         ("v_load_V",          "Loaded voltage (V)",    2,  1),
         ("thrust_total_N",    "Total thrust (N)",      2,  1),
         ("hover_efficiency_gW", "Hover efficiency (g/W)", 2, 1),
-        ("figure_of_merit",   "Figure of merit",       3,  1),
+        ("hover_drive_efficiency", "Hover drive efficiency", 3, 1),
         ("disk_loading_N_m2", "Disk loading (N/m²)",   1, -1),
         ("motor_temp_est_C",  "Motor temp (°C)",       1, -1),
         ("reserve_margin_Wh", "Reserve margin (Wh)",   2,  1),
@@ -6148,6 +6376,32 @@ def launch_gui():
         ("battery_temp_est_C", "Battery temp (°C)",    1, -1),
         ("prop_rpm",          "Prop RPM",              0,  0),
         ("groundspeed_mps",   "Groundspeed (m/s)",     2,  1),
+    ]
+    # A mission is compared on its totals and its worst case. The point set
+    # above read single-point endurance rows ("—" for a mission) and
+    # configuration figures that a mission does not merge, so they kept the
+    # first step's values (audit S6).
+    _CMP_MISSION_KEYS = [
+        ("mission_energy_Wh",    "Mission energy (Wh)",          2, -1),
+        ("mission_time_min",     "Mission time (min)",           2,  0),
+        ("mission_distance_km",  "Distance (km)",                3,  0),
+        ("energy_remaining_Wh",  "Energy remaining (Wh)",        2,  1),
+        ("min_soc_pct",          "Minimum SoC (%)",              1,  1),
+        ("reserve_margin_Wh",    "Lowest reserve margin (Wh)",   2,  1),
+        ("total_power_W",        "Peak power (W)",               1, -1),
+        ("pack_current_A",       "Peak pack current (A)",        2, -1),
+        ("v_load_V",             "Lowest loaded voltage (V)",    2,  1),
+        ("motor_current_A",      "Peak motor current / motor (A)", 2, -1),
+        ("thrust_available_N",   "Lowest thrust available (N)",  1,  1),
+        ("tilt_required_deg",    "Peak tilt (°)",                2, -1),
+        ("pitch_required_deg",   "Peak pitch (°)",               2, -1),
+        ("roll_required_deg",    "Peak roll (°)",                2, -1),
+        ("tip_mach",             "Peak tip Mach",                3, -1),
+        ("esc_loss_W",           "Peak ESC loss (W)",            2, -1),
+        ("battery_i2r_loss_W",   "Peak pack I2R loss (W)",       2, -1),
+        ("peak_motor_temp_C",    "Peak motor temp (°C)",         1, -1),
+        ("peak_esc_temp_C",      "Peak ESC temp (°C)",           1, -1),
+        ("peak_battery_temp_C",  "Peak battery temp (°C)",       1, -1),
     ]
 
     def _current_comparison_metrics():
@@ -6211,9 +6465,10 @@ def launch_gui():
                 + ("mission" if _last_run.get("from_mission") else "single-point")
                 + " run.", "—", "—", "—", "re-pin to compare like with like"))
             return
+        _keys = _CMP_MISSION_KEYS if _last_run.get("from_mission") else _CMP_KEYS
         rows = core.compare_metric_sets(
-            base, current, [(k, lbl, d) for k, lbl, d, _ in _CMP_KEYS])
-        better_map = {k: s for k, _, _, s in _CMP_KEYS}
+            base, current, [(k, lbl, d) for k, lbl, d, _ in _keys])
+        better_map = {k: s for k, _, _, s in _keys}
         for row in rows:
             if not row["comparable"]:
                 cmp_tv.insert("", "end", tags=("flat",), values=(
@@ -6870,25 +7125,39 @@ def launch_gui():
                 f"together — a bigger disc raises the ceiling, a better rotor "
                 f"gets you closer to it.")
 
-        # Figure of merit expectations must scale with rotor size. Small
-        # propellers run at low Reynolds number and simply cannot reach the
-        # FoM of a large rotor: 0.65 flagged three of the five example
-        # aircraft as bad, including two perfectly ordinary ones.
-        fm = float(metrics.get("figure_of_merit", float("nan")))
-        if math.isfinite(fm):
+        # Hover drive efficiency: ideal power over ELECTRICAL power, so the
+        # whole drivetrain, not a rotor figure of merit (audit M7, G8). It
+        # used to be checked against rotor-FoM thresholds (>= 0.60 for a
+        # mid-size propeller), which a drivetrain number clears far too
+        # easily. The expectation is a typical rotor FoM for the size times
+        # a typical motor and ESC efficiency in hover, about 0.80. Small
+        # propellers run at low Reynolds number and cannot reach what a
+        # large rotor can, so the expectation scales with size.
+        de = float(metrics.get("hover_drive_efficiency", float("nan")))
+        if math.isfinite(de):
             _d_in = float(config.propeller.diameter_in)
             if _d_in >= 15:
-                _fm_target, _fm_class = 0.70, "large rotor"
+                _fm_rotor, _fm_class = 0.70, "large rotor"
             elif _d_in >= 9:
-                _fm_target, _fm_class = 0.60, "mid-size propeller"
+                _fm_rotor, _fm_class = 0.60, "mid-size propeller"
             else:
-                _fm_target, _fm_class = 0.45, "small propeller at low Reynolds number"
-            _insert_status_row(prop_table_tv, "Figure of merit",
-                f"{fm:.3f}", f">= {_fm_target:.2f}",
-                _classify(_fm_target, max(fm, 1e-9)),
-                f"Fraction of the momentum-theory ideal this rotor achieves. "
-                f"Expectation scaled for a {_d_in:.0f} in {_fm_class}; small "
-                f"blades cannot reach the figure a large rotor can.")
+                _fm_rotor, _fm_class = 0.45, "small propeller at low Reynolds number"
+            _de_target = _fm_rotor * 0.80
+            if de > 1.0:
+                _insert_status_row(prop_table_tv, "Hover drive efficiency",
+                    f"{de:.3f}", "<= 1.00", "bad",
+                    "More than momentum theory allows: the thrust table or the "
+                    "motor constants promise thrust for less power than any "
+                    "rotor can deliver. Check the inputs.")
+            else:
+                _insert_status_row(prop_table_tv, "Hover drive efficiency",
+                    f"{de:.3f}", f">= {_de_target:.2f}",
+                    _classify(_de_target, max(de, 1e-9)),
+                    f"Ideal hover power over the electrical power, so rotor, "
+                    f"motor, ESC and wiring losses together; not a rotor figure "
+                    f"of merit. Expectation: a {_d_in:.0f} in {_fm_class} "
+                    f"(rotor FoM about {_fm_rotor:.2f}) through a motor and ESC "
+                    f"at about 80%.")
 
         v_wind_max = float(metrics.get("hover_wind_resistance_mps", float("nan")))
         if math.isfinite(v_wind_max):
@@ -7244,7 +7513,13 @@ def launch_gui():
         _metrics_add("Hover Efficiency",
                      f"{fmt(metrics.get('hover_efficiency_gW',float('nan')),2)} g/W   "
                      "(weight / electrical power in hover)")
-        _metrics_add("Figure of Merit",        f"{fmt(metrics.get('figure_of_merit',float('nan')),3)}")
+        _de = float(metrics.get('hover_drive_efficiency', float('nan')))
+        _metrics_add("Hover Drive Efficiency", f"{fmt(_de,3)}",
+                     ("Ideal hover power over the electrical power: rotor, "
+                      "motor, ESC and wiring losses together, so it is not a "
+                      "rotor figure of merit."
+                      + ("  Above 1.0 is impossible: check the thrust table "
+                         "or motor constants." if _de > 1.0 else "")))
         _metrics_add("Ideal Hover Power",
                      f"{fmt(metrics.get('hover_ideal_power_W',float('nan')),1)} W   "
                      "(momentum-theory minimum, T x sqrt(T / 2 rho A))")
@@ -7413,8 +7688,20 @@ def launch_gui():
         _metrics_add("Ground Speed", f"{groundspeed_mps:.2f} m/s  ({groundspeed_mps*3.6:.1f} km/h  /  {groundspeed_mps*1.944:.1f} kt)")
         _metrics_add("Head / Cross Wind",      f"{fmf(metrics.get('wind_head_mps',float('nan')),2)} / {fmf(metrics.get('wind_cross_mps',float('nan')),2)} m/s")
         _metrics_add("Tilt Angle",             f"{fmf(tilt,1)} °")
-        if getattr(drone,'max_tilt_deg',None) is not None:
-            pass
+        # The area the airflow meets at that tilt (audit D1): the level
+        # silhouette tilts away and part of the plan area comes into view.
+        _a_lvl = float(getattr(drone, "parasite_area", 0.0) or 0.0)
+        _a_top = float(getattr(drone, "top_area", 0.0) or 0.0)
+        if _a_top > 0 and str(orientation).lower() in ("forward", "translating"):
+            try:
+                _a_now = core.tilted_drag_area(_a_lvl, _a_top, math.radians(float(tilt)))
+                _metrics_add("Presented Drag Area",
+                             f"{_a_now*1e4:.0f} cm²  (front {_a_lvl*1e4:.0f} × cos + "
+                             f"top {_a_top*1e4:.0f} × sin of the tilt)",
+                             "A tilted multirotor shows part of its plan view to "
+                             "the airflow as well as its front.")
+            except (TypeError, ValueError):
+                pass
         _metrics_add("Estimated Range", f"{range_km:.2f} km  ({range_km*0.6214:.2f} mi  /  {range_km*0.5400:.2f} nm)")
         _metrics_add("Flight Time",            f"{fmt(t_min,2)} min  ({fmt(t_min/60,3)} h)")
         # Hover endurance (always useful to know)
@@ -7605,7 +7892,7 @@ def launch_gui():
         ("inflow_efficiency",   "Inflow efficiency (η)",         "—"),
         ("inflow_power_multiplier", "Inflow power multiplier",   "—"),
         ("hover_efficiency_gW", "Hover efficiency",              "g/W"),
-        ("figure_of_merit",     "Figure of merit",               "—"),
+        ("hover_drive_efficiency", "Hover drive efficiency (ideal / electrical)", "—"),
         ("disk_loading_N_m2",   "Disk loading",                  "N/m²"),
         ("motor_temp_est_C",    "Motor temperature (est)",       "°C"),
         ("esc_temp_est_C",      "ESC temperature (est)",         "°C"),
@@ -7882,6 +8169,7 @@ def launch_gui():
             profile_area             = (parse_float("Profile area", v_profile_area.get()) if v_profile_area.get().strip() else 0.0),
             parasite_drag_coefficient= (parse_float("Parasite Cd", v_parasite_drag.get()) if v_parasite_drag.get().strip() else 0.0),
             parasite_area            = (parse_float("Parasite area", v_parasite_area.get()) if v_parasite_area.get().strip() else 0.0),
+            top_area                 = (parse_float("Top area", v_top_area.get()) if v_top_area.get().strip() else None),
             # #6 frontal area is no longer an input. Left at 0 so the
             # geometry fallback derives it; the drag model prefers
             # parasite_area anyway.
@@ -8032,7 +8320,10 @@ def launch_gui():
                 "Speed (m/s)": _mc_v,
                 "Flight Time (min)": [estimate_flight_time_minutes(drone, v, "forward") for v in _mc_v],
                 "Range (km)": [estimate_flight_distance_km(drone, v, "forward") for v in _mc_v],
-                "Power Mechanical (W)": [power_required(drone, v, "forward") for v in _mc_v],
+                # Electrical power into the motors. It was exported as "Power
+                # Mechanical", which it is not (audit M1).
+                "Power Motor Input (W)": [power_required(drone, v, "forward") for v in _mc_v],
+                "Power Ideal Rotor (W)": [ideal_rotor_power_W(drone, v, "forward") for v in _mc_v],
                 "Power Electrical (W)": [_elec_at(v) for v in _mc_v],
                 "Thrust Total (N)": [thrust_required(drone, v, "forward") for v in _mc_v],
                 "Thrust Horizontal (N)": [drag_force_required(drone, v, "forward") for v in _mc_v],
@@ -8108,7 +8399,7 @@ def launch_gui():
                 f"Best endurance  : {be_v:.2f} m/s → {be_min:.2f} min\n"
                 f"Best range      : {br_v:.2f} m/s → {br_km:.2f} km\n"
                 f"Hover eff.      : {_fmt_out(metrics.get('hover_efficiency_gW', float('nan')),2)} g/W\n"
-                f"Figure of merit : {_fmt_out(metrics.get('figure_of_merit', float('nan')),3)}\n"
+                f"Hover drive eff.: {_fmt_out(metrics.get('hover_drive_efficiency', float('nan')),3)} (ideal / electrical)\n"
                 f"Disk loading    : {_fmt_out(metrics.get('disk_loading_N_m2', float('nan')),1)} N/m²\n"
                 f"Tip Mach        : {_fmt_out(metrics.get('tip_mach', float('nan')),3)}\n"
                 f"Potential power : {_fmt_out(metrics.get('potential_power_W', float('nan')),1)} W\n"
@@ -8608,6 +8899,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--profile_area", type=float, default=0.0, help="Rotor/arms profile reference area (m^2)")
     parser.add_argument("--parasite_drag", type=float, default=0.0, help="Parasite drag coefficient (fuselage/arms)")
     parser.add_argument("--parasite_area", type=float, default=0.0, help="Parasite reference area (m^2)")
+    parser.add_argument("--top_area", type=float, default=None,
+                        help="Plan (top-view) area (m^2). Translating, the aircraft tilts "
+                             "and presents A_front*cos(tilt) + A_top*sin(tilt). "
+                             "Omitted: estimated from the body geometry.")
     parser.add_argument(
         "--drag_model_mode",
         type=str,
@@ -8941,7 +9236,8 @@ def main():
         print(f"Best endurance speed (forward): {be_v:.1f} m/s -> {be_min:.1f} min")
         print(f"Best range speed (forward): {br_v:.1f} m/s -> {br_km:.2f} km")
         print(f"Hover Efficiency      : {metrics.get('hover_efficiency_gW', 0.0):.2f} g/W")
-        print(f"Figure of Merit (FM)  : {metrics.get('figure_of_merit', 0.0):.3f}")
+        print(f"Hover Drive Efficiency: {metrics.get('hover_drive_efficiency', 0.0):.3f}"
+              f"  (ideal / electrical, whole drivetrain; not a rotor FoM)")
         print(f"Disk Loading          : {metrics.get('disk_loading_N_m2', 0.0):.1f} N/m²")
         tip_mach = metrics.get("tip_mach", None)
         if tip_mach is not None:

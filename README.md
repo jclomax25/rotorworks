@@ -994,8 +994,12 @@ Enter mass and body Cd, then **Calculate**. Outputs:
 | `EK3_DRAG_BCOEF_X` / `_Y` | ArduPilot parameters |
 | `parasite_area` + `parasite_drag_coefficient` | Simulator, from the **front** view |
 | `profile_area` + `profile_drag_coefficient` | Simulator, from the **side** view |
+| `top_area` | Simulator, from the **top** view |
 
-The top view is reference only (vertical/descent drag).
+A translating multicopter is tilted, so forward drag uses
+`parasite_area·cos(tilt) + top_area·sin(tilt)`, with the tilt solved together
+with the drag. Without a top area the simulator estimates one from the body
+and arm dimensions.
 
 ### Tab 2 — Propeller drag (MCOEF)
 
@@ -2259,10 +2263,13 @@ wrong.
   old limit measured disc SIZE more than design quality: trivially easy on a
   heavy-lift with 22 in discs, near impossible on a 3 in cinewhoop. The
   cinewhoop now reads "44% of the 11.5 g/W ideal for this disk loading".
-- **Figure of merit scales with rotor size.** Small propellers run at low
-  Reynolds number and cannot reach the FoM of a large rotor. The flat 0.65
-  flagged three of the five example aircraft as bad, including ordinary ones.
-  Targets are now 0.70 for >= 15 in, 0.60 for >= 9 in, 0.45 below that.
+- **Hover drive efficiency scales with rotor size.** The multicopter reports
+  ideal hover power over electrical power: rotor, motor, ESC and wiring
+  together, so it is not a rotor figure of merit and is no longer called one.
+  Small propellers run at low Reynolds number and cannot reach what a large
+  rotor can, so the target is a typical rotor FoM for the size (0.70 for
+  >= 15 in, 0.60 for >= 9 in, 0.45 below that) times about 0.80 for the motor
+  and ESC. Above 1.0 is flagged as impossible rather than capped.
 - **Prop solidity scales with blade count.** Solidity rises with blade number
   almost by definition, so one 0.05-0.15 window judged 3-blade propellers
   against a 2-blade expectation and flagged normal designs as suspect.

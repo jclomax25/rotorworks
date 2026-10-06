@@ -59,7 +59,7 @@ __all__ = [
     "configure_battery_soc_model", "soc_model_short_label",
     "pack_ocv_from_soc", "pack_resistance_from_soc", "cell_soc_from_usable",
     "pack_voltage_under_load", "solve_pack_for_power", "soc_after_energy_draw",
-    "pack_resistance_at", "pack_draw",
+    "pack_resistance_at", "pack_draw", "tilted_drag_area",
     # wind
     "wind_components_mps", "groundspeed_along_track_mps",
     # rotor inflow
@@ -1480,6 +1480,25 @@ def translation_drag_area(frontal_area_m2: float,
     a_front = max(float(frontal_area_m2), 0.0)
     a_side = max(float(side_area_m2), 0.0)
     return a_front * math.cos(psi) ** 2 + a_side * math.sin(psi) ** 2
+
+
+def tilted_drag_area(level_area_m2: float, top_area_m2: float, tilt_rad: float) -> float:
+    """
+    Area a multirotor presents to the airflow when tilted by `tilt_rad`.
+
+    A drag silhouette is measured with the aircraft LEVEL. Translating, it
+    pitches (or rolls) into the direction of travel, and the airflow then
+    sees part of its plan view as well:
+
+        A(theta) = A_level * cos(theta) + A_top * sin(theta)
+
+    exact for the projected area of a rectangular prism. The plan area is
+    typically 2-3x the frontal one, so at 20 deg of tilt the level-only
+    figure understates the area by roughly 60-90%.
+    """
+    th = max(float(tilt_rad), 0.0)
+    return (max(float(level_area_m2), 0.0) * math.cos(th)
+            + max(float(top_area_m2), 0.0) * math.sin(th))
 
 
 def pitch_roll_from_tilt(tilt_deg: float, azimuth_deg: float) -> Tuple[float, float]:

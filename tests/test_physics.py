@@ -310,8 +310,12 @@ def test_forward_drag_does_not_double_count_arms(mc, mc_quad):
     V = 12.0
     q = 0.5 * mc_quad.air_density * V ** 2
     fwd = mc.drag_force_required(mc_quad, V, "forward")
-    expected = q * mc_quad.parasite_area * mc_quad.parasite_drag_coefficient
+    # The frontal silhouette, tilted (audit D1): never the side profile too.
+    tilt = math.radians(mc.required_tilt_deg(mc_quad, V, "forward"))
+    expected = q * mc.core.tilted_drag_area(
+        mc_quad.parasite_area, mc_quad.top_area, tilt) * mc_quad.parasite_drag_coefficient
     assert fwd == pytest.approx(expected, rel=1e-9)
+    assert fwd < q * (mc_quad.parasite_area + mc_quad.profile_area) * mc_quad.parasite_drag_coefficient
 
 
 def test_hover_drag_uses_side_profile(mc, mc_quad):
@@ -2085,8 +2089,8 @@ def test_the_m30_documents_where_this_model_stops_being_accurate(mc):
     # It reading higher for the smaller rotor is a symptom of the missing
     # size dependence, not its cause. Pinned so a fix is noticed.
     m300, _ = _load_dji_config(mc, "multicopter_dji_m300_rtk.json")
-    fom_small = mc.compute_operating_metrics(m30, 0.0, "hover")["figure_of_merit"]
-    fom_large = mc.compute_operating_metrics(m300, 0.0, "hover")["figure_of_merit"]
+    fom_small = mc.compute_operating_metrics(m30, 0.0, "hover")["hover_drive_efficiency"]
+    fom_large = mc.compute_operating_metrics(m300, 0.0, "hover")["hover_drive_efficiency"]
     assert fom_small > fom_large, (
         "the small-rotor figure of merit is no longer above the large-rotor "
         "one — the scaling may have been corrected, so revisit the M30 gap")
@@ -2659,3 +2663,181 @@ def test_cli_switching_loss_flag_reaches_the_esc(mc, fw, which, monkeypatch):
 def test_batch_maps_the_switching_loss_field(rw):
     assert rw.GUI_TO_CLI_MULTICOPTER["esc_switching_loss"] == "esc_switching_loss_pct"
     assert rw.GUI_TO_CLI_FIXEDWING["esc_sw"] == "esc_switching_loss_pct"
+
+
+# ----------------------------------------------------------------------
+# Audit D1 (and G8's attitude and wind figures): forward drag used the
+# LEVEL frontal silhouette, though a translating multirotor is tilted and
+# presents A_front cos(theta) + A_top sin(theta). The top area was
+# "reference only".
+# ----------------------------------------------------------------------
+
+def test_mc_geometry_estimates_a_plan_area(mc, mc_quad):
+    expected = (mc_quad.body_length_m * mc_quad.body_width_m
+                + mc_quad.num_motors * mc_quad.arm_width_m * mc_quad.arm_length_m)
+    assert mc_quad.top_area == pytest.approx(expected, rel=1e-12)
+    assert mc_quad.top_area > mc_quad.parasite_area
+
+
+def test_mc_translating_drag_uses_the_tilted_silhouette(mc, mc_quad):
+    v = 16.0
+    q = 0.5 * mc_quad.air_density * v * v
+    drag = mc.drag_force_required(mc_quad, v, "translating")
+    tilt = math.radians(mc.required_tilt_deg(mc_quad, v, "translating"))
+    weight = mc_quad.drone_weight_g * 9.81 / 1000.0
+    assert math.tan(tilt) == pytest.approx(drag / weight, rel=1e-9)
+    assert drag == pytest.approx(q * mc_quad.parasite_drag_coefficient * (
+        mc_quad.parasite_area * math.cos(tilt) + mc_quad.top_area * math.sin(tilt)), rel=1e-9)
+    level_only = q * mc_quad.parasite_drag_coefficient * mc_quad.parasite_area
+    assert drag > level_only * 1.2
+
+
+def test_mc_without_a_top_area_drag_is_the_level_silhouette(mc, mc_quad):
+    mc_quad.top_area = 0.0
+    v = 16.0
+    q = 0.5 * mc_quad.air_density * v * v
+    assert mc.drag_force_required(mc_quad, v, "translating") == pytest.approx(
+        q * mc_quad.parasite_drag_coefficient * mc_quad.parasite_area, rel=1e-12)
+
+
+def test_mc_hover_wind_limit_counts_the_plan_area(mc, mc_quad):
+    with_top = mc.hover_wind_resistance_mps(mc_quad)
+    mc_quad.top_area = 0.0
+    level_only = mc.hover_wind_resistance_mps(mc_quad)
+    assert with_top < level_only * 0.9
+
+
+def test_mc_cli_top_area_reaches_the_config(mc, monkeypatch):
+    from test_cli import MC_BASE
+    seen = _capture_metrics(monkeypatch, mc, "compute_operating_metrics")
+    monkeypatch.setattr(sys, "argv", ["sim"] + MC_BASE + ["--top_area", "0.0612"])
+    mc.main()
+    assert seen[-1][0].top_area == 0.0612
+
+
+def test_batch_maps_the_top_area(rw):
+    assert rw.GUI_TO_CLI_MULTICOPTER["top_area"] == "top_area"
+    assert "top_area" in rw.SIMPLE_ARGS_MULTICOPTER
+
+
+# ----------------------------------------------------------------------
+# Audit M7 and G8: the "figure of merit" was ideal over ELECTRICAL power,
+# a whole-drivetrain number, checked against rotor-FoM thresholds and
+# clamped silently at 1.5.
+# ----------------------------------------------------------------------
+
+def test_mc_hover_drive_efficiency_is_ideal_over_electrical(mc, mc_quad):
+    m = mc.compute_operating_metrics(mc_quad, 0.0, "hover")
+    assert "figure_of_merit" not in m
+    thrust = mc.thrust_required(mc_quad, 0.0, "hover")
+    # hover_efficiency_gW is thrust (g) over the same electrical power.
+    electrical = (thrust * 1000.0 / 9.81) / m["hover_efficiency_gW"]
+    assert m["hover_drive_efficiency"] == pytest.approx(
+        mc.hover_ideal_induced_power_W(mc_quad, thrust) / electrical, rel=1e-6)
+
+
+def test_mc_hover_drive_efficiency_is_not_clamped(mc, mc_quad):
+    thrust = mc.thrust_required(mc_quad, 0.0, "hover")
+    ideal = mc.hover_ideal_induced_power_W(mc_quad, thrust)
+    assert mc.hover_drive_efficiency(mc_quad, thrust, ideal / 2.0) == pytest.approx(2.0)
+
+
+def test_mc_cli_prints_and_batch_reads_the_drive_efficiency(mc, rw, monkeypatch, capsys):
+    from test_cli import MC_BASE
+    seen = _capture_metrics(monkeypatch, mc, "compute_operating_metrics")
+    monkeypatch.setattr(sys, "argv", ["sim"] + MC_BASE + ["--orientation", "hover"])
+    mc.main()
+    out = capsys.readouterr().out
+    assert "Figure of Merit" not in out
+    parsed = rw.parse_metrics("multicopter", out)
+    expected = [m for _c, m in seen if "climb_rate_cmd_mps" in m][-1]["hover_drive_efficiency"]
+    assert parsed["hover_drive_efficiency"] == pytest.approx(expected, abs=5e-4)
+
+
+# ----------------------------------------------------------------------
+# Audit M1: the performance figure drew motor input (electrical) power as
+# "Mechanical (to the air)", and the export called it "Power Mechanical".
+# ----------------------------------------------------------------------
+
+def test_mc_ideal_rotor_power_is_momentum_theory(mc, mc_quad):
+    for v in (0.0, 8.0, 16.0):
+        t = mc.thrust_required(mc_quad, v, "forward") / mc_quad.num_motors
+        tilt = math.radians(mc.required_tilt_deg(mc_quad, v, "forward")) if v > 0 else 0.0
+        area = mc.disk_area(mc_quad.propeller.diameter_in)
+        v_h = math.sqrt(t / (2.0 * mc_quad.air_density * area))
+        v_i = mc.induced_velocity_forward_flight(v_h, v, tilt)
+        assert mc.ideal_rotor_power_W(mc_quad, v, "forward") == pytest.approx(
+            mc_quad.num_motors * t * (v * math.sin(tilt) + v_i), rel=1e-9)
+        assert mc.ideal_rotor_power_W(mc_quad, v, "forward") < mc.power_required(
+            mc_quad, v, "forward")
+
+
+def test_mc_performance_figure_labels_each_power(mc, mc_quad):
+    fig = mc.make_performance_figure(mc_quad, max_speed=20.0)
+    ax = fig.axes[1]
+    labels = [ln.get_label() for ln in ax.lines]
+    assert "Mechanical (to the air)" not in labels
+    assert {"Electrical (from pack)", "Motor input (electrical)",
+            "Ideal rotor power (to the air)"} <= set(labels)
+    ideal = next(ln for ln in ax.lines if ln.get_label() == "Ideal rotor power (to the air)")
+    motor = next(ln for ln in ax.lines if ln.get_label() == "Motor input (electrical)")
+    xs = list(ideal.get_xdata())
+    k = len(xs) // 2
+    assert ideal.get_ydata()[k] * 1000 == pytest.approx(
+        mc.ideal_rotor_power_W(mc_quad, xs[k], "forward"), rel=1e-9)
+    assert all(i < m for i, m in zip(ideal.get_ydata(), motor.get_ydata()))
+
+
+# ----------------------------------------------------------------------
+# Audit M8: forward-flight power had no blade profile power growing with
+# advance ratio.
+# ----------------------------------------------------------------------
+
+def test_mc_profile_power_grows_with_advance_ratio(mc, mc_quad):
+    t = mc.thrust_required(mc_quad, 0.0, "hover") / mc_quad.num_motors
+    assert mc.profile_power_growth_W(mc_quad, t, 0.0) == 0.0
+    p0, tip = mc._hover_profile_power_W(mc_quad, t)
+    assert p0 > 0 and tip > 0
+    for v in (8.0, 16.0):
+        mu = v / tip
+        assert mc.profile_power_growth_W(mc_quad, t, v) == pytest.approx(
+            p0 * mc.PROFILE_POWER_K * mu * mu, rel=1e-9)
+    assert mc.profile_power_growth_W(mc_quad, t, 16.0) == pytest.approx(
+        4.0 * mc.profile_power_growth_W(mc_quad, t, 8.0), rel=1e-9)
+
+
+@pytest.mark.parametrize("with_table", [False, True])
+def test_mc_forward_power_charges_the_profile_growth(mc, mc_quad, monkeypatch, with_table):
+    drone = _quad_with_table(mc) if with_table else mc_quad
+    hover = mc.power_required(drone, 0.0, "hover")
+    fast = mc.power_required(drone, 16.0, "forward")
+    monkeypatch.setattr(mc, "PROFILE_POWER_K", 0.0)
+    assert mc.power_required(drone, 0.0, "hover") == pytest.approx(hover, rel=1e-12)
+    assert fast > mc.power_required(drone, 16.0, "forward") * 1.01
+
+
+def test_mc_profile_growth_lowers_the_best_range_speed(mc, mc_quad, monkeypatch):
+    _be, _bm, with_growth, _km = mc.find_optimal_speeds(mc_quad)
+    monkeypatch.setattr(mc, "PROFILE_POWER_K", 0.0)
+    _be, _bm, without, _km = mc.find_optimal_speeds(mc_quad)
+    assert with_growth <= without
+
+
+# ----------------------------------------------------------------------
+# Audit S6: mission Compare used a worst-case dict that merged only some
+# keys, so attitude, tip Mach and losses kept the first step's values, and
+# the mission totals were not compared at all.
+# ----------------------------------------------------------------------
+
+def test_mc_mission_worst_case_merges_attitude_and_totals(mc, tmp_path):
+    drone = _heavy_lift(mc)
+    mission = _square_mission(mc, tmp_path, speed=12.0)
+    _res, worst, s = mc.simulate_mission(drone, mission)
+    assert worst["tilt_required_deg"] == pytest.approx(max(s["tilt_deg"]), rel=1e-9)
+    assert worst["tilt_required_deg"] > s["tilt_deg"][0]
+    assert worst["mission_time_min"] == pytest.approx(s["t_s"][-1] / 60.0, rel=1e-9)
+    assert worst["mission_distance_km"] == pytest.approx(s["distance_km"][-1], rel=1e-9)
+    assert worst["energy_remaining_Wh"] == pytest.approx(s["battery_energy_Wh"][-1], rel=1e-9)
+    assert worst["mission_energy_Wh"] == pytest.approx(
+        drone.battery.usable_Wh - s["battery_energy_Wh"][-1], rel=1e-9)
+    assert worst["peak_motor_temp_C"] == pytest.approx(max(s["motor_temp_est_C"]), rel=1e-9)

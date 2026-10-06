@@ -30,7 +30,7 @@ SNAPSHOT = os.path.join(HERE, "golden_snapshot.json")
 MC_KEYS = [
     "total_power_W", "motor_power_W", "esc_loss_W", "pack_current_A",
     "v_load_V", "thrust_total_N", "thrust_per_motor_N", "tilt_required_deg",
-    "disk_loading_N_m2", "hover_efficiency_gW", "figure_of_merit",
+    "disk_loading_N_m2", "hover_efficiency_gW", "hover_drive_efficiency",
     "motor_temp_est_C", "reserve_margin_Wh",
 ]
 

@@ -548,3 +548,13 @@ def test_scale_tip_does_not_recommend_the_diagonal(paths):
     text = open(paths["dragcalc"], encoding="utf-8").read()
     assert "Use the motorbase (distance between opposite motors)" not in text
     assert "motorbase / 1.414" in text
+
+
+def test_top_area_is_exported_to_the_multicopter(paths):
+    """Audit D1: the top area was "reference only", though a translating
+    multicopter is tilted and presents front*cos + top*sin of the tilt."""
+    text = open(paths["dragcalc"], encoding="utf-8").read()
+    assert "reference only" not in text
+    export = text[text.index('"multicopter_sim": {'):]
+    export = export[:export.index("},")]
+    assert '"top_area"' in export

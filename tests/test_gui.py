@@ -935,3 +935,38 @@ def test_metrics_pack_resistance_is_the_one_in_use(request, which):
     # sag / current, to the rounding of the two displayed figures.
     implied_mohm = sag_V / current_A * 1000.0
     assert abs(shown_mohm - implied_mohm) <= 0.005 / current_A * 1000.0 + 0.06
+
+
+def test_mc_mission_compare_uses_the_mission_totals(mc_gui, paths, monkeypatch):
+    """Audit S6: mission Compare showed single-point rows ("—" for flight
+    time and range) and left out the mission's own totals."""
+    import tkinter.messagebox as mb
+    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: True)
+    _browse_mission(mc_gui, os.path.join(paths["missions"], "mc_02_takeoff_square_land.json"))
+    assert mc_gui.click("Run Mission") == []
+    assert mc_gui.click("Pin Current") == []
+    mc_gui.pump()
+    tree = _tree_with(mc_gui, "metric", "delta", "pct")
+    labels = [str(tree.item(r, "values")[0]) for r in tree.get_children()]
+    assert "Mission energy (Wh)" in labels and "Energy remaining (Wh)" in labels
+    assert "Flight time (min)" not in labels
+    for r in tree.get_children():
+        values = tree.item(r, "values")
+        assert values[1] != "—", f"{values[0]} has no mission value"
+
+
+def test_mc_status_judges_the_drive_efficiency_as_a_drivetrain(mc_gui):
+    """Audit M7, G8: the whole-drivetrain number was labelled a rotor
+    figure of merit and checked against rotor thresholds."""
+    assert mc_gui.click("Fixed Speed Sweep") == []
+    rows = {}
+    for w in mc_gui.refresh():
+        if isinstance(w, ttk.Treeview):
+            for iid in w.get_children():
+                v = w.item(iid, "values")
+                if v:
+                    rows[str(v[0])] = v
+    assert "Figure of merit" not in rows
+    row = rows["Hover drive efficiency"]
+    assert float(str(row[2]).split()[-1]) in (pytest.approx(0.56), pytest.approx(0.48),
+                                             pytest.approx(0.36))

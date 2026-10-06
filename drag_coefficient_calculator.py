@@ -790,13 +790,15 @@ class BodyDragTab(ttk.Frame):
     Multicopter sim mapping
     -----------------------
     The simulator applies:
-        forward flight :  F = ½ρV² × parasite_area × parasite_drag_coefficient
+        forward flight :  F = ½ρV² × A(θ) × parasite_drag_coefficient
+                          A(θ) = parasite_area·cosθ + top_area·sinθ
         hover/lateral  :  F = ½ρV² × profile_area  × profile_drag_coefficient
 
     So the mapping is driven by which silhouette meets the airflow:
         FRONT area → parasite_area  (nose-on, forward flight)
         SIDE  area → profile_area   (side-on, lateral translation in hover)
-        TOP   area → vertical/descent drag; reported for reference only.
+        TOP   area → top_area: translating, the aircraft tilts by θ and the
+                     airflow sees part of its plan view as well.
 
     Front and side also feed ArduPilot's EK3_DRAG_BCOEF_X and _Y.
     """
@@ -886,6 +888,7 @@ class BodyDragTab(ttk.Frame):
         self._lbl_par_cd    = res_row(sim, "parasite_drag_coeff:")
         self._lbl_prof_area = res_row(sim, "profile_area:")
         self._lbl_prof_cd   = res_row(sim, "profile_drag_coeff:")
+        self._lbl_sim_top   = res_row(sim, "top_area:")
 
         # Notes
         note = (
@@ -893,7 +896,8 @@ class BodyDragTab(ttk.Frame):
             "• parasite_area = FRONT area (forward-flight drag)\n"
             "• profile_area  = SIDE  area (lateral drag while hovering)\n"
             "• Both use the same body Cd entered above\n"
-            "• Top area is reference only (vertical/descent drag)"
+            "• top_area = TOP area: the aircraft tilts to translate, so\n"
+            "  forward drag uses front·cos(tilt) + top·sin(tilt)"
         )
         ttk.Label(res_outer, text=note, foreground="#666666",
                   font=("TkDefaultFont", 8), justify="left").grid(
@@ -967,8 +971,9 @@ class BodyDragTab(ttk.Frame):
         # Multicopter sim mapping:
         #   parasite_area ← FRONT silhouette (forward flight, nose-on)
         #   profile_area  ← SIDE  silhouette (lateral translation in hover)
-        # The top-view area is NOT used for either of these; it describes
-        # vertical/descent drag and is reported for reference only.
+        #   top_area      ← TOP   silhouette: translating, the aircraft
+        #                   tilts by theta and presents
+        #                   front*cos(theta) + top*sin(theta) (audit D1).
         par_area  = front_a
         prof_area = side_a
 
@@ -990,6 +995,7 @@ class BodyDragTab(ttk.Frame):
         self._lbl_par_cd.configure(text=f"{cd:.2f}")
         self._lbl_prof_area.configure(text=fmt_a(prof_area))
         self._lbl_prof_cd.configure(text=f"{cd:.2f}")
+        self._lbl_sim_top.configure(text=fmt_a(top_a))
 
         self._last_results = {
             "mass_kg":           mass_kg,
@@ -1006,6 +1012,7 @@ class BodyDragTab(ttk.Frame):
                 "parasite_drag_coefficient": round(cd, 4),
                 "profile_area":              round(prof_area, 6),
                 "profile_drag_coefficient":  round(cd, 4),
+                **({"top_area": round(top_a, 6)} if top_a is not None else {}),
             },
         }
 

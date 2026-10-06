@@ -213,6 +213,9 @@ def parse_metrics(sim: str, stdout: str) -> Dict[str, Any]:
         cap_float(r"Best range speed.*:\s*([-+]?\d*\.?\d+)\s*m/s", "best_range_speed_mps")
         cap_float(r"Hover Efficiency\s*:\s*([-+]?\d*\.?\d+)", "hover_efficiency_gW")
         cap_float(r"Figure of Merit.*:\s*([-+]?\d*\.?\d+)", "figure_of_merit")
+        # The multicopter's ideal / electrical hover figure (a whole-drivetrain
+        # efficiency, not a rotor figure of merit; audit M7).
+        cap_float(r"Hover Drive Efficiency\s*:\s*([-+]?\d*\.?\d+)", "hover_drive_efficiency")
         cap_float(r"Disk Loading\s*:\s*([-+]?\d*\.?\d+)", "disk_loading_N_m2")
         cap_float(r"SoC / model source\s*:\s*([-+]?\d*\.?\d+)\s*%", "soc_percent")
         cap_str(r"SoC / model source\s*:\s*[-+]?\d*\.?\d+\s*%\s*/\s*(.+)$", "soc_model_source")
@@ -552,7 +555,7 @@ SIMPLE_ARGS_MULTICOPTER = {
     "num_motors", "weight", "payload_mass_g", "speed", "area",
     "motor_configuration", "coaxial_spacing_m", "max_tilt_deg",
     "drag_model_mode", "parasite_drag", "parasite_area",
-    "profile_drag", "profile_area",
+    "profile_drag", "profile_area", "top_area",
     "body_length_m", "body_width_m", "body_height_m",
     "arm_length_m", "arm_width_m",
     # Battery
@@ -662,6 +665,7 @@ GUI_TO_CLI_MULTICOPTER = {
     "drag_model_mode": "drag_model_mode",
     "profile_drag": "profile_drag", "profile_area": "profile_area",
     "parasite_drag": "parasite_drag", "parasite_area": "parasite_area",
+    "top_area": "top_area",
     "body_length_m": "body_length_m", "body_width_m": "body_width_m",
     "body_height_m": "body_height_m", "arm_length_m": "arm_length_m",
     "arm_width_m": "arm_width_m",
