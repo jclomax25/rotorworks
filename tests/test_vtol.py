@@ -4763,3 +4763,38 @@ def test_cli_rotor_positions_reach_the_config(vtol):
 
 def test_batch_maps_the_rotor_positions(rw):
     assert rw.gui_to_cli_vtol()["lift_positions"] == "lift_rotor_positions"
+
+
+@pytest.mark.gui
+def test_a_mission_export_carries_its_time_series(gui, tmp_path):
+    """Audit E8: after a mission only the per-phase table was exported,
+    although the Mission Plots tab draws a full time series."""
+    import tkinter.filedialog as filedialog
+    _load_mission(gui)
+    gui.click("Run Mission")
+    target = tmp_path / "mission.csv"
+    filedialog.asksaveasfilename = lambda *a, **k: str(target)
+    gui.invoke_menu("File", "Export CSV…")
+    lines = target.read_text().splitlines()
+    i = lines.index("[Mission Series]")
+    header = lines[i + 1].split(",")
+    assert "total_power_W" in header and len(lines) > i + 20
+
+
+@pytest.mark.gui
+def test_exported_status_values_are_numbers(gui, tmp_path):
+    """Audit E5: exported cells were display strings."""
+    import csv
+    import tkinter.filedialog as filedialog
+    gui.click("Fixed Speed Sweep")
+    target = tmp_path / "out.csv"
+    filedialog.asksaveasfilename = lambda *a, **k: str(target)
+    gui.invoke_menu("File", "Export CSV…")
+    rows = list(csv.reader(target.read_text().splitlines()))
+    i = rows.index(["[Battery Status]"])
+    header = rows[i + 1]
+    assert header[1:4] == [header[1], "Unit", f"{header[1]} (display)"]
+    assert header[-1] == "Result"
+    body = [r for r in rows[i + 2:i + 12] if r and not r[0].startswith("[")]
+    numeric = [r for r in body if r[1] not in ("", "None")]
+    assert numeric and all(float(r[1]) == float(r[1]) for r in numeric)

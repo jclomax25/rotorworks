@@ -3586,7 +3586,22 @@ def build_drone_from_args(args) -> DroneConfig:
             switching_loss_pct=args.esc_switching_loss_pct,
         )
 
-    base_weight_g = float(args.weight)
+    # The GUI's two mass modes (audit B8): "enter airframe" builds the
+    # all-up weight from the bare structure and the components, exactly as
+    # the GUI does, rather than flying a saved total that may be stale.
+    enter_airframe = str(getattr(args, "mass_mode", "") or "").strip().lower().startswith("enter")
+    avionics_mass_g = max(float(getattr(args, "avionics_mass", 0.0) or 0.0), 0.0)
+    if enter_airframe:
+        _each = sum(float(v or 0.0) for v in (args.motor_weight, args.prop_weight,
+                                             args.esc_weight))
+        base_weight_g = (max(float(getattr(args, "airframe_mass", 0.0) or 0.0), 0.0)
+                         + _each * int(args.num_motors)
+                         + float(getattr(battery, "weight_g", 0.0) or 0.0)
+                         + avionics_mass_g)
+    else:
+        if args.weight is None:
+            raise SystemExit("--weight is required unless --mass_mode is 'enter airframe'.")
+        base_weight_g = float(args.weight)
     payload_mass_g = max(float(getattr(args, "payload_mass_g", 0.0) or 0.0), 0.0)
     drone = DroneConfig(
         num_motors=args.num_motors,
@@ -3621,6 +3636,10 @@ def build_drone_from_args(args) -> DroneConfig:
         inflow_map_enabled=inflow_map_enabled,
         inflow_mu_bp=inflow_mu_bp,
         inflow_eff_bp=inflow_eff_bp,
+        avionics_mass_g=avionics_mass_g,
+        airframe_mass_g=(float(getattr(args, "airframe_mass", 0.0) or 0.0)
+                         if enter_airframe else 0.0),
+        translation_direction_deg=float(getattr(args, "translation_direction_deg", 0.0) or 0.0),
     )
     drone.payload_mass_g = payload_mass_g
 
@@ -3701,55 +3720,6 @@ def _extract_weight_budget(cfg) -> list:
     rows.append(("Airframe / Structure", airframe_g, 1, airframe_g))
     rows.append(("TOTAL", total_g, 1, total_g))
     return rows
-
-def _export_csv_file(path: str, sweep: dict, metrics: list) -> None:
-    import csv
-    with open(path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["[Performance Sweep]"])
-        if sweep:
-            headers = list(sweep.keys())
-            w.writerow(headers)
-            n = max(len(v) for v in sweep.values())
-            for i in range(n):
-                w.writerow([sweep[h][i] if i < len(sweep[h]) else "" for h in headers])
-        w.writerow([])
-        w.writerow(["[Metrics]"])
-        w.writerow(["Metric", "Value"])
-        for label, value in metrics:
-            w.writerow([label, value])
-
-def _export_excel_file(path: str, sweep: dict, metrics: list, weight_budget: list) -> None:
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment
-    wb = Workbook()
-    ws = wb.active; ws.title = "Performance Sweep"
-    if sweep:
-        headers = list(sweep.keys())
-        for ci, h in enumerate(headers, 1):
-            c = ws.cell(row=1, column=ci, value=h)
-            c.font = Font(bold=True, color="FFFFFF")
-            c.fill = PatternFill("solid", fgColor="1F3864")
-        n = max(len(v) for v in sweep.values())
-        for ri in range(n):
-            for ci, h in enumerate(headers, 1):
-                ws.cell(row=ri+2, column=ci, value=sweep[h][ri] if ri < len(sweep[h]) else None)
-    ws2 = wb.create_sheet("Metrics")
-    ws2.append(["Metric", "Value"])
-    for r in [ws2["A1"], ws2["B1"]]: r.font = Font(bold=True)
-    for label, value in metrics: ws2.append([label, value])
-    ws3 = wb.create_sheet("Weight Budget")
-    ws3.append(["Component", "Unit Weight (g)", "Count", "Total Weight (g)", "% of Total"])
-    for c in ws3[1]: c.font = Font(bold=True)
-    total_g = weight_budget[-1][3] if weight_budget else 1.0
-    for label, uw, cnt, tw in weight_budget[:-1]:
-        pct = round(tw/total_g*100, 1) if total_g > 0 else 0
-        ws3.append([label, round(uw,1), cnt, round(tw,1), pct])
-    if weight_budget:
-        label, uw, cnt, tw = weight_budget[-1]
-        ws3.append([label, "", "", round(tw,1), 100.0])
-        for c in list(ws3.rows)[-1]: c.font = Font(bold=True)
-    wb.save(path)
 
 def _generate_pdf_report(path: str, report_title: str,
                           inputs_rows: list, metrics_rows: list,
@@ -4442,7 +4412,9 @@ def launch_gui():
     # ------------------------------------------------------------------ #
     root = tk.Tk()
     root.title(f"Multicopter Power Simulator  v{SIM_VERSION}")
-    root.minsize(1100, 700)
+    # Sized to the screen: a minimum size alone let the window open at
+    # its contents' requested width, wider than the screen (audit G1).
+    _win_w, _win_h = core.fit_window_to_screen(root)
     root.columnconfigure(0, weight=1)
     root.rowconfigure(0, weight=1)
 
@@ -4456,7 +4428,7 @@ def launch_gui():
 
     _view = {
         "scale_pct":    100,
-        "plot_w":       15.0,
+        "plot_w":       core.plot_width_in(_win_w),
         "plot_h":        9.0,
         "mpl_fontsize":  9,
         "ui_fontsize":   9,
@@ -4471,7 +4443,9 @@ def launch_gui():
             root.tk.call("tk", "scaling", factor)
         except Exception:
             pass
-        root.minsize(int(1100 * pct / 100), int(700 * pct / 100))
+        # Never larger than the screen (audit G1).
+        root.minsize(min(int(1100 * pct / 100), root.winfo_screenwidth() - 40),
+                     min(int(700 * pct / 100), root.winfo_screenheight() - 80))
         root.update_idletasks()
 
     def _apply_ui_font(size: int) -> None:
@@ -8739,6 +8713,30 @@ def launch_gui():
                 pass
         return rows
 
+    def _export_sections() -> list:
+        """
+        Every table the tool shows, as export sections: the sweep or the
+        mission's time series, Metrics, each Status table, the Power Budget
+        (single point only, as on screen) and the Weight Budget.
+
+        The CSV and workbook used to hold the sweep and Metrics only, while
+        the VTOL exported every table (audit E8). Each value cell is split
+        into a number, its unit and the display text, so a spreadsheet can
+        compute with it; they were display strings with the explanation
+        folded in (audit E5).
+        """
+        from_mission = bool(_last_run.get("from_mission"))
+        sections = [core.series_section(
+            "Mission Series" if from_mission else "Performance Sweep", _last_run_sweep),
+            core.tree_section("Metrics", metrics_tv)]
+        sections += [core.tree_section(f"Status - {title}", tv, with_tags=True)
+                     for tv, title in _status_tv_pairs]
+        if not from_mission:
+            sections.append(core.tree_section("Power Budget", pb_tv))
+        cfg = _last_run_cfg[0]
+        sections.append(core.weight_budget_section(_extract_weight_budget(cfg) if cfg else []))
+        return sections
+
     def _do_export_csv():
         if not _last_run_sweep:
             messagebox.showinfo("No data", "Run a simulation first to generate sweep data.")
@@ -8748,7 +8746,7 @@ def launch_gui():
             filetypes=[("CSV files","*.csv"),("All files","*.*")])
         if not path: return
         try:
-            _export_csv_file(path, _last_run_sweep, _get_metrics_rows())
+            core.export_csv(path, _export_sections())
             messagebox.showinfo("Exported", f"CSV saved to:\n{path}")
         except Exception as e:
             messagebox.showerror("Export error", str(e))
@@ -8762,9 +8760,7 @@ def launch_gui():
             filetypes=[("Excel files","*.xlsx"),("All files","*.*")])
         if not path: return
         try:
-            cfg = _last_run_cfg[0]
-            wb  = _extract_weight_budget(cfg) if cfg else []
-            _export_excel_file(path, _last_run_sweep, _get_metrics_rows(), wb)
+            core.export_excel(path, _export_sections())
             messagebox.showinfo("Exported", f"Excel saved to:\n{path}")
         except Exception as e:
             messagebox.showerror("Export error", str(e))
@@ -8895,6 +8891,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_motors", type=int, required=False)
     parser.add_argument("--weight", type=float, required=False, help="Base drone weight excluding payload (g)")
     parser.add_argument("--payload_mass_g", type=float, default=0.0, help="Payload mass added to base drone weight (g)")
+    parser.add_argument("--mass_mode", type=str, default="derive airframe",
+                        help="'derive airframe' (default): --weight is the all-up weight "
+                             "without payload. 'enter airframe': the weight is built from "
+                             "--airframe_mass plus the components, as in the GUI.")
+    parser.add_argument("--airframe_mass", type=float, default=None,
+                        help="Bare structure mass (g), used in 'enter airframe' mode.")
+    parser.add_argument("--avionics_mass", type=float, default=None,
+                        help="Avionics mass (g), a component of the weight budget.")
+    parser.add_argument("--translation_direction_deg", type=float, default=0.0,
+                        help="Direction of travel from the nose (deg): 0 forward, 90 right.")
     parser.add_argument("--profile_drag", type=float, default=0.0, help="Profile drag coefficient")
     parser.add_argument("--profile_area", type=float, default=0.0, help="Rotor/arms profile reference area (m^2)")
     parser.add_argument("--parasite_drag", type=float, default=0.0, help="Parasite drag coefficient (fuselage/arms)")
@@ -8979,6 +8985,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--esc_idle_current", type=float, required=False)
     parser.add_argument("--esc_resistance", type=float, required=False)
     parser.add_argument("--esc_weight", type=float, required=False)
+    parser.add_argument("--metrics_json", type=str, default=None,
+                        help="Also write the run's metrics, at full precision, to this "
+                             "JSON file (used by rotorworks-batch).")
     parser.add_argument("--esc_switching_loss_pct", type=float, default=None,
                         help=f"ESC switching loss, %% of the power passed "
                              f"(default {ESC_SWITCHING_LOSS_PCT_DEFAULT:g})")
@@ -9176,6 +9185,11 @@ def main():
         )
         for name, time_min, dist_km, status in results:
             print(f"{name}: {time_min:.1f} min, {dist_km:.2f} km, {status}")
+        core.write_metrics_json(
+            args.metrics_json, _worst_metrics or {},
+            flight_time_min=sum(r[1] for r in results),
+            flight_range_km=sum(r[2] for r in results),
+            mission_status="; ".join(f"{r[0]}: {r[3]}" for r in results if r[3] != "OK") or "OK")
     else:
         be_v, be_min, br_v, br_km = find_optimal_speeds(drone)
         # Same entry point as the GUI's fixed-speed run, so hover is evaluated
@@ -9268,6 +9282,12 @@ def main():
                  f"{m['wire_temp_C']:.0f} C" if float(m.get('wire_resistance_ohm', 0.0) or 0.0) > 0 else "")
         if _lead:
             print(_lead)
+        # Machine-readable results at full precision, for the batch driver
+        # (audit B6).
+        core.write_metrics_json(
+            args.metrics_json, metrics, flight_time_min=t_min, flight_range_km=d_km,
+            best_endurance_speed_mps=be_v, best_endurance_min=be_min,
+            best_range_speed_mps=br_v, best_range_km=br_km)
 
     if args.plot:
         plot_performance(drone)

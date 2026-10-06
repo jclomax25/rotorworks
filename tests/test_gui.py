@@ -970,3 +970,39 @@ def test_mc_status_judges_the_drive_efficiency_as_a_drivetrain(mc_gui):
     row = rows["Hover drive efficiency"]
     assert float(str(row[2]).split()[-1]) in (pytest.approx(0.56), pytest.approx(0.48),
                                              pytest.approx(0.36))
+
+
+@pytest.mark.parametrize("which", ["mc", "fw"])
+def test_the_window_fits_the_screen(request, which):
+    """Audit G1: the windows opened at their requested width, 1,933 px,
+    and grew past 2,500 px after a run."""
+    gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
+    assert gui.click("Fixed Speed Sweep") == []
+    gui.pump()
+    root = gui.root
+    root.update_idletasks()
+    assert root.winfo_width() <= root.winfo_screenwidth()
+    assert root.winfo_height() <= root.winfo_screenheight()
+
+
+@pytest.mark.parametrize("which", ["mc", "fw"])
+def test_export_carries_every_table_with_numbers(request, which, tmp_path):
+    """Audit E5, E8: the CSV held the sweep and display-string Metrics only;
+    the Status tables, Power Budget and Weight Budget were missing."""
+    import csv
+    gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
+    assert gui.click("Fixed Speed Sweep") == []
+    dest = tmp_path / "out.csv"
+    gui.set_save_dialog(str(dest))
+    assert gui.click("Export CSV") == []
+    rows = list(csv.reader(dest.read_text(encoding="utf-8").splitlines()))
+    titles = [r[0] for r in rows if r and r[0].startswith("[")]
+    assert "[Performance Sweep]" in titles and "[Metrics]" in titles
+    assert "[Status - Battery Status]" in titles
+    assert "[Power Budget]" in titles and "[Weight Budget]" in titles
+    i = rows.index(["[Metrics]"])
+    assert rows[i + 1][:4] == ["Metric", "Value", "Unit", "Value (display)"]
+    numbers = [r for r in rows[i + 2:] if len(r) > 2 and r[1] not in ("", "None")]
+    assert len(numbers) > 20
+    for r in numbers[:50]:
+        float(r[1])

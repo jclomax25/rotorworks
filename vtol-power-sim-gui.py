@@ -3995,6 +3995,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="VTOL UAV power and endurance simulator.")
     p.add_argument("--gui", action="store_true", help="Open the graphical interface.")
+    p.add_argument("--metrics_json", type=str, default=None,
+                   help="Also write the run's metrics, at full precision, to this "
+                        "JSON file (used by rotorworks-batch).")
     p.add_argument("--config", type=str, default=None,
                    help="A configuration saved by the GUI. Flags given as well "
                         "override the values in it.")
@@ -4209,7 +4212,8 @@ def run_settings(values: dict) -> dict:
 
 def _print_single_point(cfg: VTOLConfig, wind_mps: float = 0.0,
                         wind_direction_deg: float = 0.0,
-                        course_deg: float = 0.0) -> None:
+                        course_deg: float = 0.0,
+                        metrics_json: Optional[str] = None) -> None:
     m = compute_metrics(cfg, wind_mps=wind_mps,
                         wind_direction_deg=wind_direction_deg,
                         course_deg=course_deg)
@@ -4249,6 +4253,12 @@ def _print_single_point(cfg: VTOLConfig, wind_mps: float = 0.0,
     print(f"  Usable energy        : {m['usable_Wh']:.1f} Wh")
     print(f"  SoC model            : {m['soc_model']}")
     print_performance_summary(m, print)
+    # Machine-readable results at full precision, for the batch driver
+    # (audit B6). flight_time_min and flight_range_km are the cruise figures,
+    # the ones comparable to the other simulators' single answer; the hover
+    # endurance travels under its own name.
+    core.write_metrics_json(metrics_json, m, flight_time_min=m["cruise_endurance_min"],
+                            flight_range_km=m["cruise_range_km"])
 
 
 def _fmt(x, fmt="{:.2f}", na="n/a") -> str:
@@ -4316,7 +4326,8 @@ def _print_mission(cfg: VTOLConfig, path: str,
                    wind_mps: float = 0.0,
                    wind_direction_deg: float = 0.0,
                    max_accel: float = 0.0, max_decel: float = 0.0,
-                   regen_eff: float = 0.0) -> None:
+                   regen_eff: float = 0.0,
+                   metrics_json: Optional[str] = None) -> None:
     if not os.path.exists(path):
         raise SystemExit(f"Mission file not found: {path}")
     try:
@@ -4345,6 +4356,10 @@ def _print_mission(cfg: VTOLConfig, path: str,
           f"(reserve target {totals['reserve_Wh']:.1f} Wh)")
     for line in mission_summary_lines(totals):
         print(line)
+    core.write_metrics_json(
+        metrics_json, totals, flight_time_min=totals["time_s"] / 60.0,
+        flight_range_km=totals["distance_m"] / 1000.0,
+        mission_status="; ".join(f"{r[0]}: {r[5]}" for r in results if r[5] != "OK") or "OK")
 
 
 def mission_summary_lines(totals: dict) -> List[str]:
@@ -4380,11 +4395,13 @@ def main() -> None:
     try:
         if run["mission"]:
             _print_mission(cfg, run["mission"], run["wind"], run["wind_dir"],
-                           run["accel"], run["decel"], run["regen"])
+                           run["accel"], run["decel"], run["regen"],
+                           metrics_json=args.metrics_json)
         else:
             _print_single_point(cfg, wind_mps=run["wind"],
                                 wind_direction_deg=run["wind_dir"],
-                                course_deg=run["course"])
+                                course_deg=run["course"],
+                                metrics_json=args.metrics_json)
     except NotImplementedError as exc:
         raise SystemExit(str(exc))
 
@@ -4407,7 +4424,8 @@ def launch_gui(args=None) -> None:
 
     root = tk.Tk()
     root.title(f"VTOL Power Simulator  v{SIM_VERSION}")
-    root.geometry("1500x900")
+    # 1500 x 900, or the screen if that is smaller (audit G1).
+    core.fit_window_to_screen(root, 1500, 900)
     root.columnconfigure(1, weight=1)
     root.rowconfigure(1, weight=1)
 
@@ -7454,18 +7472,31 @@ def launch_gui(args=None) -> None:
             rows.append(row)
         return ("Speed Sweep", [h for h, _k, _d in cols], rows)
 
-    def _export_sections():
+    def _export_sections(for_report: bool = False):
+        """The tables for an export. `for_report` keeps them as displayed,
+        with no time series, for the PDF, whose tables are sized to fit the
+        page."""
         cfg = _export_state["cfg"]
         if cfg is None:
             return None
-        sections = [_tree_section("Metrics", metrics_tv)]
+        if for_report:
+            def _section(title, tree, with_tags=False):
+                return _tree_section(title, tree)
+        else:
+            _section = core.tree_section
+        # Value cells are split into a number, its unit and the display text,
+        # so a spreadsheet can compute with them; they were display strings
+        # ("6800 g (6.80 kg) (66.7 N)") (audit E5). The Status verdict, shown
+        # only as a row colour, travels as a Result column.
+        sections = [_section("Metrics", metrics_tv)]
         # One export section per Status sub-table, so a reader of the CSV or
         # the PDF sees the same grouping as the screen rather than one
         # undifferentiated block.
-        sections += [_tree_section(_title, _tv) for _title, _tv in _STATUS_TABLES]
-        sections.append(_tree_section("Weight Budget", wb_tv))
+        sections += [_section(_title, _tv, with_tags=True)
+                     for _title, _tv in _STATUS_TABLES]
+        sections.append(_section("Weight Budget", wb_tv))
         if not _export_state["from_mission"]:
-            sections.append(_tree_section("Power Budget", pb_tv))
+            sections.append(_section("Power Budget", pb_tv))
             sections.append(_sweep_section(cfg))
         results = _export_state.get("results")
         if results:
@@ -7473,6 +7504,12 @@ def launch_gui(args=None) -> None:
                 "Mission", ["Phase", "Time (min)", "Distance (km)", "Power (W)",
                             "Energy (Wh)", "Status"],
                 [list(r) for r in results]))
+            # The time series the Mission Plots tab draws. Only the per-phase
+            # table was exported, so a mission's history could not be
+            # (audit E8).
+            if not for_report:
+                sections.append(core.series_section("Mission Series",
+                                                    _export_state.get("series") or {}))
         return sections
 
     def export_csv():
@@ -7513,7 +7550,7 @@ def launch_gui(args=None) -> None:
 
     def generate_report():
         """A PDF of the same tables plus the airframe and performance figures."""
-        sections = _export_sections()
+        sections = _export_sections(for_report=True)
         cfg = _export_state["cfg"]
         if sections is None:
             messagebox.showinfo("Report", "Run something first.")
@@ -7676,7 +7713,9 @@ def launch_gui(args=None) -> None:
             root.tk.call("tk", "scaling", 1.3333 * pct / 100.0)
         except Exception:
             pass
-        root.minsize(int(1100 * pct / 100), int(700 * pct / 100))
+        # Never larger than the screen (audit G1).
+        root.minsize(min(int(1100 * pct / 100), root.winfo_screenwidth() - 40),
+                     min(int(700 * pct / 100), root.winfo_screenheight() - 80))
         root.update_idletasks()
 
     def _apply_ui_font(size: int) -> None:
@@ -8890,7 +8929,8 @@ def launch_gui(args=None) -> None:
         update_status(cfg, last, worst=worst)
         draw_airframe_diagram(cfg)
         update_rotor_loading(cfg, last)
-        _export_state.update(cfg=cfg, from_mission=True, results=results)
+        _export_state.update(cfg=cfg, from_mission=True, results=results,
+                             series=totals.get("series"))
         update_weight_budget(cfg, last)
         clear_power_budget()
         clear_fixed_speed_plots()

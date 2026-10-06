@@ -2912,3 +2912,106 @@ def test_fw_climb_power_stays_within_the_bench_maximum(fw):
     v_rc, _rc = fw.max_rate_of_climb_mps(cfg)
     t = fw.thrust_available_N(cfg, v_rc)
     assert fw.motor_shaft_power_from_thrust(cfg, t, v_rc) <= fw.max_electrical_power_W(cfg) * 1.001
+
+
+# ----------------------------------------------------------------------
+# Audit B6: batch read results by regex-scraping console text, to printed
+# precision, with the VTOL parsed by the multicopter's patterns.
+# ----------------------------------------------------------------------
+
+def _argv_to_dict(argv):
+    out, i = {}, 0
+    while i < len(argv):
+        out[argv[i].lstrip("-")] = argv[i + 1]
+        i += 2
+    return out
+
+
+def test_batch_reads_full_precision_metrics(rw, paths):
+    from pathlib import Path
+    from test_cli import MC_BASE
+    rr = rw.run_simulation("multicopter", Path(paths["multicopter"]), "t",
+                           dict(_argv_to_dict(MC_BASE), orientation="translating", speed=9),
+                           300)
+    assert rr.return_code == 0, rr.stderr[-500:]
+    t = rr.metrics["flight_time_min"]
+    assert t != round(t, 1), "flight time is only at its printed precision"
+    assert "hover_drive_efficiency" in rr.metrics and "pack_current_A" in rr.metrics
+
+
+def test_batch_reads_the_vtol_by_name(rw, paths):
+    from pathlib import Path
+    script = Path(paths["root"]) / rw.SIM_SCRIPT_DEFAULTS["vtol"]
+    rr = rw.run_simulation("vtol", script, "t", {}, 300)
+    assert rr.return_code == 0, rr.stderr[-500:]
+    assert rr.metrics["flight_time_min"] == rr.metrics["cruise_endurance_min"]
+    assert rr.metrics["hover_endurance_min"] < rr.metrics["cruise_endurance_min"]
+
+
+def test_metrics_json_is_json_safe(mc):
+    core = mc.core
+    d = core.metrics_for_json({"a": 1, "b": float("inf"), "c": "OK", "d": [1, 2],
+                               "_hidden": 3, "e": True})
+    assert d == {"a": 1.0, "b": None, "c": "OK", "e": True}
+
+
+# ----------------------------------------------------------------------
+# Audit B8: the GUI-config translation dropped the mass mode, the
+# translation direction and the fixed-wing's prop efficiency model.
+# ----------------------------------------------------------------------
+
+def test_batch_keeps_the_translation_direction(rw, paths):
+    args = rw.load_gui_config(os.path.join(paths["configs"], "multicopter_5in_freestyle_6S.json"),
+                              "multicopter")
+    assert args["translation_direction_deg"] == 45
+
+
+def test_batch_maps_the_mass_mode_and_prop_model(rw):
+    for table in (rw.GUI_TO_CLI_MULTICOPTER, rw.GUI_TO_CLI_FIXEDWING):
+        assert table["mass_mode"] == "mass_mode"
+        assert table["airframe_mass"] == "airframe_mass"
+        assert table["avionics_mass"] == "avionics_mass"
+    assert rw.GUI_TO_CLI_FIXEDWING["prop_eff_model"] == "prop_eff_model"
+
+
+@pytest.mark.parametrize("which", ["mc", "fw"])
+def test_cli_enter_airframe_builds_the_weight(mc, fw, which, monkeypatch):
+    from test_cli import MC_BASE, FW_BASE
+    mod, base, entry = ((mc, MC_BASE, "compute_operating_metrics") if which == "mc"
+                        else (fw, FW_BASE, "compute_metrics"))
+    seen = _capture_metrics(monkeypatch, mod, entry)
+    monkeypatch.setattr(sys, "argv", ["sim"] + base + [
+        "--mass_mode", "enter airframe", "--airframe_mass", "700",
+        "--avionics_mass", "60", "--motor_weight", "50", "--prop_weight", "12",
+        "--esc_weight", "8"])
+    mod.main()
+    cfg = seen[-1][0]
+    n = cfg.num_motors
+    expected = 700 + 60 + (50 + 12 + 8) * n + cfg.battery.weight_g
+    weight = cfg.drone_weight_g if which == "mc" else cfg.aircraft_weight_g
+    payload = float(getattr(cfg, "payload_mass_g", 0.0) or 0.0)
+    assert weight - payload == pytest.approx(expected, rel=1e-12)
+
+
+def test_mc_cli_translation_direction_reaches_the_config(mc, monkeypatch):
+    from test_cli import MC_BASE
+    seen = _capture_metrics(monkeypatch, mc, "compute_operating_metrics")
+    monkeypatch.setattr(sys, "argv", ["sim"] + MC_BASE + ["--translation_direction_deg", "45"])
+    mc.main()
+    assert seen[-1][0].translation_direction_deg == 45.0
+
+
+# ----------------------------------------------------------------------
+# Audit E5: exported values were display strings.
+# ----------------------------------------------------------------------
+
+def test_display_values_split_into_number_and_unit(mc):
+    core = mc.core
+    assert core.split_display_value("1800 g (17.7 N) — Everything") == (1800.0, "g")
+    assert core.split_display_value("1,250.5 W") == (1250.5, "W")
+    assert core.split_display_value("-3.5 °C") == (-3.5, "°C")
+    assert core.split_display_value("OK") == (None, "")
+    _t, headers, rows = core.numeric_section("M", ["Metric", "Value", "Note"],
+                                             [["AUW", "1800 g (17.7 N)", "n"]])
+    assert headers == ["Metric", "Value", "Unit", "Value (display)", "Note"]
+    assert rows == [["AUW", 1800.0, "g", "1800 g (17.7 N)", "n"]]

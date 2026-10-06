@@ -243,6 +243,17 @@ def parse_metrics(sim: str, stdout: str) -> Dict[str, Any]:
     return metrics
 
 
+def read_metrics_json(path: str) -> Dict[str, Any]:
+    """The metrics a simulator wrote with --metrics_json, or {} if it wrote
+    none (a failed run, or an older simulator)."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def run_simulation(
     sim: str,
     sim_script: Path,
@@ -251,18 +262,39 @@ def run_simulation(
     timeout_s: float,
     print_command: bool = False,
 ) -> RunResult:
-    cmd = [sys.executable, str(sim_script)] + build_cli_args(run_args)
+    # Each simulator also writes its metrics to a JSON file at full
+    # precision. Reading results only by regex-scraping the console text
+    # kept each value to its printed precision, a change of wording silently
+    # emptied a column, and the VTOL was parsed with the multicopter's
+    # patterns (audit B6). The scrape is kept for the raw_ text columns and
+    # as a fallback; the file's values win.
+    import tempfile
+    fd, json_path = tempfile.mkstemp(prefix="rw_metrics_", suffix=".json")
+    os.close(fd)
+    os.unlink(json_path)
+    cmd = ([sys.executable, str(sim_script)] + build_cli_args(run_args)
+           + ["--metrics_json", json_path])
     if print_command:
         print(f"CMD[{run_name}]: {' '.join(cmd)}")
     t0 = time.time()
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout_s,
-    )
-    elapsed = time.time() - t0
-    metrics = parse_metrics(sim, proc.stdout)
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+        if proc.returncode != 0 and "--metrics_json" in (proc.stderr or ""):
+            # A simulator script from before --metrics_json existed: run it
+            # again without the flag and fall back to the console text.
+            cmd = cmd[:-2]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        elapsed = time.time() - t0
+        metrics = parse_metrics(sim, proc.stdout)
+        metrics.update(read_metrics_json(json_path))
+    finally:
+        if os.path.exists(json_path):
+            os.unlink(json_path)
     return RunResult(
         name=run_name,
         args=dict(run_args),
@@ -658,6 +690,12 @@ def enforce_mode(sim: str, mode: str, arg_names, context: str) -> None:
 
 GUI_TO_CLI_MULTICOPTER = {
     "num_motors": "num_motors", "weight": "weight",
+    # Dropped before (audit B8): batch flew the saved all-up weight even in
+    # "enter airframe" mode, and the 5-inch freestyle example's 45 deg
+    # translation at 0 deg.
+    "mass_mode": "mass_mode", "airframe_mass": "airframe_mass",
+    "avionics_mass": "avionics_mass",
+    "translation_direction_deg": "translation_direction_deg",
     "payload_mass_g": "payload_mass_g", "area": "area", "speed": "speed",
     "periph_current": "periph_current",
     "motor_configuration": "motor_configuration",
@@ -756,6 +794,10 @@ def gui_to_cli_vtol() -> Dict[str, str]:
 
 GUI_TO_CLI_FIXEDWING = {
     "weight": "weight", "payload_mass_g": "payload_mass_g",
+    # Dropped before (audit B8): the mass mode, and the propeller-efficiency
+    # model, so batch ran the CLI's default "curve".
+    "mass_mode": "mass_mode", "airframe_mass": "airframe_mass",
+    "avionics_mass": "avionics_mass", "prop_eff_model": "prop_eff_model",
     "num_motors": "num_motors", "cruise_speed": "cruise_speed",
     "periph_cur": "periph_current",
     "wing_span": "wing_span", "wing_area": "wing_area",

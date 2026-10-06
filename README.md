@@ -778,6 +778,10 @@ All three simulators run headless with no `--gui`. Key arguments:
 |---|---|---|
 | `--weight` | grams | Base weight **excluding** payload |
 | `--payload_mass_g` | grams | Added on top of base weight |
+| `--mass_mode` | `derive airframe` \| `enter airframe` | Multicopter and fixed-wing. `enter airframe` builds the weight from `--airframe_mass`, `--avionics_mass` and the component weights, as the GUI does |
+| `--airframe_mass`, `--avionics_mass` | grams | Bare structure; avionics |
+| `--translation_direction_deg` | degrees | Multicopter: direction of travel from the nose |
+| `--metrics_json` | path | Also write the run's metrics, at full precision, as JSON. The batch driver reads this file rather than scraping the console |
 | `--altitude` | metres ASL | Sets air density |
 | `--temperature` | °C | Optional; blank uses ISA |
 | `--wind` | m/s | Wind speed |
@@ -898,6 +902,14 @@ python vtol-power-sim-gui.py \
 
 Three subcommands, all of which accept `--gui-config` and `--mode`.
 `--sim` takes `multicopter`, `fixedwing` or `vtol`.
+
+Each run's metrics come from the simulator's own `--metrics_json` file, at
+full precision and under the simulator's own names. The console text is
+still captured as `raw_` columns. For the VTOL, `flight_time_min` and
+`flight_range_km` are the cruise endurance and range; the hover endurance
+is `hover_endurance_min`. A `--gui-config` keeps the mass mode, the
+multicopter's translation direction and the fixed-wing's propeller
+efficiency model, so batch flies the configuration the GUI saved.
 
 ### Sweep — one-variable sensitivity
 

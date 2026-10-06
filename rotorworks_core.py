@@ -37,6 +37,7 @@ tk installed, matching how the simulators themselves behave.
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import os
@@ -60,6 +61,10 @@ __all__ = [
     "pack_ocv_from_soc", "pack_resistance_from_soc", "cell_soc_from_usable",
     "pack_voltage_under_load", "solve_pack_for_power", "soc_after_energy_draw",
     "pack_resistance_at", "pack_draw", "tilted_drag_area",
+    "fit_window_to_screen", "plot_width_in",
+    "metrics_for_json", "write_metrics_json",
+    "split_display_value", "numeric_section", "series_section",
+    "tree_section", "weight_budget_section",
     # wind
     "wind_components_mps", "groundspeed_along_track_mps",
     # rotor inflow
@@ -2331,6 +2336,118 @@ def build_power_budget(total_in_W: float,
 # EXPORTS
 # ============================================================
 
+_DISPLAY_NUMBER = re.compile(
+    r"^\s*([-+]?(?:\d{1,3}(?:,\d{3})+|\d+)?(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+    r"(?:\s?([^\s(),;\u2014]+))?")
+
+
+def split_display_value(text) -> Tuple[Optional[float], str]:
+    """
+    The leading number of a display string and the unit right after it:
+    "1800 g (17.7 N) — Everything the rotors must lift" -> (1800.0, "g").
+    A value that is already a number comes back as itself; text that does
+    not start with a number (a status word, "n/a") gives (None, "").
+    """
+    if isinstance(text, bool):
+        return None, ""
+    if isinstance(text, (int, float)):
+        v = float(text)
+        return (v if math.isfinite(v) else None), ""
+    m = _DISPLAY_NUMBER.match(str(text))
+    if not m or not m.group(1) or not re.search(r"\d", m.group(1)):
+        return None, ""
+    try:
+        value = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None, ""
+    unit = (m.group(2) or "").strip()
+    return value, unit
+
+
+def numeric_section(title: str, headers: List[str], rows: List[list],
+                    value_col: int = 1) -> Tuple[str, List[str], List[list]]:
+    """
+    An export section whose display column is split into a number a
+    spreadsheet can sum and chart, its unit, and the original text.
+
+    Exported Metrics and Status cells were display strings, value, units and
+    explanation in one cell ("1800 g (17.7 N) — Everything the rotors must
+    lift..."), which nothing downstream could compute with without parsing
+    text (audit E5). The original column is kept, renamed "Display".
+    """
+    headers = list(headers)
+    label = headers[value_col] if value_col < len(headers) else "Value"
+    new_headers = (headers[:value_col] + [label, "Unit", f"{label} (display)"]
+                   + headers[value_col + 1:])
+    out = []
+    for row in rows:
+        row = list(row)
+        if value_col >= len(row):
+            out.append(row)
+            continue
+        number, unit = split_display_value(row[value_col])
+        out.append(row[:value_col] + [number, unit, row[value_col]] + row[value_col + 1:])
+    return title, new_headers, out
+
+
+def series_section(title: str, series: dict) -> Tuple[str, List[str], List[list]]:
+    """A dict of equal-length columns (a sweep or a mission time series) as
+    an export section: one column per key, numbers left as numbers."""
+    if not series:
+        return title, [], []
+    keys = [k for k, v in series.items() if isinstance(v, (list, tuple))]
+    n = max((len(series[k]) for k in keys), default=0)
+    rows = [[series[k][i] if i < len(series[k]) else "" for k in keys] for i in range(n)]
+    return title, keys, rows
+
+
+def tree_section(title: str, tree, value_col: Optional[int] = 1,
+                 with_tags: bool = False) -> Tuple[str, List[str], List[list]]:
+    """
+    A Tk Treeview's visible contents as an export section, nested rows
+    included (indented, so a flat CSV keeps the grouping).
+
+    `value_col` is split into number, unit and display text
+    (numeric_section); None leaves the rows as shown. `with_tags` adds the
+    row's first tag as a "Result" column: the Status tables carry their
+    ok / warn / bad verdict only as a row colour.
+    """
+    headers = [tree.heading(c)["text"] for c in tree.cget("columns")]
+    rows: List[list] = []
+
+    def walk(parent, depth=0):
+        for iid in tree.get_children(parent):
+            values = list(tree.item(iid, "values"))
+            if values and depth:
+                values[0] = f"  {values[0]}"
+            if with_tags:
+                tags = tree.item(iid, "tags")
+                values = values + [""] * (len(headers) - len(values)) + [tags[0] if tags else ""]
+            rows.append(values)
+            walk(iid, depth + 1)
+
+    walk("")
+    if with_tags:
+        headers = headers + ["Result"]
+    if value_col is None:
+        return title, headers, rows
+    return numeric_section(title, headers, rows, value_col)
+
+
+def weight_budget_section(budget: list) -> Tuple[str, List[str], List[list]]:
+    """The (label, unit_g, count, total_g) rows of a weight budget, its last
+    row the TOTAL, as an export section with a percentage column."""
+    headers = ["Component", "Unit Weight (g)", "Count", "Total Weight (g)", "% of Total"]
+    if not budget:
+        return "Weight Budget", headers, []
+    total_g = float(budget[-1][3]) or 1.0
+    rows = [[label, round(float(uw), 1), cnt, round(float(tw), 1),
+             round(float(tw) / total_g * 100.0, 1)] for label, uw, cnt, tw in budget[:-1]]
+    label, _uw, _cnt, tw = budget[-1]
+    rows.append([label, "", "", round(float(tw), 1), 100.0])
+    return "Weight Budget", headers, rows
+
+
 def export_csv(path: str, sections: List[Tuple[str, List[str], List[list]]]) -> None:
     """
     Write several titled tables into one CSV.
@@ -2388,6 +2505,83 @@ def export_excel(path: str, sections: List[Tuple[str, List[str], List[list]]]) -
 # ============================================================
 # FIGURES
 # ============================================================
+
+def metrics_for_json(metrics: dict) -> dict:
+    """
+    The scalar entries of a metrics dict in a JSON-safe form: numbers as
+    floats at full precision, inf and NaN as None, bools and strings as they
+    are. Nested and private (underscore) entries are left out.
+    """
+    out = {}
+    for key, value in (metrics or {}).items():
+        if str(key).startswith("_"):
+            continue
+        if isinstance(value, bool) or value is None or isinstance(value, str):
+            out[str(key)] = value
+        elif isinstance(value, (int, float)):
+            v = float(value)
+            out[str(key)] = v if math.isfinite(v) else None
+        else:
+            try:
+                v = float(value)               # numpy scalars
+            except (TypeError, ValueError):
+                continue
+            out[str(key)] = v if math.isfinite(v) else None
+    return out
+
+
+def write_metrics_json(path: Optional[str], metrics: dict, **extra) -> None:
+    """
+    Write a run's metrics, plus `extra` named values, to `path` as JSON.
+
+    The batch driver used to read results by regex-scraping the console
+    text: each value carried only its printed precision, a change of wording
+    silently emptied a column, and the VTOL was parsed with the multicopter's
+    patterns (audit B6). Each simulator's --metrics_json writes this file
+    and the batch reads it.
+    """
+    if not path:
+        return
+    data = metrics_for_json(metrics)
+    data.update(metrics_for_json(extra))
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=1, sort_keys=True)
+
+
+def fit_window_to_screen(root, width: int = 1600, height: int = 1000,
+                         min_width: int = 1100, min_height: int = 700,
+                         margin_px: Tuple[int, int] = (40, 80)) -> Tuple[int, int]:
+    """
+    Size a Tk window to fit the screen, and return (width, height).
+
+    The multicopter and fixed-wing windows set only a minimum size, so they
+    opened at their contents' requested width, 1,933 px, and grew past
+    2,500 px after a run, because the default 15-inch figure drives the
+    request. On a 1920 px screen the right of the figure and the
+    Save / Load / Export / Report buttons were off-screen (audit G1). An
+    explicit geometry stops Tk resizing the window to its contents, and the
+    minimum size is clamped so it cannot exceed the screen either.
+    """
+    try:
+        sw, sh = int(root.winfo_screenwidth()), int(root.winfo_screenheight())
+    except Exception:
+        sw, sh = width, height
+    w = max(min(int(width), sw - margin_px[0]), 640)
+    h = max(min(int(height), sh - margin_px[1]), 480)
+    root.minsize(min(int(min_width), w), min(int(min_height), h))
+    x = max((sw - w) // 2, 0)
+    y = max((sh - h) // 3, 0)
+    root.geometry(f"{w}x{h}+{x}+{y}")
+    return w, h
+
+
+def plot_width_in(window_width_px: int, inputs_px: int = 480,
+                  px_per_in: float = 100.0, max_in: float = 15.0,
+                  min_in: float = 7.0) -> float:
+    """Figure width in inches that fits beside the input pane of a window
+    `window_width_px` wide (matplotlib's default 100 dpi)."""
+    return min(max((float(window_width_px) - inputs_px) / px_per_in, min_in), max_in)
+
 
 def make_figure(nrows: int = 1, ncols: int = 1, figsize=None, **kwargs):
     """
