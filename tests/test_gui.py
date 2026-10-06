@@ -567,6 +567,43 @@ def test_pinned_baseline_shows_zero_delta_against_itself(request, which):
             f"{values[0]} reports {delta} against its own baseline")
 
 
+@pytest.mark.parametrize("which,first,second", [
+    ("mc", "multicopter_450_survey_4S.json", "multicopter_7in_longrange_6S.json"),
+    ("fw", "fixedwing_2m_survey_4S.json", "fixedwing_3m_endurance_6S_liion.json"),
+])
+def test_compare_shows_the_new_run_on_its_first_run(request, which, first, second, paths,
+                                                    monkeypatch):
+    """
+    Audit S1: the multicopter refreshed Compare before storing the new run,
+    so after loading a different aircraft and running once, every row but
+    flight time and range showed the previous aircraft with zero change.
+    """
+    import tkinter.messagebox as mb
+    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: True)
+    gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")
+    gui.set_open_dialog(os.path.join(paths["configs"], first))
+    assert gui.click("Load Config") == []
+    assert gui.click("Fixed Speed Sweep") == []
+    assert gui.click("Pin Current") == []
+    gui.set_open_dialog(os.path.join(paths["configs"], second))
+    assert gui.click("Load Config") == []
+    assert gui.click("Fixed Speed Sweep") == []
+    gui.pump()
+
+    tree = _tree_with(gui, "metric", "delta", "pct")
+
+    def rows():
+        return {str(tree.item(r, "values")[0]): tuple(tree.item(r, "values"))
+                for r in tree.get_children()}
+
+    after_one_run = rows()
+    assert gui.click("Fixed Speed Sweep") == []
+    gui.pump()
+    assert rows() == after_one_run, "Compare changed on a second identical run"
+    power = after_one_run["Total power (W)"]
+    assert power[1] != power[2], "the new aircraft shows the baseline's power"
+
+
 @pytest.mark.parametrize("which", ["mc", "fw"])
 def test_clearing_the_baseline_empties_the_table(request, which):
     gui = request.getfixturevalue("mc_gui" if which == "mc" else "fw_gui")

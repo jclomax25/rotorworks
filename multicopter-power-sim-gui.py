@@ -7908,13 +7908,17 @@ def launch_gui():
             _set_sensitivity_outputs(False)
             clear_mission_diagram()
             _clear_sensitivity("Fixed speed sweep re-run — sensitivity is out of date")
+            # Store this run's metrics BEFORE refreshing Compare (audit S1).
+            # Refreshing first compared the baseline against the PREVIOUS
+            # run's metrics, so every row but flight time and range (which
+            # are recomputed from the new aircraft) read zero change. They
+            # are also what a plot-scale change regenerates from.
+            _last_run["metrics"] = metrics
             refresh_comparison()
             _clear_mission_plots_panel()   # #18
             fig = make_performance_figure(
                 drone, max_speed=max_spd,
                 figsize=(_view["plot_w"], _view["plot_h"]))
-            # Store metrics for regeneration during plot scale changes
-            _last_run["metrics"] = metrics
             # Generate motor operating point figure if propeller table is available
             motor_fig = None
             if drone.propeller.table is not None:
