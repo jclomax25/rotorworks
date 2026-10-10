@@ -765,7 +765,8 @@ class PropellerConfig:
                  table_csv: Optional[str] = None,
                  TConst: Optional[float] = None,
                  PConst: Optional[float] = None,
-                 weight_g: Optional[float] = None):
+                 weight_g: Optional[float] = None,
+                 figure_of_merit: Optional[float] = None):
         self.diameter_in = float(diameter_in)
         self.pitch_in = float(pitch_in)
         self.blades = int(blades)
@@ -775,6 +776,13 @@ class PropellerConfig:
         self.TConst = TConst
         self.PConst = PConst
         self.weight_g = weight_g
+        # Rotor figure of merit in hover, ideal over shaft power (audit M13).
+        # None: a typical value for the diameter (rotor_figure_of_merit).
+        # Used only when neither a bench table nor TConst/PConst describes
+        # the rotor, since both of those already contain its losses.
+        self.figure_of_merit = (None if figure_of_merit is None
+                                or float(figure_of_merit) <= 0.0
+                                else float(figure_of_merit))
 
         self.table: Optional[pd.DataFrame] = None
         if table_csv:
@@ -1291,8 +1299,11 @@ def available_total_thrust_N(config: DroneConfig) -> float:
         return 0.0
     rho = max(float(config.air_density), 1e-9)
     A_pm = max(disk_area(config.propeller.diameter_in), 1e-9)
-    # P = T^(3/2) / sqrt(2*rho*A)  => T = (P*sqrt(2*rho*A))^(2/3)
-    t_pm = (p_max_pm * math.sqrt(2.0 * rho * A_pm)) ** (2.0 / 3.0)
+    # FoM * P = T^(3/2) / sqrt(2*rho*A)  => T = (FoM*P*sqrt(2*rho*A))^(2/3)
+    # Without the figure of merit the rotor was ideal, and the thrust
+    # available about 20% high (audit M13).
+    fom = rotor_figure_of_merit(config)
+    t_pm = (fom * p_max_pm * math.sqrt(2.0 * rho * A_pm)) ** (2.0 / 3.0)
     return t_pm * nm
 
 
@@ -1360,6 +1371,65 @@ def hover_drive_efficiency(config: DroneConfig,
     p_actual = max(float(electrical_propulsion_power_W), 1e-9)
     p_ideal = hover_ideal_induced_power_W(config, total_thrust_N)
     return p_ideal / p_actual
+
+
+# Typical hover figure of merit of a fixed-pitch rotor by diameter, for when
+# none is entered (audit M13). The 3, 9 and 15 in values are the size classes
+# the Status check already expected; 0.78 is typical of a large carbon rotor.
+# Small propellers run at low Reynolds number, so their blade sections are
+# draggier and the figure falls with size. Interpolated linearly, held flat
+# beyond the ends.
+ROTOR_FOM_BY_DIAMETER_IN = ((3.0, 0.45), (9.0, 0.60), (15.0, 0.70), (21.0, 0.78))
+# The range an entered figure of merit may take: no real rotor reaches 0.9,
+# and below 0.2 the input is almost certainly a mistake.
+ROTOR_FOM_MIN, ROTOR_FOM_MAX = 0.2, 0.9
+
+
+def default_rotor_figure_of_merit(diameter_in: float) -> float:
+    """Typical hover figure of merit for a rotor of this diameter."""
+    pts = ROTOR_FOM_BY_DIAMETER_IN
+    d = float(diameter_in)
+    if d <= pts[0][0]:
+        return pts[0][1]
+    for (d0, f0), (d1, f1) in zip(pts, pts[1:]):
+        if d <= d1:
+            return f0 + (f1 - f0) * (d - d0) / (d1 - d0)
+    return pts[-1][1]
+
+
+def rotor_figure_of_merit(config: DroneConfig) -> float:
+    """The rotor figure of merit the momentum model uses: the one entered
+    on the propeller, else the typical value for its diameter."""
+    fom = getattr(config.propeller, "figure_of_merit", None)
+    if fom is None:
+        fom = default_rotor_figure_of_merit(config.propeller.diameter_in)
+    return min(max(float(fom), ROTOR_FOM_MIN), ROTOR_FOM_MAX)
+
+
+def rotor_figure_of_merit_source(config: DroneConfig) -> str:
+    """Where the rotor's losses come from in the power model."""
+    prop = config.propeller
+    if prop.table is not None:
+        return "bench table"
+    if prop.TConst and prop.PConst and config.motor.kv is not None:
+        return "TConst/PConst"
+    if getattr(prop, "figure_of_merit", None) is not None:
+        return "entered"
+    return "typical for the diameter"
+
+
+def check_rotor_figure_of_merit(value: Optional[float]) -> Optional[float]:
+    """An entered rotor figure of merit, or None when blank; out of range
+    is an input error rather than a value to clip silently."""
+    if value is None:
+        return None
+    fom = float(value)
+    if not (ROTOR_FOM_MIN <= fom <= ROTOR_FOM_MAX):
+        raise ValueError(
+            f"Rotor figure of merit must be between {ROTOR_FOM_MIN} and "
+            f"{ROTOR_FOM_MAX} (got {fom:g}); a good large rotor reaches about "
+            f"0.8. Leave it blank for the typical value for the diameter.")
+    return fom
 
 
 def hover_wind_resistance_mps(config: DroneConfig) -> float:
@@ -1612,97 +1682,115 @@ def interpolate_motor_power(config: DroneConfig, thrust_per_motor_N: float) -> f
 
 
 
+def rotor_shaft_power_W(config: DroneConfig, thrust_per_motor_N: float,
+                        airspeed_mps: float = 0.0,
+                        disk_incidence_rad: float = 0.0,
+                        extra_shaft_W: float = 0.0) -> float:
+    """
+    Shaft power of ONE rotor from momentum theory and its hover figure of
+    merit (rotor_figure_of_merit), by the energy method:
+
+        P = kappa * T * v_i  +  P0  +  T * V * sin(a)  +  extra
+
+        v_h = sqrt(T / (2 rho A)),  v_i = induced_velocity_forward_flight(...)
+
+    T * V * sin(a) is the propulsive power that overcomes airframe drag (by
+    the tilt balance T sin(a) = D it is D * V); at V = 0 it vanishes.
+
+    The figure of merit fixes the rotor's hover loss, T v_h (1/FoM - 1). It
+    is split into blade profile power P0 (_hover_profile_power_W, which
+    does not fall with speed) and an induced-loss factor kappa (which
+    scales with v_i), so that in hover P = T v_h / FoM exactly. When the
+    profile estimate is larger than the whole loss the figure of merit
+    allows, P0 is cut to it and kappa is 1.
+
+    Dividing the whole ideal power by the hover figure of merit instead
+    would let the profile power fall away with v_i at speed, and charge the
+    rotor's hover loss on the propulsive power too.
+    """
+    t = max(float(thrust_per_motor_N), 0.0)
+    if t <= 0.0:
+        return max(float(extra_shaft_W), 0.0)
+    rho = config.air_density
+    area = disk_area(config.propeller.diameter_in)
+    v_hover = math.sqrt(t / max(2.0 * rho * area, 1e-9))
+    v_i = induced_velocity_forward_flight(v_hover, airspeed_mps, disk_incidence_rad)
+    v_through = max(float(airspeed_mps), 0.0) * math.sin(float(disk_incidence_rad))
+    p_ideal_hover = t * v_hover
+    hover_loss = p_ideal_hover * (1.0 / rotor_figure_of_merit(config) - 1.0)
+    p0_hover, _tip = _hover_profile_power_W(config, t)
+    p0 = min(max(p0_hover, 0.0), hover_loss)
+    kappa = 1.0 + (hover_loss - p0) / max(p_ideal_hover, 1e-12)
+    return (kappa * t * v_i + p0 + t * v_through
+            + max(float(extra_shaft_W), 0.0))
+
+
 def motor_power_from_params(config: DroneConfig, thrust_per_motor_N: float,
                             airspeed_mps: float = 0.0,
                             disk_incidence_rad: float = 0.0,
                             extra_shaft_W: float = 0.0) -> float:
     """
-    Estimate electrical input power required for a given thrust per motor.
+    Electrical input power of ONE motor making `thrust_per_motor_N`.
 
-    Two options:
-      - If propeller TConst/PConst provided: solve for RPM via thrust model:
-            T = C_T * rho * n^2 * D^4
-        Then mechanical shaft power:
-            P_mech = C_P * rho * n^3 * D^5
-      - Else: momentum-theory induced power, corrected for forward flight:
-            v_h = sqrt(T / (2*rho*A))
-            vi  = induced_velocity_forward_flight(v_h, V, incidence)
-            P_mech ≈ T * vi
-        At V = 0 this is the familiar hover result; at speed the rotor meets
-        already-moving air, so vi (and induced power) drop sharply.
+    Shaft power, two options:
+      - Propeller TConst/PConst provided: RPM from T = C_T rho n^2 D^4, then
+            P_shaft = C_P rho n^3 D^5
+      - Else momentum theory with the rotor's figure of merit
+        (rotor_shaft_power_W). Without the figure of merit the rotor was
+        ideal and the only losses were the motor's (audit M13).
 
-    Electrical conversion (very simplified):
-      - torque constant: Kt = 60 / (2π Kv)  [Nm/A]
-      - approximate motor torque from mech power and omega
-      - current ≈ torque/Kt + I0
-      - copper loss via motor resistance
-      - clamp by motor max current/power
+    `extra_shaft_W` is the profile power that grows with advance ratio in
+    edgewise flow (profile_power_growth_W; audit M8).
+
+    Motor, the DC model, at the rotor's own RPM:
+        V_emf = rpm / Kv,   Kt = 60 / (2 pi Kv)
+        I     = Q / Kt + I0,   Q = P_shaft / omega
+        P_in  = (V_emf + I R) I = P_shaft + V_emf I0 + I^2 R
+
+    The ESC chops the pack down to the winding voltage V_emf + I R. This
+    used to price the motor at the pack voltage with the copper drop taken
+    OFF, P_in = (V_pack - I R) I, which subtracted the copper loss instead
+    of adding it and charged idle loss at full voltage; with TConst/PConst
+    it charged V_pack x I at whatever RPM the rotor turned, many times the
+    shaft power on a slow rotor (audit M13).
+
+    The current and power ratings are NOT applied here: a motor asked for
+    more than its rating draws more, and Status flags it. Clipping the
+    power at the rating made an overloaded design look like it hovered on
+    the rated power.
     """
     if config.motor.kv is None:
         raise ValueError("motor_kv must be set to use motor electrical model.")
+    thrust_per_motor_N = float(thrust_per_motor_N)
+    if thrust_per_motor_N <= 0.0:
+        return 0.0
 
     D = config.propeller.diameter_in * 0.0254  # meters
     rho = config.air_density
+    extra = max(float(extra_shaft_W), 0.0)
+    # TConst when it is entered, else C_T estimated from the geometry; the
+    # same RPM compute_operating_metrics reports.
+    rpm = _rotor_rpm_at_thrust(config, thrust_per_motor_N)
+    if rpm is None or not math.isfinite(rpm) or rpm <= 0.0:
+        # No RPM can be worked out: assume the motor turns at its
+        # no-load speed, which makes the back-EMF the pack voltage.
+        rpm = config.battery.vnom_pack * config.motor.kv
 
     # ---- Mechanical shaft power ----
     if config.propeller.TConst and config.propeller.PConst:
-        low, high = 100.0, 40000.0  # RPM bounds
-        rpm_solution = None
-
-        for _ in range(40):
-            mid = 0.5 * (low + high)
-            n = mid / 60.0  # rev/s
-            thrust = config.propeller.TConst * rho * (n**2) * (D**4)
-            if thrust < thrust_per_motor_N:
-                low = mid
-            else:
-                high = mid
-                rpm_solution = mid
-
-        if rpm_solution is None:
-            return 0.0
-
-        n = rpm_solution / 60.0
-        # extra_shaft_W: the profile power that grows with advance ratio in
-        # edgewise flow (profile_power_growth_W; audit M8).
-        mech_power_W = (config.propeller.PConst * rho * (n**3) * (D**5)
-                        + max(float(extra_shaft_W), 0.0))
-        omega = 2.0 * math.pi * n
-        torque_Nm = mech_power_W / max(omega, 1e-9)
+        n = rpm / 60.0
+        mech_power_W = config.propeller.PConst * rho * (n**3) * (D**5) + extra
     else:
-        A = disk_area(config.propeller.diameter_in)
-        v_hover = math.sqrt(max(thrust_per_motor_N, 0.0) / max(2.0 * rho * A, 1e-9))
-        vi = induced_velocity_forward_flight(v_hover, airspeed_mps, disk_incidence_rad)
-        # Shaft power = thrust x (through-disk freestream + induced velocity).
-        #   P = T * (V*sin(a) + vi)
-        # The first term is the propulsive power that overcomes airframe drag:
-        # by the tilt balance T*sin(a) = D, so T*V*sin(a) = D*V exactly.
-        # Dropping it (as an induced-only model does) makes power fall without
-        # bound at speed; at V = 0 it vanishes and hover is unchanged.
-        v_through = max(float(airspeed_mps), 0.0) * math.sin(float(disk_incidence_rad))
-        mech_power_W = (thrust_per_motor_N * (v_through + vi)
-                        + max(float(extra_shaft_W), 0.0))
-        # crude omega/torque estimate from Kv and voltage
-        omega = (config.battery.vnom_pack * config.motor.kv) * (2.0 * math.pi / 60.0)
-        torque_Nm = mech_power_W / max(omega, 1e-9)
+        mech_power_W = rotor_shaft_power_W(config, thrust_per_motor_N,
+                                           airspeed_mps, disk_incidence_rad, extra)
 
     # ---- Electrical model ----
+    omega = 2.0 * math.pi * rpm / 60.0
+    torque_Nm = mech_power_W / max(omega, 1e-9)
     kt = 60.0 / (2.0 * math.pi * config.motor.kv)  # Nm/A
     current_A = torque_Nm / max(kt, 1e-9) + config.motor.idle_current
-
-    # motor terminal voltage ~ pack voltage - I*R (motor copper)
-    v_drop = current_A * config.motor.resistance
-    v_eff = max(config.battery.vnom_pack - v_drop, 0.0)
-    input_power_W = v_eff * current_A
-
-    # Enforce current/power limits
-    if config.motor.max_current and current_A > config.motor.max_current:
-        current_A = config.motor.max_current
-        input_power_W = config.battery.vnom_pack * current_A
-    if config.motor.max_power and input_power_W > config.motor.max_power:
-        input_power_W = config.motor.max_power
-
-    return float(input_power_W)
+    v_emf = rpm / config.motor.kv
+    return float((v_emf + current_A * config.motor.resistance) * current_A)
 
 
 
@@ -1965,14 +2053,13 @@ def motor_power_per_motor_W(config: DroneConfig, thrust_per_motor_N: float,
             extra_shaft_W=profile_power_growth_W(
                 config, thrust_per_motor_N, airspeed_for_inflow, incidence_rad))
     else:
-        A = disk_area(config.propeller.diameter_in)
-        v_hover = math.sqrt(max(thrust_per_motor_N, 0.0) /
-                            max(2.0 * config.air_density * A, 1e-9))
-        vi = induced_velocity_forward_flight(v_hover, airspeed_for_inflow, incidence_rad)
-        v_through = airspeed_for_inflow * math.sin(incidence_rad)
-        motor_power_W = (thrust_per_motor_N * (v_through + vi)
-                         + profile_power_growth_W(config, thrust_per_motor_N,
-                                                  airspeed_for_inflow, incidence_rad)) / 0.85
+        # No motor constants: the rotor's shaft power, with its figure of
+        # merit, through a lumped 85% for the motor. The rotor used to be
+        # ideal here too (audit M13).
+        motor_power_W = rotor_shaft_power_W(
+            config, thrust_per_motor_N, airspeed_for_inflow, incidence_rad,
+            profile_power_growth_W(config, thrust_per_motor_N,
+                                   airspeed_for_inflow, incidence_rad)) / 0.85
 
     # Apply motor-configuration penalty (e.g., coaxial interference)
     motor_power_W *= motor_configuration_power_multiplier(
@@ -2072,22 +2159,14 @@ def _compute_operating_metrics_core(drone: DroneConfig,
     esc_loss_W  = max(0.0, float(total_power_W) - float(motor_power_W)
                       - float(periph_power_W) - float(wire["loss_W"]))
     rpm_est     = None
-    if drone.propeller.TConst and drone.propeller.PConst:
+    # An entered TConst sets the RPM, with or without PConst: the speed the
+    # motor model turns the motor at (_rotor_rpm_at_thrust), so the winding
+    # current recovered below is the model's own.
+    if drone.propeller.TConst:
         try:
-            D   = drone.propeller.diameter_in * 0.0254
-            rho = drone.air_density
-            lo, hi = 100.0, 40000.0
-            sol = None
-            for _ in range(40):
-                mid = 0.5*(lo+hi)
-                n   = mid/60.0
-                T   = float(drone.propeller.TConst)*rho*(n**2)*(D**4)
-                if T < thrust_per_motor_N:
-                    lo = mid
-                else:
-                    hi = mid
-                    sol = mid
-            rpm_est = float(sol) if sol is not None else None
+            rpm_est = core.rpm_from_thrust(
+                thrust_per_motor_N, drone.propeller.diameter_in * 0.0254,
+                drone.air_density, float(drone.propeller.TConst))
         except Exception:
             rpm_est = None
     motor_table = None
@@ -2283,6 +2362,13 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         # Ideal / electrical: the whole drivetrain, not a rotor figure of
         # merit (audit M7).
         "hover_drive_efficiency": float(drive_eff_hover),
+        # The rotor figure of merit the momentum model uses, and where the
+        # rotor's losses come from (audit M13). With a bench table or
+        # TConst/PConst the figure is not used: those carry the losses.
+        "rotor_figure_of_merit": (float("nan") if rotor_figure_of_merit_source(drone)
+                                  in ("bench table", "TConst/PConst")
+                                  else float(rotor_figure_of_merit(drone))),
+        "rotor_figure_of_merit_source": rotor_figure_of_merit_source(drone),
         "disk_loading_N_m2":   float(dl),
         "total_disk_area_m2":  float(A_total),
         "tip_speed_mps":       (float(tip_speed) if math.isfinite(tip_speed) else None),
@@ -3502,6 +3588,13 @@ def make_motor_operating_point_figure(config: DroneConfig, metrics: dict, figsiz
 # -------------------------------
 # Config builders
 # -------------------------------
+def _cli_figure_of_merit(value):
+    try:
+        return check_rotor_figure_of_merit(value)
+    except ValueError as e:
+        raise SystemExit(f"--prop_figure_of_merit: {e}")
+
+
 def build_drone_from_args(args) -> DroneConfig:
     inflow_mu_bp = parse_float_list(getattr(args, "inflow_mu_bp", None))
     inflow_eff_bp = parse_float_list(getattr(args, "inflow_eff_bp", None))
@@ -3567,6 +3660,7 @@ def build_drone_from_args(args) -> DroneConfig:
         PConst=args.prop_pconst,
         TConst=args.prop_tconst,
         weight_g=getattr(args, "prop_weight", None),
+        figure_of_merit=_cli_figure_of_merit(getattr(args, "prop_figure_of_merit", None)),
     )
 
     avionics = AvionicsConfig(
@@ -4234,6 +4328,10 @@ MC_FIELD_HELP = {
                     "Advanced. Leave blank to use momentum theory."),
     "prop_pconst": ("Power coefficient C_P, if you know it.",
                     "Advanced. Leave blank."),
+    "prop_fom": ("Rotor figure of merit in hover: ideal power over shaft power, "
+                 "the rotor's own losses. Not used with a table or TConst/PConst.",
+                 "Blank = typical for the diameter: about 0.45 at 3 in, 0.60 at "
+                 "9 in, 0.70 at 15 in, 0.78 at 21 in and up."),
     "prop_weight": ("Weight of ONE propeller in grams.", "5in tri-blade ~4 g."),
 
     # ---- Mission / environment ----
@@ -4736,6 +4834,7 @@ def launch_gui():
     v_prop_table        = sv("")
     v_prop_tconst       = sv("")
     v_prop_pconst       = sv("")
+    v_prop_fom          = sv("")
     v_prop_weight       = sv(20)
 
     # Mission / env
@@ -5399,6 +5498,7 @@ def launch_gui():
         row=0, column=1, padx=(0,6)); r += 1
     add_row(tab_prop, r, "TConst (optional)",     v_prop_tconst, key="prop_tconst");     r += 1
     add_row(tab_prop, r, "PConst (optional)",     v_prop_pconst, key="prop_pconst");     r += 1
+    add_row(tab_prop, r, "Figure of Merit (optional)", v_prop_fom, key="prop_fom");      r += 1
     add_row(tab_prop, r, "Weight (g)",            v_prop_weight, key="prop_weight");     r += 1
 
     # ===== MISSION / ENV TAB =====
@@ -5571,7 +5671,8 @@ def launch_gui():
         "prop_d": v_prop_d, "prop_pitch": v_prop_pitch, "prop_blades": v_prop_blades,
         "prop_max_rpm": v_prop_max_rpm, "prop_max_thrust": v_prop_max_thrust,
         "prop_table": v_prop_table, "prop_tconst": v_prop_tconst,
-        "prop_pconst": v_prop_pconst, "prop_weight": v_prop_weight,
+        "prop_pconst": v_prop_pconst, "prop_fom": v_prop_fom,
+        "prop_weight": v_prop_weight,
         "mission": v_mission, "alt": v_alt, "temp": v_temp,
         "press": v_press, "wind": v_wind, "wind_dir": v_wind_dir,
         "course_deg": v_course_deg, "climb_rate": v_climb_rate,
@@ -6145,9 +6246,12 @@ def launch_gui():
             # multirotor is far more sensitive to it than a fixed-wing,
             # because hover power scales as 1/sqrt(rho).
             ("Air density",        lambda c, f: setattr(c, "air_density", c.air_density * f)),
-            # There is no "Figure of merit" lever: the multicopter has no
-            # figure-of-merit input. The old lever set an attribute nothing
-            # reads, so it always showed a zero swing (audit S2).
+            # The rotor's figure of merit, from the value in use (entered or
+            # the size default). Moves the answer only where the model uses
+            # it: not with a bench table or TConst/PConst (audit M13).
+            ("Rotor figure of merit", lambda c, f: setattr(
+                c.propeller, "figure_of_merit",
+                min(rotor_figure_of_merit(c) * f, ROTOR_FOM_MAX))),
             ("Battery resistance", _scale_batt_resistance),
             ("ESC resistance",     _scale_esc_resistance),
             ("Profile area",       lambda c, f: setattr(c, "profile_area",
@@ -7110,12 +7214,13 @@ def launch_gui():
         de = float(metrics.get("hover_drive_efficiency", float("nan")))
         if math.isfinite(de):
             _d_in = float(config.propeller.diameter_in)
-            if _d_in >= 15:
-                _fm_rotor, _fm_class = 0.70, "large rotor"
-            elif _d_in >= 9:
-                _fm_rotor, _fm_class = 0.60, "mid-size propeller"
-            else:
-                _fm_rotor, _fm_class = 0.45, "small propeller at low Reynolds number"
+            # The rotor figure of merit the model assumes: the one entered,
+            # else the typical value for the diameter (audit M13), which
+            # falls with size because small propellers run at low Reynolds
+            # number.
+            _fm_rotor = rotor_figure_of_merit(config)
+            _fm_class = ("rotor" if getattr(config.propeller, "figure_of_merit", None)
+                         is not None else "rotor, typical for the size")
             _de_target = _fm_rotor * 0.80
             if de > 1.0:
                 _insert_status_row(prop_table_tv, "Hover drive efficiency",
@@ -7129,8 +7234,8 @@ def launch_gui():
                     _classify(_de_target, max(de, 1e-9)),
                     f"Ideal hover power over the electrical power, so rotor, "
                     f"motor, ESC and wiring losses together; not a rotor figure "
-                    f"of merit. Expectation: a {_d_in:.0f} in {_fm_class} "
-                    f"(rotor FoM about {_fm_rotor:.2f}) through a motor and ESC "
+                    f"of merit. Expectation: a {_d_in:.0f} in rotor at FoM "
+                    f"{_fm_rotor:.2f} ({_fm_class}) through a motor and ESC "
                     f"at about 80%.")
 
         v_wind_max = float(metrics.get("hover_wind_resistance_mps", float("nan")))
@@ -7494,12 +7599,22 @@ def launch_gui():
                       "rotor figure of merit."
                       + ("  Above 1.0 is impossible: check the thrust table "
                          "or motor constants." if _de > 1.0 else "")))
+        _fom_src = metrics.get("rotor_figure_of_merit_source", "")
+        if _fom_src in ("bench table", "TConst/PConst"):
+            _metrics_add("Rotor Figure of Merit", "not used",
+                         f"The {_fom_src} already contains the rotor's losses.")
+        else:
+            _metrics_add("Rotor Figure of Merit",
+                         f"{fmt(metrics.get('rotor_figure_of_merit', float('nan')),3)}   ({_fom_src})",
+                         "Ideal hover power over rotor shaft power: the rotor's "
+                         "own losses. Enter a measured value on the Propeller "
+                         "tab; the default falls with diameter.")
         _metrics_add("Ideal Hover Power",
                      f"{fmt(metrics.get('hover_ideal_power_W',float('nan')),1)} W   "
                      "(momentum-theory minimum, T x sqrt(T / 2 rho A))")
-        _metrics_add("Actual Induced Power",
+        _metrics_add("Hover Propulsion Power",
                      f"{fmt(metrics.get('actual_induced_power_W',float('nan')),1)} W   "
-                     "(ideal / figure of merit — the two differ by exactly FM)")
+                     "(electrical, all motors and ESCs; ideal / drive efficiency)")
         _metrics_add("Copper Loss / motor",
                      f"{fmf(metrics.get('motor_copper_loss_W_per_motor', float('nan')),2)} W",
                      "I2Rm heat in the windings. It rises with the SQUARE of "
@@ -8080,6 +8195,8 @@ def launch_gui():
             TConst       = float(tc) if tc else None,
             PConst       = float(pc) if pc else None,
             weight_g     = parse_float_opt("Prop weight", v_prop_weight.get()),
+            figure_of_merit = check_rotor_figure_of_merit(
+                parse_float_opt("Rotor figure of merit", v_prop_fom.get())),
         )
         # Two mass entry modes. In "enter airframe" the user gives the bare
         # structure and the all-up weight is built up from the components, so
@@ -9011,6 +9128,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--prop_table", type=str, default=None)
     parser.add_argument("--prop_tconst", type=float, default=None, help="Prop thrust coefficient (C_T-like)")
     parser.add_argument("--prop_pconst", type=float, default=None, help="Prop power coefficient (C_P-like)")
+    parser.add_argument("--prop_figure_of_merit", type=float, default=None,
+                        help="Rotor hover figure of merit, ideal over shaft power "
+                             f"({ROTOR_FOM_MIN}-{ROTOR_FOM_MAX}). Default: typical for "
+                             "the diameter. Not used with --prop_table or TConst/PConst.")
 
     # Mission
     parser.add_argument("--mission", type=str, default=None, help="Path to mission profile JSON; if omitted, do single-point run.")
@@ -9252,6 +9373,11 @@ def main():
         print(f"Hover Efficiency      : {metrics.get('hover_efficiency_gW', 0.0):.2f} g/W")
         print(f"Hover Drive Efficiency: {metrics.get('hover_drive_efficiency', 0.0):.3f}"
               f"  (ideal / electrical, whole drivetrain; not a rotor FoM)")
+        _fom_src = metrics.get("rotor_figure_of_merit_source", "")
+        if _fom_src in ("bench table", "TConst/PConst"):
+            print(f"Rotor FoM (hover)     : not used ({_fom_src} carries the rotor's losses)")
+        else:
+            print(f"Rotor FoM (hover)     : {metrics.get('rotor_figure_of_merit', 0.0):.3f}  ({_fom_src})")
         print(f"Disk Loading          : {metrics.get('disk_loading_N_m2', 0.0):.1f} N/m²")
         tip_mach = metrics.get("tip_mach", None)
         if tip_mach is not None:

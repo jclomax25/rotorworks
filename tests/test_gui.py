@@ -18,6 +18,7 @@ is not testing them.
 from __future__ import annotations
 
 import glob
+import json
 import math
 import os
 import sys
@@ -636,9 +637,11 @@ def test_payload_and_avionics_levers_move_the_answer(request, which, config, pat
     assert swing["Payload mass"] > 0, swing
     assert swing["Avionics draw"] > 0, swing
     if which == "mc":
-        # The multicopter has no figure-of-merit input, so it is not offered
-        # as a lever that can only ever read zero.
+        # The rotor figure of merit is a real input now (audit M13), and on
+        # this Kv-path aircraft it moves the answer. The old lever, which set
+        # an attribute nothing read, is gone.
         assert "Figure of merit" not in swing
+        assert swing["Rotor figure of merit"] > 0, swing
 
 
 @pytest.mark.parametrize("which", ["mc", "fw"])
@@ -955,7 +958,7 @@ def test_mc_mission_compare_uses_the_mission_totals(mc_gui, paths, monkeypatch):
         assert values[1] != "—", f"{values[0]} has no mission value"
 
 
-def test_mc_status_judges_the_drive_efficiency_as_a_drivetrain(mc_gui):
+def test_mc_status_judges_the_drive_efficiency_as_a_drivetrain(mc, mc_gui):
     """Audit M7, G8: the whole-drivetrain number was labelled a rotor
     figure of merit and checked against rotor thresholds."""
     assert mc_gui.click("Fixed Speed Sweep") == []
@@ -968,8 +971,10 @@ def test_mc_status_judges_the_drive_efficiency_as_a_drivetrain(mc_gui):
                     rows[str(v[0])] = v
     assert "Figure of merit" not in rows
     row = rows["Hover drive efficiency"]
-    assert float(str(row[2]).split()[-1]) in (pytest.approx(0.56), pytest.approx(0.48),
-                                             pytest.approx(0.36))
+    # The expectation is the rotor figure of merit in use, the typical value
+    # for the GUI's default 12 in propeller, through a motor and ESC at 80%.
+    assert float(str(row[2]).split()[-1]) == pytest.approx(
+        round(mc.default_rotor_figure_of_merit(12.0) * 0.80, 2))
 
 
 @pytest.mark.parametrize("which", ["mc", "fw"])
@@ -1006,3 +1011,38 @@ def test_export_carries_every_table_with_numbers(request, which, tmp_path):
     assert len(numbers) > 20
     for r in numbers[:50]:
         float(r[1])
+
+
+# ----------------------------------------------------------------------
+# Audit M13: the multicopter had no rotor figure-of-merit input.
+# ----------------------------------------------------------------------
+
+def _mc_config_with(paths, tmp_path, **extra_vars):
+    src = os.path.join(paths["configs"], "multicopter_450_survey_4S.json")
+    data = json.load(open(src))
+    data["vars"].update(extra_vars)
+    out = tmp_path / "mc_fom.json"
+    out.write_text(json.dumps(data))
+    return str(out)
+
+
+def test_mc_entered_figure_of_merit_reaches_metrics_and_status(mc_gui, paths, tmp_path,
+                                                               monkeypatch):
+    import tkinter.messagebox as mb
+    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: True)
+    mc_gui.set_open_dialog(_mc_config_with(paths, tmp_path, prop_fom="0.55"))
+    assert mc_gui.click("Load Config") == []
+    assert mc_gui.click("Fixed Speed Sweep") == []
+    text = _all_tree_text(mc_gui)
+    assert "Rotor Figure of Merit" in text
+    assert "0.550   (entered)" in text
+    assert "at FoM 0.55 (rotor)" in text
+
+
+def test_mc_out_of_range_figure_of_merit_is_refused(mc_gui, paths, tmp_path, monkeypatch):
+    import tkinter.messagebox as mb
+    monkeypatch.setattr(mb, "askyesno", lambda *a, **k: True)
+    mc_gui.set_open_dialog(_mc_config_with(paths, tmp_path, prop_fom="1.2"))
+    assert mc_gui.click("Load Config") == []
+    errors = mc_gui.click("Fixed Speed Sweep")
+    assert any("figure of merit" in e.lower() for e in errors), errors

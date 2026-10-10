@@ -1485,17 +1485,18 @@ def test_figure_of_merit_expectation_scales_with_rotor_size(mc):
     """
     Small propellers run at low Reynolds number and cannot reach the figure
     of merit of a large rotor. A flat 0.65 flagged three of the five example
-    aircraft as bad, including ordinary ones.
+    aircraft as bad, including ordinary ones. The default rotor figure of
+    merit (audit M13) passes through the size classes the check used.
     """
-    def target(diameter_in):
-        if diameter_in >= 15:
-            return 0.70
-        if diameter_in >= 9:
-            return 0.60
-        return 0.45
-
-    assert target(22) > target(10) > target(3), \
-        "expectation should fall with rotor size, not stay constant"
+    fom = mc.default_rotor_figure_of_merit
+    assert fom(3) == pytest.approx(0.45)
+    assert fom(9) == pytest.approx(0.60)
+    assert fom(15) == pytest.approx(0.70)
+    assert fom(21) == pytest.approx(0.78)
+    sizes = [1, 3, 5, 7, 9, 12, 15, 18, 21, 28, 40]
+    values = [fom(d) for d in sizes]
+    assert values == sorted(values), "expectation should rise with rotor size"
+    assert values[0] == values[1] and values[-1] == values[-3], "held flat beyond the ends"
 
 
 # ======================================================================
@@ -1870,8 +1871,11 @@ def test_dji_m300_hover_endurance_matches_the_published_figure(mc):
     """
     DJI publishes 55 minutes of hover for a Matrice 300 RTK at 6.3 kg with
     two TB60 packs and no camera. This is the strongest validation in the
-    project: the battery energy is published, so NOTHING is tuned. The only
-    judgement call is usable capacity, left at the conventional 80%.
+    project: the battery energy is published, so NOTHING is tuned. The
+    judgement calls are usable capacity, left at the conventional 80%, and
+    the rotor figure of merit, left at the typical 0.78 for a 21 in rotor
+    (audit M13; it used to be an ideal 1.0). Propulsion power only: the
+    file's avionics rails are not counted here.
 
     The pack energy is worth checking on its own — 11870 mAh at a 12S LiPo
     nominal should come out at DJI's stated 548 Wh for the pair, and if it
@@ -2033,6 +2037,12 @@ def test_m350_is_shorter_legged_than_the_m300_by_the_right_margin(mc):
     This is a sensitivity check, which is worth more than another absolute
     one: a model can be right about one aircraft by luck, but not about the
     DIFFERENCE between two that DJI documents separately.
+
+    DJI measures the M350's 55 min at about 8 m/s without payload, so that
+    is where the absolute check is made. With an ideal rotor the model was
+    about 15% optimistic there and the hover figure stood in as the
+    "conservative" comparison; with the rotor's figure of merit (audit M13)
+    the published condition itself lands within a few percent.
     """
     m300, m300_Wh = _load_dji_config(mc, "multicopter_dji_m300_rtk.json")
     m350, m350_Wh = _load_dji_config(mc, "multicopter_dji_m350_rtk.json")
@@ -2045,55 +2055,43 @@ def test_m350_is_shorter_legged_than_the_m300_by_the_right_margin(mc):
     assert 0.88 < m350_min / m300_min < 0.98, (
         f"M350 is {m350_min / m300_min:.3f} of the M300 — outside what the "
         "weight and energy difference can explain")
-    assert m350_min == pytest.approx(55.0, rel=0.10), (
-        f"M350 hovers {m350_min:.1f} min against a published 55 (measured by "
-        "DJI at ~8 m/s, so this is the conservative comparison)")
+
+    at_8 = mc.compute_operating_metrics(m350, 8.0, "translating")["total_power_W"]
+    m350_8_min = m350_Wh / at_8 * 60.0
+    assert m350_8_min == pytest.approx(55.0, rel=0.10), (
+        f"M350 flies {m350_8_min:.1f} min at 8 m/s against a published 55")
 
 
-def test_the_m30_documents_where_this_model_stops_being_accurate(mc):
+def test_m30_hover_holds_once_rotor_efficiency_falls_with_size(mc):
     """
-    KNOWN LIMITATION, pinned deliberately.
+    The M30 is half the M300's weight on 16 in rotors instead of 21: its
+    value here is SCALE.
 
-    The M30 is half the M300's weight on 16 in rotors instead of 21. The
-    model predicts 47 min of hover against DJI's published 36 — it is 31%
-    OPTIMISTIC, and this test asserts that gap rather than hiding it.
+    With an ideal rotor (an effective figure of merit of 1.0) the model gave
+    47 min of hover against DJI's published 36, 31% optimistic, while the
+    M300 came out right. Real hardware loses efficiency scaling down: the
+    published figures put overall hover efficiency (ideal momentum power
+    over electrical power) at 69.2% for the M300 and 57.3% for the M30, and
+    the model had the M30 HIGHER than the M300.
 
-    Overall hover efficiency, ideal momentum power over electrical power:
-
-        M300, 21 in rotors: model 69.4%, real 69.2%   essentially exact
-        M30,  16 in rotors: model 74.8%, real 57.3%   far too kind
-
-    The model gets the large aircraft almost exactly right, then carries the
-    same efficiency down to half the size. It has NO size dependence in its
-    efficiency chain and real hardware plainly does — roughly 12 points lost
-    scaling down, from lower propeller Reynolds number and from smaller
-    motors and ESCs.
-
-    Not fixed deliberately: two aircraft is not a scaling law, and fitting
-    one to two points would be inventing a coefficient. If someone does fix
-    it with real bench data, this test fails — and it should, because the
-    right response is to update the expectation here rather than to discover
-    the change by accident somewhere else.
+    The rotor figure of merit now falls with diameter (audit M13; 0.71 at
+    16 in, 0.78 at 21 in, from the size classes the Status check already
+    used). Neither aircraft was fitted. This pins both that the M30 lands
+    and that the small rotor is the less efficient one.
     """
     m30, usable_Wh = _load_dji_config(mc, "multicopter_dji_m30.json")
     predicted = _hover_endurance_min(mc, m30, usable_Wh)
-    published = 36.0
+    assert predicted == pytest.approx(36.0, rel=0.10), (
+        f"M30 hovers {predicted:.1f} min against a published 36")
 
-    assert predicted > published, "the known optimism has reversed"
-    assert 1.20 < predicted / published < 1.45, (
-        f"the M30 gap is now {predicted / published:.2f}x, not the documented "
-        "~1.31x — if the figure-of-merit scaling was fixed, update this test")
-
-    # The model's reported figure of merit is a DERIVED diagnostic, not an
-    # input: it is ideal induced power over the model's own induced power.
-    # It reading higher for the smaller rotor is a symptom of the missing
-    # size dependence, not its cause. Pinned so a fix is noticed.
     m300, _ = _load_dji_config(mc, "multicopter_dji_m300_rtk.json")
-    fom_small = mc.compute_operating_metrics(m30, 0.0, "hover")["hover_drive_efficiency"]
-    fom_large = mc.compute_operating_metrics(m300, 0.0, "hover")["hover_drive_efficiency"]
-    assert fom_small > fom_large, (
-        "the small-rotor figure of merit is no longer above the large-rotor "
-        "one — the scaling may have been corrected, so revisit the M30 gap")
+    eff_small = mc.compute_operating_metrics(m30, 0.0, "hover")["hover_drive_efficiency"]
+    eff_large = mc.compute_operating_metrics(m300, 0.0, "hover")["hover_drive_efficiency"]
+    assert eff_small < eff_large, (
+        f"the 16 in drive ({eff_small:.3f}) is no less efficient than the "
+        f"21 in one ({eff_large:.3f})")
+    # The published figures put the gap at about 12 points.
+    assert 0.04 < eff_large - eff_small < 0.20
 
 
 # ----------------------------------------------------------------------
@@ -3015,3 +3013,165 @@ def test_display_values_split_into_number_and_unit(mc):
                                              [["AUW", "1800 g (17.7 N)", "n"]])
     assert headers == ["Metric", "Value", "Unit", "Value (display)", "Note"]
     assert rows == [["AUW", 1800.0, "g", "1800 g (17.7 N)", "n"]]
+
+
+# ----------------------------------------------------------------------
+# Audit M13: with no bench table or TConst/PConst, the Kv path priced each
+# rotor at its ideal momentum power, an effective figure of merit of 1.0,
+# and the motor model took the copper loss OFF the input power. Each test
+# below fails on that code.
+# ----------------------------------------------------------------------
+
+def _hover_thrust_per_motor(mc, drone):
+    return mc.thrust_required(drone, 0.0, "hover") / drone.num_motors
+
+
+def test_mc_kv_path_charges_the_rotor_figure_of_merit(mc, mc_quad):
+    import copy
+    t = _hover_thrust_per_motor(mc, mc_quad)
+    area = mc.disk_area(mc_quad.propeller.diameter_in)
+    ideal = t * math.sqrt(t / (2.0 * mc_quad.air_density * area))
+    fom = mc.rotor_figure_of_merit(mc_quad)
+    assert fom == pytest.approx(mc.default_rotor_figure_of_merit(10.0))
+    assert mc.rotor_shaft_power_W(mc_quad, t) == pytest.approx(ideal / fom, rel=1e-9)
+
+    good, poor = copy.deepcopy(mc_quad), copy.deepcopy(mc_quad)
+    good.propeller.figure_of_merit, poor.propeller.figure_of_merit = 0.75, 0.50
+    p_good = mc.power_required(good, 0.0, "hover")
+    p_poor = mc.power_required(poor, 0.0, "hover")
+    # The shaft power goes as 1/FoM; the motor's losses come on top.
+    assert p_poor / p_good > 1.35, (p_good, p_poor)
+
+
+def test_mc_motor_input_is_shaft_power_plus_the_motor_losses(mc, mc_quad):
+    t = _hover_thrust_per_motor(mc, mc_quad)
+    shaft = mc.rotor_shaft_power_W(mc_quad, t)
+    rpm = mc._rotor_rpm_at_thrust(mc_quad, t)
+    kv, r, i0 = mc_quad.motor.kv, mc_quad.motor.resistance, mc_quad.motor.idle_current
+    v_emf = rpm / kv
+    current = shaft / v_emf + i0          # Q / Kt = P / omega * 2 pi Kv / 60
+    expected = shaft + v_emf * i0 + current ** 2 * r
+    p_in = mc.motor_power_from_params(mc_quad, t)
+    assert p_in == pytest.approx(expected, rel=1e-9)
+    assert p_in > shaft + current ** 2 * r, "copper loss must be added, not subtracted"
+    # The winding current the metrics report recovers the model's current.
+    m = mc.compute_operating_metrics(mc_quad, 0.0, "hover")
+    assert m["motor_current_A"] == pytest.approx(current, rel=1e-3)
+
+
+def test_mc_motor_power_is_not_clipped_at_its_rating(mc, mc_quad):
+    import copy
+    rated = copy.deepcopy(mc_quad)
+    rated.motor.max_power, rated.motor.max_current = 20.0, 2.0
+    assert mc.power_required(rated, 0.0, "hover") == pytest.approx(
+        mc.power_required(mc_quad, 0.0, "hover"), rel=1e-12)
+
+
+def test_mc_tconst_pconst_motor_runs_at_the_rotor_rpm(mc, mc_quad):
+    """With TConst/PConst the motor was charged pack voltage x current at
+    whatever RPM the rotor turned: many times the shaft power on a slow
+    rotor."""
+    import copy
+    d = copy.deepcopy(mc_quad)
+    d.propeller.TConst, d.propeller.PConst = 0.11, 0.045
+    t = _hover_thrust_per_motor(mc, d)
+    rpm = mc._rotor_rpm_at_thrust(d, t)
+    n = rpm / 60.0
+    shaft = 0.045 * d.air_density * n ** 3 * (0.254 ** 5)
+    p_in = mc.motor_power_from_params(d, t)
+    assert shaft < p_in < 1.3 * shaft, (shaft, p_in)
+    assert mc.compute_operating_metrics(d, 0.0, "hover")["rotor_figure_of_merit_source"] \
+        == "TConst/PConst"
+
+
+def test_mc_figure_of_merit_loss_does_not_scale_the_propulsive_power(mc, mc_quad):
+    """The rotor's hover loss splits into profile power, which does not fall
+    with speed, and an induced loss, which scales with v_i. Dividing the
+    whole ideal power by the figure of merit charged the loss on the
+    propulsive term T V sin(a) as well."""
+    import copy
+    a, b = copy.deepcopy(mc_quad), copy.deepcopy(mc_quad)
+    a.propeller.figure_of_merit, b.propeller.figure_of_merit = 0.45, 0.55
+    t = _hover_thrust_per_motor(mc, mc_quad)
+    p0, _tip = mc._hover_profile_power_W(mc_quad, t)
+    area = mc.disk_area(mc_quad.propeller.diameter_in)
+    v_h = math.sqrt(t / (2.0 * mc_quad.air_density * area))
+    assert p0 < t * v_h * (1 / 0.55 - 1), "profile power must not be capped here"
+    v, inc = 15.0, math.radians(20.0)
+    v_i = mc.induced_velocity_forward_flight(v_h, v, inc)
+    gap_hover = mc.rotor_shaft_power_W(a, t) - mc.rotor_shaft_power_W(b, t)
+    gap_speed = mc.rotor_shaft_power_W(a, t, v, inc) - mc.rotor_shaft_power_W(b, t, v, inc)
+    assert gap_speed == pytest.approx(gap_hover * v_i / v_h, rel=1e-9)
+    # Profile power stays: at speed the rotor still pays its full P0.
+    assert mc.rotor_shaft_power_W(a, t, v, inc) > t * v * math.sin(inc) + p0
+
+
+def test_mc_drive_efficiency_of_the_cli_example_is_below_one(mc, monkeypatch):
+    """The CLI test aircraft reported a hover drive efficiency of 1.01, more
+    than momentum theory allows, from an ideal rotor and a motor model
+    that subtracted its copper loss."""
+    from test_cli import MC_BASE
+    seen = _capture_metrics(monkeypatch, mc, "compute_operating_metrics")
+    monkeypatch.setattr(sys, "argv", ["sim"] + MC_BASE + ["--orientation", "hover"])
+    mc.main()
+    de = seen[-1][1]["hover_drive_efficiency"]
+    assert 0.3 < de < 0.8, de
+
+
+def test_mc_cli_figure_of_merit_reaches_the_model(mc, monkeypatch, capsys):
+    from test_cli import MC_BASE
+    seen = _capture_metrics(monkeypatch, mc, "compute_operating_metrics")
+    monkeypatch.setattr(sys, "argv", ["sim"] + MC_BASE + ["--orientation", "hover",
+                                                          "--prop_figure_of_merit", "0.5"])
+    mc.main()
+    assert seen[-1][0].propeller.figure_of_merit == 0.5
+    assert seen[-1][1]["rotor_figure_of_merit"] == 0.5
+    assert seen[-1][1]["rotor_figure_of_merit_source"] == "entered"
+    assert "Rotor FoM (hover)     : 0.500  (entered)" in capsys.readouterr().out
+
+    monkeypatch.setattr(sys, "argv", ["sim"] + MC_BASE + ["--prop_figure_of_merit", "1.2"])
+    with pytest.raises(SystemExit, match="figure of merit"):
+        mc.main()
+
+
+def test_mc_figure_of_merit_out_of_range_is_an_input_error(mc):
+    assert mc.check_rotor_figure_of_merit(None) is None
+    assert mc.check_rotor_figure_of_merit(0.62) == 0.62
+    for bad in (0.1, 0.95, 1.0, 1.5):
+        with pytest.raises(ValueError):
+            mc.check_rotor_figure_of_merit(bad)
+
+
+def test_mc_figure_of_merit_is_not_used_with_a_bench_table(mc, mc_quad):
+    import copy
+    d = copy.deepcopy(mc_quad)
+    d.propeller = mc.PropellerConfig(
+        diameter_in=10, pitch_in=4.5, max_rpm=0, max_thrust_g=0,
+        table_csv=os.path.join(ROOT, "tests", "data", "motor_prop_table.csv"))
+    base = mc.power_required(d, 0.0, "hover")
+    d.propeller.figure_of_merit = 0.3
+    assert mc.power_required(d, 0.0, "hover") == pytest.approx(base, rel=1e-12)
+    m = mc.compute_operating_metrics(d, 0.0, "hover")
+    assert m["rotor_figure_of_merit_source"] == "bench table"
+    assert math.isnan(m["rotor_figure_of_merit"])
+
+
+def test_rw_maps_the_multicopter_figure_of_merit(rw):
+    assert rw.GUI_TO_CLI_MULTICOPTER["prop_fom"] == "prop_figure_of_merit"
+
+
+def test_mc_reported_rpm_is_the_motor_models_with_tconst_alone(mc, mc_quad):
+    """TConst without PConst: the power model turns the motor at the TConst
+    RPM, so the metrics must report that RPM and recover the model's own
+    winding current from it, not a geometry estimate."""
+    import copy
+    d = copy.deepcopy(mc_quad)
+    d.propeller.TConst = 0.11
+    t = _hover_thrust_per_motor(mc, d)
+    rpm = mc._rotor_rpm_at_thrust(d, t)
+    m = mc.compute_operating_metrics(d, 0.0, "hover")
+    assert m["prop_rpm"] == pytest.approx(rpm, rel=1e-9)
+    assert m["prop_rpm_is_estimated"] is False
+    shaft = mc.rotor_shaft_power_W(d, t)
+    current = shaft / (rpm / d.motor.kv) + d.motor.idle_current
+    assert m["motor_current_A"] == pytest.approx(current, rel=1e-3)

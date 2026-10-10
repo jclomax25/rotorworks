@@ -748,6 +748,7 @@ GUI_TO_CLI_MULTICOPTER = {
     "prop_blades": "prop_blades", "prop_table": "prop_table",
     "prop_max_rpm": "prop_max_rpm", "prop_max_thrust": "prop_max_thrust",
     "prop_tconst": "prop_tconst", "prop_pconst": "prop_pconst",
+    "prop_fom": "prop_figure_of_merit",
     "prop_weight": "prop_weight",
     "mission": "mission", "orientation": "orientation",
     "alt": "altitude", "temp": "temperature", "press": "pressure",

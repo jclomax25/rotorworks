@@ -344,17 +344,27 @@ enough to check the model against something it did not choose.
 
 | File | Aircraft | Published check | Model | Published |
 |---|---|---|---|---|
-| `multicopter_dji_m300_rtk.json` | DJI Matrice 300 RTK | Hover, 6.3 kg no payload | **55.2 min** | 55 min |
-| `multicopter_dji_m350_rtk.json` | DJI Matrice 350 RTK | Hover, 6.47 kg | **52.1 min** | 55 min |
-| `multicopter_dji_m30.json` | DJI Matrice 30 | Hover, 3.77 kg | **47.0 min** | 36 min ⚠ |
+| `multicopter_dji_m300_rtk.json` | DJI Matrice 300 RTK | Hover, 6.3 kg no payload | **51.0 min** | 55 min |
+| `multicopter_dji_m350_rtk.json` | DJI Matrice 350 RTK | ~8 m/s, 6.47 kg | **55.5 min** | 55 min |
+| `multicopter_dji_m30.json` | DJI Matrice 30 | Hover, 3.77 kg | **35.7 min** | 36 min |
 | `fixedwing_ebee_x_mapping.json` | senseFly eBee X | Endurance / range | **89.8 min / 94.9 km** | 90 min / 95 km |
 | `vtol_trinity_f90_lift_cruise.json` | Quantum-Systems Trinity F90+ | Total flight time | **90.0 min** | 90 min |
 | `vtol_wingtraone_gen2_tailsitter.json` | Wingtra WingtraOne GEN II | Total flight time | **58.4 min** | 59 min |
 
-**The M300 is the strongest of these, because nothing is tuned.** DJI
-publishes the battery energy, so the pack comes out at 548 Wh by arithmetic
-and the hover power is whatever the momentum theory says. The only judgement
-call is usable capacity, left at the conventional 80%.
+**The three DJI aircraft have nothing tuned.** DJI publishes the battery
+energy, so each pack comes out at its published Wh by arithmetic, and the
+power is momentum theory over the rotor's figure of merit, through the motor
+model. The judgement calls are usable capacity, left at the conventional
+80%, and the rotor figure of merit, left at the default for the diameter
+(0.78 at 21 in, 0.71 at 16 in). That default was not fitted to these
+aircraft: its 3, 9 and 15 in points are the size classes the Status check
+already used, and 0.78 is a typical large-rotor value. Moving the 21 in point
+between 0.75 and 0.80 moves the M300 between 49.3 and 52.1 min.
+
+These are **propulsion-only** figures, as the tests compute them: the files
+also carry about 72 W of avionics rails and an ESC, which the GUI counts.
+Loaded in the GUI, the M300 hovers 42.7 min and the M30 27.2. DJI does not
+say what its avionics draw, so treat the rails as an assumption to edit.
 
 The other three fit exactly one number — `CD0` for the two VTOLs, battery
 capacity for the eBee X — and are then checked against a **second** published
@@ -367,40 +377,39 @@ figure that was not fitted:
   three-rotor hover also clears the published 4500 m maximum altitude, at
   93% throttle — a third published figure the model was not fitted to.
 
-**The M30 misses by 31%, and it is shipped BECAUSE it misses.** It is the
-clearest evidence here of where this model stops being accurate. Comparing
-overall hover efficiency — ideal momentum power over electrical power:
+**The M30 is the scale check.** It is half the M300's weight on 16 in rotors
+instead of 21. Overall hover efficiency, ideal momentum power over electrical
+power:
 
 | | Model | Real |
 |---|---|---|
-| M300, 21 in rotors | 69.4% | **69.2%** |
-| M30, 16 in rotors | 74.8% | **57.3%** |
+| M300, 21 in rotors | 64.1% | **69.2%** |
+| M30, 16 in rotors | 56.8% | **57.3%** |
 
-The model gets the large aircraft almost exactly right and then carries that
-same efficiency down to half the size, where it does not hold. **It has no
-size dependence in its efficiency chain and real hardware plainly does** —
-about 12 points lost scaling down, from lower propeller Reynolds number and
-from smaller motors and ESCs being less efficient.
+Until audit M13 the multicopter had no rotor figure of merit at all: with no
+bench table or TConst/PConst it priced each rotor at its ideal momentum
+power, and its motor model took the copper loss off the input power instead
+of adding it while charging the idle loss at full pack voltage. On the M300
+those errors happened to cancel, almost exactly on 55 min; carried down to
+the M30 they came out 31% optimistic (47.0 min), with the model's
+small-rotor efficiency *above* the large one. With the figure of merit falling with size, the small rotor is
+the less efficient one, as real hardware is, and the M30 lands.
 
-**This is not fixed, deliberately.** Two aircraft is not a scaling law, and
-fitting one to two points would be inventing a coefficient — the mistake that
-made the propeller thrust fit 2x wrong earlier in this project. Correcting it
-needs bench data across a range of rotor sizes.
-
-**Practical consequence: trust this model least on small rotors.** Below about
-16 in, load a measured propeller table and the estimate is bypassed entirely.
-A test pins the gap deliberately, so a future fix fails loudly rather than
-being discovered by accident.
+**Below about 9 in, trust the default least.** Small-propeller figures of
+merit vary widely with Reynolds number and blade design, and none of the
+validated aircraft is that small. Load a measured propeller table, or enter
+a measured figure of merit on the Propeller tab, and the default is bypassed.
 
 The M300 and M350 together are a **sensitivity** check, which is worth more
 than another absolute one: the M350 is heavier (6.47 vs 6.3 kg) on less energy
-(526 vs 548 Wh), and the model puts it 5.6% shorter-legged, which is what
-those two numbers imply. A model can be right about one aircraft by luck, but
-not about the difference between two documented separately.
+(526 vs 548 Wh), and the model puts it 7.4% shorter-legged in hover, which is
+what those two numbers imply. A model can be right about one aircraft by
+luck, but not about the difference between two documented separately. DJI
+measures the M350's 55 min at about 8 m/s, so that is where its absolute
+check is made; in hover the model gives 47.2 min.
 
 Each file separates `_published` from `_inferred`, and `_calibration` says
-exactly what was fitted and to what — including, for the M30, that nothing was
-fitted and it still misses. Read those before trusting a number.
+exactly what was fitted and to what. Read those before trusting a number.
 
 ### Configs — VTOL
 
@@ -821,7 +830,10 @@ All three simulators run headless with no `--gui`. Key arguments:
 `--motor_configuration flat|coaxial`, `--coaxial_spacing_m`,
 `--drag_model_mode auto|manual`, `--parasite_area`, `--parasite_drag`,
 `--profile_area`, `--profile_drag`, `--body_length_m`, `--body_width_m`,
-`--body_height_m`, `--arm_length_m`, `--arm_width_m`
+`--body_height_m`, `--arm_length_m`, `--arm_width_m`,
+`--prop_figure_of_merit` (rotor hover figure of merit, 0.2–0.9; blank uses
+the typical value for the diameter; not used with `--prop_table` or
+TConst/PConst)
 
 ### ESC (both)
 
@@ -1170,41 +1182,43 @@ Notes:
 ## Accuracy: what the validated aircraft show
 
 Four aircraft have been checked against published manufacturer figures using
-**first-principles inputs only** — no drag or efficiency fitted. Ordered by
-how optimistic the untuned model turned out to be:
+**first-principles inputs only** — no drag or efficiency fitted to them.
+Ordered by how optimistic the untuned model turned out to be:
 
 | Aircraft | Simulator | Size | Model / real |
 |---|---|---|---|
+| DJI Matrice 300 RTK | multicopter | 21 in rotors | **0.93** |
 | Trinity F90+ | VTOL | 2.39 m span | **0.99** |
-| DJI Matrice 300 RTK | multicopter | 21 in rotors | **1.00** |
+| DJI Matrice 30 | multicopter | 16 in rotors | **0.99** |
 | Wingtra WingtraOne GEN II | VTOL | 1.25 m span | **1.10** |
-| DJI Matrice 30 | multicopter | 16 in rotors | **1.31** |
 
-**The two large aircraft are essentially exact; the two smaller ones are
-optimistic, by more the smaller they get.** That holds across two independent
-simulators with different physics, which is what makes it worth stating: it
-is unlikely to be a coincidence of one code path.
+The multicopter figures are propulsion-only (see the validation section
+above for what the files' avionics rails do to them).
 
-The probable cause is that nothing in these models depends on scale. A
+**Efficiency falls with size, and only the multicopter models that.** A
 propeller's figure of merit falls with Reynolds number, and small motors and
-ESCs are less efficient than large ones — none of which is represented. The
-models were built and checked against large-aircraft data, and that is where
-they are trustworthy.
+ESCs are less efficient than large ones. The multicopter's rotor figure of
+merit now falls with diameter (audit M13), and its two aircraft land within
+7%. Before that it priced rotors as ideal: the M300 came out at 1.00 by a
+cancellation of errors and the M30 at 1.31. The VTOL's lift figure of merit
+is a flat 0.65 unless you enter one, and the smaller of its two aircraft is
+10% optimistic.
 
 **How to use this.** For aircraft in the 5 kg and up, 20 in rotor or 2 m span
-class, expect the untuned model to be close. Below that, expect it to flatter
-your design by 10-30%, and either:
+class, expect the untuned model to be close. Below that, and below about 9 in
+rotors on a multicopter, expect more scatter, and either:
 
 - load a **measured propeller table** (Propeller tab, or `--lift_prop_table`
   / `--prop_table`), which bypasses the efficiency estimate entirely; or
-- **calibrate `CD0` or the figure of merit** against a measured endurance,
-  as the WingtraOne and eBee X configs do — each says in its `_calibration`
-  block exactly what was fitted.
+- **enter or calibrate the figure of merit** (`--prop_figure_of_merit`,
+  `--lift_figure_of_merit`) or `CD0` against a measured endurance, as the
+  WingtraOne and eBee X configs do — each says in its `_calibration` block
+  exactly what was fitted.
 
-**This is not corrected in code, deliberately.** Four aircraft is a pattern,
-not a scaling law, and fitting one would be inventing a coefficient. It is
-documented instead, and the M30 gap is pinned by a test so that a future fix
-with real bench data fails loudly rather than passing unnoticed.
+The multicopter's default is a curve through typical values for each size
+class, not a fit to these aircraft. Moving it a few hundredths moves the
+answers a few percent; a measured figure for your own propeller is always
+better.
 
 ---
 
@@ -1262,11 +1276,23 @@ with real bench data fails loudly rather than passing unnoticed.
   `v_h = sqrt(T / (2·ρ·A))` and `a` is the disk incidence (the tilt angle).
   At `V = 0` this reduces to the hover value; at speed the rotor meets air
   that is already moving, so induced power falls sharply.
-- Shaft power is `P = T·(V·sin a + vi)`. The first term is the propulsive
+- Ideal power is `P = T·(V·sin a + vi)`. The first term is the propulsive
   power overcoming airframe drag — by the tilt balance `T·sin a = D`, so it
   equals `D·V` exactly. Together these produce the **power bucket**: a
   minimum roughly 10–25% below hover power somewhere around 8–14 m/s, which
   is what sets the real best-endurance and best-range speeds.
+- **Rotor figure of merit.** Without a bench table or TConst/PConst, shaft
+  power is the ideal over the rotor's hover figure of merit: the value on the
+  Propeller tab (`--prop_figure_of_merit`, 0.2–0.9), else a default that
+  falls with diameter — 0.45 at 3 in, 0.60 at 9 in, 0.70 at 15 in, 0.78 at
+  21 in and up, linear in between. In forward flight the hover loss
+  `T·v_h·(1/FoM − 1)` is split into blade profile power, which does not fall
+  with speed, and an induced-loss factor that scales with `vi`; the
+  propulsive term is not charged it. Until audit M13 the rotor was ideal.
+- **Motor model.** `I = Q/Kt + I0`, `Kt = 60/(2π·Kv)`, at the rotor's own
+  RPM, and `P_in = (rpm/Kv + I·Rm)·I`, i.e. shaft power plus idle and copper
+  loss. The motor's current and power ratings are Status checks, not clips
+  on the power. With no Kv the motor is a lumped 85%.
 - Coaxial interference scales with spacing ratio `s / D`.
 - Forward-flight drag uses the **frontal** silhouette; hover/lateral drag
   uses the **side** silhouette. These are separate terms and are not summed.
@@ -2281,9 +2307,9 @@ wrong.
   ideal hover power over electrical power: rotor, motor, ESC and wiring
   together, so it is not a rotor figure of merit and is no longer called one.
   Small propellers run at low Reynolds number and cannot reach what a large
-  rotor can, so the target is a typical rotor FoM for the size (0.70 for
-  >= 15 in, 0.60 for >= 9 in, 0.45 below that) times about 0.80 for the motor
-  and ESC. Above 1.0 is flagged as impossible rather than capped.
+  rotor can, so the target is the rotor figure of merit in use (entered, or
+  the default that falls with diameter) times about 0.80 for the motor and
+  ESC. Above 1.0 is flagged as impossible rather than capped.
 - **Prop solidity scales with blade count.** Solidity rises with blade number
   almost by definition, so one 0.05-0.15 window judged 3-blade propellers
   against a 2-blade expectation and flagged normal designs as suspect.
