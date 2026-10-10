@@ -69,8 +69,8 @@
     "prop_max_rpm": "6000",
     "prop_max_thrust": "6500",
     "prop_table": "",
-    "prop_tconst": "0.9",
-    "prop_pconst": "1.1",
+    "prop_tconst": "0.0618",
+    "prop_pconst": "0.0166",
     "prop_weight": "45",
     "mission": "",
     "alt": "250",
@@ -122,5 +122,6 @@
       "eff": 0.85
     }
   ],
-  "_comment": "User-supplied 22in quad on 12S. The propeller table path was removed because it pointed at one machine's Desktop; load your own measured table on the Propeller tab to see the table-derived TConst/PConst and the thrust-range check."
+  "_comment": "User-supplied 22in quad on 12S: T-motor MN6007 II (V2) KV160 motors on T-motor P22x6.6 carbon propellers. The propeller table path was removed because it pointed at one machine's Desktop; load your own measured table on the Propeller tab to see the table-derived TConst/PConst and the thrust-range check.",
+  "_propeller": "TConst and PConst are the P22x6.6's own coefficients, T = C_T rho n^2 D^4 and P_shaft = C_P rho n^3 D^5 (n in rev/s, D in m), fitted by least squares to T-motor's published bench rows for this propeller, which list thrust, torque and RPM: 40% 1737 g, 0.41 N.m, 2904 rpm; 50% 2431 g, 0.57 N.m, 3421 rpm; 60% 3059 g, 0.72 N.m, 3820 rpm; 68% 3573 g, 0.83 N.m, 4127 rpm. Shaft power is torque x omega, so the motor's losses are not in C_P and the motor model adds them once. Each row gives C_T 0.061-0.062 and C_P 0.0165-0.0167, an implied figure of merit of 0.74. Taken at sea-level density, 1.225 kg/m3; the test's air density is not stated, and at 1.18 both would be about 4% higher. The rows were read from T-motor's LIGPOWER listing through a search, not from the datasheet itself: check them against it. They turn 4127 rpm on 24 V, more than a 160 KV motor can, so they were probably measured on another winding of the MN6007; that does not change the propeller's coefficients, but do not use their currents for the KV160. The hover here, about 1 kg per rotor near 2200 rpm, is below the lowest bench row, where C_P usually rises a little. Replaced TConst 0.9 and PConst 1.1, about 15 and 65 times these, which hovered the rotor at 570 rpm."
 }

@@ -154,7 +154,7 @@ software rather than a minimal case.
 | `multicopter_7in_longrange_6S` | Efficiency-focused cruise; Li-ion SoC curve |
 | `multicopter_450_survey_4S` | Payload, avionics rails, tight tilt limits |
 | `multicopter_heavylift_X8_12S` | Coaxial X8, three avionics rails, 12S ratings |
-| `Jaguar-quad` | A real user design. Load your own prop table to see measured TConst/PConst |
+| `Jaguar-quad` | A real user design: T-motor MN6007 II KV160 on P22x6.6 props, with TConst/PConst fitted to T-motor's bench thrust and torque (see its `_propeller` note) |
 | `fixedwing_1m5_foam_trainer_3S` | High CD0, low Reynolds number, short field |
 | `fixedwing_2m_survey_4S` | Clean airframe, camera payload, 150 m strip |
 | `fixedwing_3m_endurance_6S_liion` | High aspect ratio; best specific range of the set |

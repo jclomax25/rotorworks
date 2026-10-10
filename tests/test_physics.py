@@ -1875,7 +1875,7 @@ def test_dji_m300_hover_endurance_matches_the_published_figure(mc):
     judgement calls are usable capacity, left at the conventional 80%, and
     the rotor figure of merit, left at the typical 0.78 for a 21 in rotor
     (audit M13; it used to be an ideal 1.0). Propulsion power only: the
-    file's avionics rails are not counted here.
+    file's avionics rails are not counted here (audit M14).
 
     The pack energy is worth checking on its own — 11870 mAh at a 12S LiPo
     nominal should come out at DJI's stated 548 Wh for the pair, and if it
@@ -1984,7 +1984,15 @@ def test_ebee_x_endurance_and_range_agree_with_one_battery_choice(fw):
 
 
 def _load_dji_config(mc, filename):
-    """Build a DroneConfig from one of the shipped DJI example files."""
+    """
+    Build a DroneConfig from one of the shipped DJI example files.
+
+    PROPULSION ONLY, deliberately (audit M14): the files' avionics rails
+    (about 72 W) and ESC are left out, so these checks compare the rotor,
+    motor and battery model with DJI's published times. The GUI counts the
+    rails, and there the same files hover 15-25% shorter. DJI publishes no
+    avionics draw, so the rails are an assumption, not data to validate.
+    """
     import json
     path = os.path.join(ROOT, "examples", "configs", filename)
     g = json.load(open(path))["vars"]
@@ -3175,3 +3183,44 @@ def test_mc_reported_rpm_is_the_motor_models_with_tconst_alone(mc, mc_quad):
     shaft = mc.rotor_shaft_power_W(d, t)
     current = shaft / (rpm / d.motor.kv) + d.motor.idle_current
     assert m["motor_current_A"] == pytest.approx(current, rel=1e-3)
+
+
+def test_shipped_propeller_constants_are_physical(mc):
+    """
+    TConst and PConst are C_T and C_P in T = C_T rho n^2 D^4 and
+    P = C_P rho n^3 D^5. The Jaguar example carried 0.9 and 1.1, about 15
+    and 65 times a real 22 in propeller's, which hovered its rotors at
+    570 rpm. Now they come from T-motor's P22x6.6 bench rows.
+    """
+    import glob
+    import json
+    checked = 0
+    for path in sorted(glob.glob(os.path.join(ROOT, "examples", "configs", "*.json"))):
+        data = json.load(open(path))
+        if data.get("schema") != "multicopter_power_sim_gui_config":
+            continue
+        g = data["vars"]
+        tc, pc = str(g.get("prop_tconst", "")).strip(), str(g.get("prop_pconst", "")).strip()
+        if not (tc and pc):
+            continue
+        c_t, c_p = float(tc), float(pc)
+        name = os.path.basename(path)
+        assert 0.03 < c_t < 0.2, f"{name}: C_T {c_t}"
+        assert 0.005 < c_p < 0.1, f"{name}: C_P {c_p}"
+        # Ideal over shaft power for the pair: C_T^1.5 / (sqrt(pi/2) C_P).
+        fom = c_t ** 1.5 / (math.sqrt(math.pi / 2.0) * c_p)
+        assert 0.4 < fom < 0.85, f"{name}: implied figure of merit {fom:.2f}"
+        checked += 1
+    assert checked >= 1
+
+
+def test_jaguar_hovers_its_rotors_at_a_realistic_speed(mc, rw):
+    path = os.path.join(ROOT, "examples", "configs", "Jaguar-quad.json")
+    args = mc.build_arg_parser().parse_args(
+        rw.build_cli_args(rw.load_gui_config(path, "multicopter")))
+    drone = mc.build_drone_from_args(args)
+    m = mc.compute_operating_metrics(drone, 0.0, "hover")
+    assert m["rotor_figure_of_merit_source"] == "TConst/PConst"
+    # 1 kg per 22 in rotor: about 2200 rpm on T-motor's P22x6.6 data.
+    assert 1900 < m["prop_rpm"] < 2600, m["prop_rpm"]
+    assert 0.40 < m["hover_drive_efficiency"] < 0.70, m["hover_drive_efficiency"]

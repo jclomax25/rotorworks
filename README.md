@@ -363,8 +363,12 @@ between 0.75 and 0.80 moves the M300 between 49.3 and 52.1 min.
 
 These are **propulsion-only** figures, as the tests compute them: the files
 also carry about 72 W of avionics rails and an ESC, which the GUI counts.
-Loaded in the GUI, the M300 hovers 42.7 min and the M30 27.2. DJI does not
-say what its avionics draw, so treat the rails as an assumption to edit.
+Loaded in the GUI, the M300 hovers 42.7 min, the M350 38.7 and the M30 27.2.
+DJI does not say what its avionics draw, so the rails are an assumption to
+edit, not data to validate against, and the gap is documented rather than
+fixed (audit M14). Usable capacity is the other unknown: DJI does not say
+what state of charge its times run to, and 80% is conservative if it flies
+closer to empty.
 
 The other three fit exactly one number — `CD0` for the two VTOLs, battery
 capacity for the eBee X — and are then checked against a **second** published
