@@ -1300,7 +1300,7 @@ def test_leg_times_order_correctly_by_heading(mc, tmp_path):
 
 def test_hover_thrust_equals_weight_at_zero_speed(mc, mc_quad):
     """At rest there is no drag, so thrust must be exactly the weight."""
-    weight_N = mc_quad.drone_weight_g * 9.81 / 1000.0
+    weight_N = mc_quad.drone_weight_g * mc.G0 / 1000.0
     assert mc.thrust_required(mc_quad, 0.0, "hover") == pytest.approx(weight_N, rel=1e-9)
 
 
@@ -1311,7 +1311,7 @@ def test_hover_drag_adds_in_quadrature_not_linearly(mc, mc_quad):
     overstated thrust badly at speed — on a 16.5 kg X8 at 18 m/s it gave
     187 N against a true 164 N.
     """
-    weight_N = mc_quad.drone_weight_g * 9.81 / 1000.0
+    weight_N = mc_quad.drone_weight_g * mc.G0 / 1000.0
     for speed in (5.0, 10.0, 18.0):
         drag_N = mc.drag_force_required(mc_quad, speed, "hover")
         got = mc.thrust_required(mc_quad, speed, "hover")
@@ -1337,7 +1337,7 @@ def test_thrust_to_weight_uses_available_thrust(mc, mc_quad):
     is ~1 by definition in steady flight and told a designer nothing. It must
     compare what the propulsion system CAN produce.
     """
-    weight_N = mc_quad.drone_weight_g * 9.81 / 1000.0
+    weight_N = mc_quad.drone_weight_g * mc.G0 / 1000.0
     available_N = mc.available_total_thrust_N(mc_quad)
     assert available_N > 0, "the reference quad should have a thrust limit"
 
@@ -1359,7 +1359,7 @@ def test_status_and_metrics_agree_on_thrust_to_weight(mc, mc_quad):
 
     Both surfaces must derive from the same available-thrust figure.
     """
-    weight_N = mc_quad.drone_weight_g * 9.81 / 1000.0
+    weight_N = mc_quad.drone_weight_g * mc.G0 / 1000.0
     available_N = mc.available_total_thrust_N(mc_quad)
     assert available_N > 0
 
@@ -1730,7 +1730,7 @@ def test_multicopter_power_curve_has_no_jumps(mc, mc_quad):
 
 def test_thrust_equals_weight_when_stationary(mc, mc_quad):
     """With no drag and no turn, the rotors hold exactly the weight."""
-    weight_N = mc_quad.drone_weight_g * 9.81 / 1000.0
+    weight_N = mc_quad.drone_weight_g * mc.G0 / 1000.0
     assert mc.thrust_required(mc_quad, 0.0, "translating") == pytest.approx(
         weight_N, abs=1e-6)
     assert mc.thrust_required(mc_quad, 0.0, "hover") == pytest.approx(
@@ -1806,7 +1806,7 @@ def test_mission_climb_energy_matches_potential_energy(mc, mc_quad, tmp_path):
     hover_Wh = hover_W * duration / 3600.0
     climb_work_Wh = used_Wh - hover_Wh
 
-    ideal_Wh = (mc_quad.drone_weight_g * 9.81 / 1000.0) * height / 3600.0
+    ideal_Wh = (mc_quad.drone_weight_g * mc.G0 / 1000.0) * height / 3600.0
     assert climb_work_Wh == pytest.approx(ideal_Wh, rel=0.15), (
         f"climb cost {climb_work_Wh:.2f} Wh over hover, ideal m*g*h is "
         f"{ideal_Wh:.2f} Wh")
@@ -2690,7 +2690,7 @@ def test_mc_translating_drag_uses_the_tilted_silhouette(mc, mc_quad):
     q = 0.5 * mc_quad.air_density * v * v
     drag = mc.drag_force_required(mc_quad, v, "translating")
     tilt = math.radians(mc.required_tilt_deg(mc_quad, v, "translating"))
-    weight = mc_quad.drone_weight_g * 9.81 / 1000.0
+    weight = mc_quad.drone_weight_g * mc.G0 / 1000.0
     assert math.tan(tilt) == pytest.approx(drag / weight, rel=1e-9)
     assert drag == pytest.approx(q * mc_quad.parasite_drag_coefficient * (
         mc_quad.parasite_area * math.cos(tilt) + mc_quad.top_area * math.sin(tilt)), rel=1e-9)
@@ -2737,7 +2737,7 @@ def test_mc_hover_drive_efficiency_is_ideal_over_electrical(mc, mc_quad):
     assert "figure_of_merit" not in m
     thrust = mc.thrust_required(mc_quad, 0.0, "hover")
     # hover_efficiency_gW is thrust (g) over the same electrical power.
-    electrical = (thrust * 1000.0 / 9.81) / m["hover_efficiency_gW"]
+    electrical = (thrust * 1000.0 / mc.G0) / m["hover_efficiency_gW"]
     assert m["hover_drive_efficiency"] == pytest.approx(
         mc.hover_ideal_induced_power_W(mc_quad, thrust) / electrical, rel=1e-6)
 
@@ -3224,3 +3224,90 @@ def test_jaguar_hovers_its_rotors_at_a_realistic_speed(mc, rw):
     # 1 kg per 22 in rotor: about 2200 rpm on T-motor's P22x6.6 data.
     assert 1900 < m["prop_rpm"] < 2600, m["prop_rpm"]
     assert 0.40 < m["hover_drive_efficiency"] < 0.70, m["hover_drive_efficiency"]
+
+
+# ----------------------------------------------------------------------
+# Audit Low items, group 1: core numerics and the power budget.
+# ----------------------------------------------------------------------
+
+def test_linear_soc_falls_from_full_charge_to_cutoff_in_every_simulator(mc, fw, mc_quad):
+    """C5: the linear model held full-charge voltage for the whole flight."""
+    import copy
+    for batt in (copy.deepcopy(mc_quad.battery),):
+        batt.soc_nonlinear_enabled = False
+        assert mc.core.pack_ocv_from_soc(batt, 0.0) == pytest.approx(batt.vmin_pack)
+        assert mc.core.pack_ocv_from_soc(batt, 0.5) == pytest.approx(
+            0.5 * (batt.vmin_pack + batt.vmax_pack))
+    fb = fw.BatteryConfig(chemistry="LiPo", operating_voltage_min=3.3,
+                          operating_voltage_nominal=3.7, operating_voltage_max=4.2,
+                          unit_mode="pack", pack_capacity_mAh=5000, pack_weight_g=500,
+                          series_units=1, parallel_units=1, cells_series_per_unit=4,
+                          discharge_percent=80, resistance_cell_mOhm=4.0,
+                          soc_model="linear")
+    assert fb.ocv_at_soc(1.0) == pytest.approx(fb.vmax_pack)
+    assert fb.ocv_at_soc(0.0) == pytest.approx(fb.vmin_pack)
+
+
+def test_motor_connector_carries_the_winding_current(mc):
+    """C6: the motor connector was a fixed 1.15 x the ESC's DC input."""
+    core = mc.core
+    cur = core.connector_currents_A(40.0, 10.0, motor_current_A=18.0)
+    assert cur["Motor"] == 18.0 and cur["ESC"] == 10.0
+    # Never below the DC input, and the old estimate without a model current.
+    assert core.connector_currents_A(40.0, 10.0, motor_current_A=5.0)["Motor"] == 10.0
+    assert core.connector_currents_A(40.0, 10.0)["Motor"] == pytest.approx(11.5)
+    wiring = core.WiringConfig(length_m=0.3, awg=12,
+                               connectors={"Motor": (15.0, 20.0, None)})
+    rows = core.wiring_status_rows(wiring, 40.0, 10.0, 16.8, 25.0, motor_current_A=18.0)
+    motor = next(r for r in rows if r[1].startswith("Motor connector current"))
+    assert motor[2] == "18.0 A" and motor[4] == "warn"
+
+
+def test_power_budget_does_not_count_rotor_loss_as_delivered(mc):
+    """C7: shaft power was labelled "to the air" with the rotor's loss in it."""
+    core = mc.core
+    rows = core.build_power_budget(total_in_W=100.0, motor_shaft_W=80.0,
+                                   motor_copper_W=10.0, battery_i2r_W=0.0,
+                                   esc_loss_W=10.0, air_W=50.0)
+    by = {r["name"]: r for r in rows}
+    assert by["Power to the air (ideal)"]["watts"] == 50.0
+    assert by["Power to the air (ideal)"]["kind"] == "delivered"
+    assert by["Rotor / propeller aerodynamic loss"]["watts"] == 30.0
+    assert by["Rotor / propeller aerodynamic loss"]["kind"] == "lost"
+    assert not any("to the air)" in r["name"] and "shaft" in r["name"] for r in rows)
+    plain = core.build_power_budget(total_in_W=100.0, motor_shaft_W=80.0,
+                                    motor_copper_W=10.0, battery_i2r_W=0.0,
+                                    esc_loss_W=10.0)
+    assert plain[0]["name"] == "Motor shaft power (to the propellers)"
+
+
+def test_air_density_below_sea_level(mc):
+    """C8: sites below sea level got sea-level density."""
+    core = mc.core
+    assert core.air_density(-430.0) > core.air_density(0.0) * 1.04
+    assert core.air_density(-5000.0) == core.air_density(core.MIN_ALTITUDE_M)
+
+
+def test_mc_budget_splits_noload_and_rotor_losses(mc, mc_quad):
+    """M9: the budget's shaft power was motor input less copper loss, with
+    the no-load loss and every rotor loss inside it."""
+    m = mc.compute_operating_metrics(mc_quad, 0.0, "hover")
+    rpm, kv, i0 = m["prop_rpm"], mc_quad.motor.kv, mc_quad.motor.idle_current
+    assert m["motor_noload_loss_W_per_motor"] == pytest.approx(i0 * rpm / kv, rel=1e-9)
+    assert m["ideal_rotor_power_W"] == pytest.approx(m["hover_ideal_power_W"], rel=1e-6)
+    # The figure of merit (shaft over ideal) is what the budget's rotor row shows.
+    n = mc_quad.num_motors
+    shaft = (m["motor_power_W"] - n * m["motor_copper_loss_W_per_motor"]
+             - n * m["motor_noload_loss_W_per_motor"])
+    assert m["ideal_rotor_power_W"] / shaft == pytest.approx(
+        mc.rotor_figure_of_merit(mc_quad), rel=0.02)
+
+
+def test_mc_tip_mach_and_weight_use_physical_constants(mc, mc_quad):
+    """M12: tip Mach divided by a fixed 340 m/s and weight used g = 9.81."""
+    hot = mc.compute_operating_metrics(mc_quad, 0.0, "hover", ambient_temp_C=40.0)
+    a = mc.core.speed_of_sound_mps(40.0)
+    assert hot["tip_mach"] == pytest.approx(hot["tip_speed_mps"] / a, rel=1e-9)
+    assert a == pytest.approx(354.7, abs=0.1)
+    assert mc.thrust_required(mc_quad, 0.0, "hover") == pytest.approx(
+        mc_quad.drone_weight_g / 1000.0 * 9.80665, rel=1e-12)

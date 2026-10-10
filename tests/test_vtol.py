@@ -3146,16 +3146,17 @@ def test_breakpoints_outrank_an_explicitly_named_preset(vtol):
     assert b.soc_model_source == "custom-arrays"
 
 
-def test_linear_holds_voltage_at_full_charge(vtol):
+def test_linear_falls_from_full_charge_to_the_cutoff(vtol):
     """
-    The shared core's "linear" is not a ramp — it pins open-circuit
-    voltage at full charge. That is optimistic near the end of the pack,
-    and the tooltip says so; this pins the behaviour the tooltip claims.
+    Audit C5: "linear" pinned open-circuit voltage at full charge for the
+    whole flight, optimistic near the end of the pack. It is now a ramp
+    from full charge to the cutoff, as the tooltip says.
     """
     b = vtol.VTOLBattery(series_cells=6, soc_model="linear")
     assert not b.soc_nonlinear_enabled
     assert b.ocv_at_soc(1.0) == pytest.approx(b.vmax_pack)
-    assert b.ocv_at_soc(0.1) == pytest.approx(b.vmax_pack)
+    assert b.ocv_at_soc(0.0) == pytest.approx(b.vmin_pack)
+    assert b.ocv_at_soc(0.5) == pytest.approx(0.5 * (b.vmin_pack + b.vmax_pack))
 
 
 def test_a_curve_changes_the_loaded_voltage_against_linear(vtol):

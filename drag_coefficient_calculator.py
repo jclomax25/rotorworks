@@ -68,16 +68,22 @@ try:
 except ImportError:
     HAS_PIL = False
 
+# The shared physics, so the atmosphere here is the simulators' own and
+# cannot drift from it (audit D7). It must sit beside this file, as for the
+# simulators.
+try:
+    import rotorworks_core as core
+except ImportError as _exc:      # pragma: no cover - install/deploy problem
+    raise SystemExit(
+        "rotorworks_core.py could not be imported. It must sit in the same "
+        f"folder as this script. ({_exc})")
+
 
 # ============================================================
 # PHYSICS CONSTANTS
 # ============================================================
-G0   = 9.80665   # m/s²  – standard gravity
-RHO0 = 1.225     # kg/m³ – ISA sea-level air density
-T0   = 288.15    # K     – sea-level ISA temperature
-P0   = 101325.0  # Pa    – sea-level ISA pressure
-L    = 0.0065    # K/m   – tropospheric temperature lapse rate
-R    = 287.05    # J/kg/K – specific gas constant for dry air
+G0   = core.G0     # m/s²  – standard gravity
+RHO0 = core.RHO0   # kg/m³ – ISA sea-level air density
 
 
 # ============================================================
@@ -86,17 +92,14 @@ R    = 287.05    # J/kg/K – specific gas constant for dry air
 def isa_density(altitude_m: float,
                 temperature_C: Optional[float] = None) -> float:
     """
-    Compute air density [kg/m³] using the International Standard Atmosphere.
+    Air density [kg/m³] from the International Standard Atmosphere: the
+    shared core implementation (audit D7; this used to be a separate copy).
 
     If temperature_C is provided it overrides the ISA lapse-rate temperature,
     allowing a hot-day or cold-day density to be used while keeping the ISA
     pressure profile.
     """
-    h     = max(float(altitude_m), 0.0)
-    T_isa = T0 - L * h                                # ISA temperature [K]
-    P_isa = P0 * (T_isa / T0) ** (G0 / (R * L))      # ISA pressure [Pa]
-    T_K   = T_isa if temperature_C is None else float(temperature_C) + 273.15
-    return P_isa / (R * max(T_K, 1.0))
+    return core.air_density(altitude_m, temperature_C)
 
 
 # ============================================================
@@ -351,13 +354,13 @@ class ViewCanvas(ttk.Frame):
         self._st_area.configure(text=area)
 
     def _area_str(self) -> str:
+        """Format the current polygon area for display."""
         # A crossed trace still produces a number — for a bowtie it is
         # exactly 0.0 — so the warning has to sit next to the value.
         if self._polygon_closed and len(self._vertices) >= 4 \
                 and polygon_self_intersects(self._vertices):
             return "!! outline crosses itself — area unreliable"
 
-        """Format the current polygon area for display."""
         a = self.get_area_m2()
         if a is None:
             return "—"
@@ -927,9 +930,9 @@ class BodyDragTab(ttk.Frame):
         side_a  = self.side.get_area_m2()
         top_a   = self.top.get_area_m2()     # optional
 
-        # Front and side are required; top is optional (produces profile_area)
         # Front and side are both required: front drives parasite_area and
-        # BCOEF_X, side drives profile_area and BCOEF_Y.  Top is optional.
+        # BCOEF_X, side drives profile_area and BCOEF_Y.  Top is optional and
+        # gives top_area, which the multicopter tilts into its forward drag.
         missing = []
         if front_a is None:
             missing.append("Front view: complete scale + polygon")

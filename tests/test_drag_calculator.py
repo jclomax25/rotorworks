@@ -229,9 +229,14 @@ def test_a_hot_day_is_less_dense_than_a_cold_one(dc):
     assert hot / standard == pytest.approx(288.15 / 313.15, rel=1e-6)
 
 
-def test_negative_altitude_is_clamped(dc):
-    """Below sea level is not a meaningful input here; it must not blow up."""
-    assert dc.isa_density(-500.0) == pytest.approx(dc.isa_density(0.0))
+def test_below_sea_level_is_denser_and_shares_the_core_atmosphere(dc):
+    """Audit C8, D7: a site below sea level has denser air (it used to be
+    clamped to 0 m), and the calculator's atmosphere is the core's own, not
+    a copy that could drift. Inputs below -1000 m are clamped there."""
+    assert dc.isa_density(-430.0) > dc.isa_density(0.0) * 1.04
+    assert dc.isa_density(-430.0) == dc.core.air_density(-430.0)
+    assert dc.isa_density(-5000.0) == pytest.approx(dc.isa_density(-1000.0))
+    assert dc.isa_density(-1000.0) < 1.4, "must not blow up"
 
 
 # ======================================================================

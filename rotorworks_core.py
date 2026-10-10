@@ -172,6 +172,10 @@ T0_K = 288.15           # K       sea-level temperature
 P0_PA = 101325.0        # Pa      sea-level pressure
 LAPSE_K_PER_M = 0.0065  # K/m     tropospheric lapse rate
 R_AIR = 287.05          # J/kg/K  specific gas constant, dry air
+GAMMA_AIR = 1.4         # -       ratio of specific heats, dry air
+# The lowest altitude the atmosphere accepts. The Dead Sea shore, the lowest
+# dry land, is at about -430 m; below -1000 m an input is a mistake.
+MIN_ALTITUDE_M = -1000.0
 
 
 def air_density(altitude_m: float,
@@ -188,8 +192,12 @@ def air_density(altitude_m: float,
     temperature was also given, so ``--pressure`` alone was silently ignored
     and the two simulators disagreed. Having one implementation makes that
     class of divergence impossible.
+
+    Altitudes below sea level are honoured down to MIN_ALTITUDE_M: the ISA
+    profile holds there, and a site below sea level has denser air. They
+    used to be clamped to 0 m, giving sea-level density (audit C8).
     """
-    h = max(float(altitude_m), 0.0)
+    h = max(float(altitude_m), MIN_ALTITUDE_M)
 
     # Temperature: ISA lapse rate unless overridden.
     T_K = (T0_K - LAPSE_K_PER_M * h) if temperature_C is None \
@@ -204,6 +212,16 @@ def air_density(altitude_m: float,
         P = float(pressure_Pa)
 
     return P / (R_AIR * T_K)
+
+
+def speed_of_sound_mps(temperature_C: float) -> float:
+    """Speed of sound in dry air at a temperature, a = sqrt(gamma R T).
+
+    Tip Mach is judged against it. A fixed 340 m/s is the value at about
+    15 C; on a hot day the real figure is higher and on a cold one lower,
+    so a fixed figure misplaces the transonic knee (audit M12).
+    """
+    return math.sqrt(GAMMA_AIR * R_AIR * max(float(temperature_C) + 273.15, 1.0))
 
 
 # ============================================================
@@ -288,8 +306,10 @@ def parse_soc_breakpoints(spec: Optional[object]) -> Optional[List[float]]:
 # ============================================================
 # A real pack's open-circuit voltage sags non-linearly as it empties, and its
 # internal resistance climbs steeply at low SoC. Modelling that matters for
-# endurance: a linear fallback anchors pack voltage at full charge, which
-# flatters current draw late in a flight.
+# endurance. Without a curve the fallback is LINEAR: open-circuit voltage
+# falls in a straight line from full charge to the cutoff. It used to stay at
+# full charge for the whole flight, which flattered current late in a flight
+# (audit C5).
 #
 # These are deliberately conservative approximations, not cell datasheets.
 
@@ -392,7 +412,7 @@ def configure_battery_soc_model(battery,
       1. explicit breakpoint arrays
       2. a CSV curve file
       3. a chemistry preset (or auto-detected from the chemistry label)
-      4. linear fallback, anchoring voltage at full charge
+      4. linear fallback: OCV in a straight line from full charge to cutoff
 
     Sets: soc_nonlinear_enabled, soc_model_source, soc_bp, ocv_cell_bp,
     r_scale_bp. Works on either simulator's BatteryConfig by duck typing.
@@ -453,13 +473,16 @@ def pack_ocv_from_soc(battery, soc: float) -> float:
     The curve's own axis, spanning the full capacity. A mission's
     usable-energy SoC goes through cell_soc_from_usable first.
     """
+    s = min(max(float(soc), 0.0), 1.0)
     if bool(getattr(battery, "soc_nonlinear_enabled", False)) and getattr(battery, "soc_bp", None):
         ocv_cell = interp_linear_clamped(
-            min(max(float(soc), 0.0), 1.0),
-            list(battery.soc_bp), list(battery.ocv_cell_bp))
+            s, list(battery.soc_bp), list(battery.ocv_cell_bp))
         return max(float(ocv_cell) * float(battery.series_cells),
                    float(battery.vmin_pack))
-    return float(battery.vmax_pack)          # linear fallback: full charge
+    # Linear model: full charge at SoC 1 down to the cutoff at 0 (audit C5).
+    # It used to return the full-charge voltage at every SoC.
+    v_lo, v_hi = float(battery.vmin_pack), float(battery.vmax_pack)
+    return v_lo + s * (v_hi - v_lo)
 
 
 def pack_resistance_from_soc(battery, soc: float) -> float:
@@ -1665,8 +1688,9 @@ def rotor_thrust_distribution(rotor_positions: List[Tuple[float, float]],
     if denom < 1e-12:
         return [even] * n
 
-    # Drag above the CG pitches the nose down, so the LEADING rotors unload
-    # and the trailing ones take up the difference.
+    # Drag acting above the CG pitches the nose UP. Holding attitude takes a
+    # nose-down moment from the rotors, so the LEADING rotors unload and the
+    # trailing ones take up the difference.
     return [max(even - moment * a / denom, 0.0) for a in arms]
 
 
@@ -2099,16 +2123,25 @@ def wiring_from_fields(values: dict) -> Optional["WiringConfig"]:
     return wiring
 
 
-def connector_currents_A(pack_current_A: float, per_esc_current_A: float) -> Dict[str, float]:
+def connector_currents_A(pack_current_A: float, per_esc_current_A: float,
+                         motor_current_A: Optional[float] = None) -> Dict[str, float]:
     """
     The current through each connector, which is not the same number in
     each position: the battery connector carries the whole pack current,
-    an ESC connector one motor's share, and a motor connector the phase
-    current, about 1.15x the ESC's DC input.
+    an ESC connector one motor's share, and a motor connector the motor's
+    winding current.
+
+    The ESC chops its supply down to the winding voltage, so at part
+    throttle the winding carries roughly the DC input divided by the duty
+    cycle. A fixed 1.15 x the DC input understated it well below full
+    throttle (audit C6). Pass `motor_current_A`, the winding current from
+    the motor model; without it the old 1.15 x estimate is the floor.
     """
-    return {"Battery": max(float(pack_current_A), 0.0),
-            "ESC": max(float(per_esc_current_A), 0.0),
-            "Motor": max(float(per_esc_current_A), 0.0) * 1.15}
+    esc = max(float(per_esc_current_A), 0.0)
+    motor = esc * 1.15
+    if motor_current_A is not None and math.isfinite(float(motor_current_A)):
+        motor = max(float(motor_current_A), esc)
+    return {"Battery": max(float(pack_current_A), 0.0), "ESC": esc, "Motor": motor}
 
 
 def _dual_limit(value: float, cont: Optional[float], mx: Optional[float],
@@ -2132,7 +2165,8 @@ def _dual_limit(value: float, cont: Optional[float], mx: Optional[float],
 
 def wiring_status_rows(wiring: Optional["WiringConfig"], pack_current_A: float,
                        per_esc_current_A: float, pack_voltage_full_V: float,
-                       ambient_C: float, where: str = "") -> List[Tuple]:
+                       ambient_C: float, where: str = "",
+                       motor_current_A: Optional[float] = None) -> List[Tuple]:
     """
     The Status rows for the main wire run and the three connectors, for any
     of the three simulators: (group, metric, value, limit, tag, note), where
@@ -2166,7 +2200,7 @@ def wiring_status_rows(wiring: Optional["WiringConfig"], pack_current_A: float,
                      f"Steady temperature of the main lead at {pack_current_A:.1f} A in still "
                      f"air — conservative, since a lead in the propeller wash runs cooler. "
                      f"Silicone insulation is rated about 200 °C, PVC about 105 °C."))
-    currents = connector_currents_A(pack_current_A, per_esc_current_A)
+    currents = connector_currents_A(pack_current_A, per_esc_current_A, motor_current_A)
     for name in CONNECTOR_POSITIONS:
         if name not in wiring.connectors:
             continue
@@ -2176,7 +2210,10 @@ def wiring_status_rows(wiring: Optional["WiringConfig"], pack_current_A: float,
         limit, tag, note = _dual_limit(amps, cont, mx, "A")
         what = {"Battery": "the whole pack current",
                 "ESC": "one ESC's share of the current",
-                "Motor": "the motor phase current, about 1.15x the ESC's DC input"}[name]
+                "Motor": ("the motor's winding current, which at part throttle is "
+                          "well above the ESC's DC input"
+                          if motor_current_A is not None else
+                          "the motor phase current, estimated at 1.15x the ESC's DC input")}[name]
         rows.append((group, f"{name} connector current{at}", f"{amps:.1f} A", limit, tag,
                      f"Carries {what}. {note}"))
         if volts:
@@ -2222,7 +2259,9 @@ def build_power_budget(total_in_W: float,
                        peripheral_V: Optional[float] = None,
                        peripheral_A: Optional[float] = None,
                        rails: Optional[List[dict]] = None,
-                       motor_iron_W: float = 0.0) -> List[dict]:
+                       motor_iron_W: float = 0.0,
+                       air_W: Optional[float] = None,
+                       air_label: str = "Power to the air (ideal)") -> List[dict]:
     """
     Break the pack's electrical output into where every watt ends up.
 
@@ -2245,6 +2284,14 @@ def build_power_budget(total_in_W: float,
     Rows carry a voltage and a current. Anything drawing straight from the
     pack reports "Battery" for voltage, because its voltage is whatever the
     pack happens to be at that moment rather than a designed value.
+
+    `air_W` is the power that actually reaches the air: the momentum-theory
+    ideal for rotors, thrust x airspeed for a propeller. With it, the shaft
+    power splits into that and a lost row for the rotor's or propeller's own
+    aerodynamic loss. Without it the shaft power is one delivered row, named
+    for where it goes, the propellers, since it still contains their losses.
+    It used to be labelled "to the air" either way, overstating what was
+    delivered by 1 - FoM or 1 - eta_prop (audit C7).
 
     Returns a list of dicts: name, watts, pct, kind ("delivered"/"lost"/
     "subtotal"/"total"), voltage, current.
@@ -2272,7 +2319,12 @@ def build_power_budget(total_in_W: float,
         })
 
     # ---- delivered ----------------------------------------------------
-    add("Motor shaft power (to the air)", motor_shaft_W, "delivered")
+    shaft = max(float(motor_shaft_W), 0.0)
+    to_air = None if air_W is None else min(max(float(air_W), 0.0), shaft)
+    if to_air is None:
+        add("Motor shaft power (to the propellers)", shaft, "delivered")
+    else:
+        add(air_label, to_air, "delivered")
 
     rail_list = rails or []
     for rail in rail_list:
@@ -2296,6 +2348,8 @@ def build_power_budget(total_in_W: float,
             peripheral_A)
 
     # ---- lost ---------------------------------------------------------
+    if to_air is not None:
+        add("Rotor / propeller aerodynamic loss", shaft - to_air, "lost")
     add("Motor copper loss (I2Rm)", motor_copper_W, "lost")
     if motor_iron_W > 0:
         # Only the VTOL passes this: the no-load current times back-EMF, the

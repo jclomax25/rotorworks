@@ -138,8 +138,8 @@ def isa_density(altitude_m: float,
 # ============================================================
 # A real pack's open-circuit voltage sags non-linearly as it empties, and its
 # internal resistance climbs steeply at low SoC.  Modelling that matters for
-# endurance: the linear fallback anchors pack voltage at full charge, which
-# flatters current draw late in a flight.
+# endurance. Without a curve the fallback is linear, from full charge to the
+# cutoff (core.pack_ocv_from_soc; it used to hold full charge, audit C5).
 #
 # These tables mirror the multicopter simulator so the two tools agree.
 # They are deliberately conservative approximations, not cell datasheets.
@@ -281,7 +281,7 @@ class BatteryConfig:
 
         # ---- State-of-charge model ----------------------------------
         # "auto" picks a preset from the chemistry label; "linear" disables
-        # the curve and anchors pack voltage at full charge (legacy behaviour).
+        # the curve: voltage falls in a straight line from full to cutoff.
         self.soc_model = str(soc_model or "auto").strip().lower()
         self.soc_curve_csv = (str(soc_curve_csv).strip() if soc_curve_csv else None)
         self.soc_nonlinear_enabled: bool = False
@@ -300,24 +300,16 @@ class BatteryConfig:
 
     # ---- SoC-dependent pack behaviour --------------------------------
     def ocv_at_soc(self, soc: float) -> float:
-        """Pack open-circuit voltage at a given state of charge (0..1)."""
-        if self.soc_nonlinear_enabled and self.soc_bp:
-            ocv_cell = _interp_linear_clamped(
-                min(max(float(soc), 0.0), 1.0),
-                list(self.soc_bp), list(self.ocv_cell_bp))
-            return max(float(ocv_cell) * float(self.series_cells), float(self.vmin_pack))
-        # Linear fallback: anchored at full-charge voltage.
-        return float(self.vmax_pack)
+        """Pack open-circuit voltage at a given state of charge (0..1).
+
+        The shared core model, as the other two simulators use. This copy
+        held the linear fallback at full-charge voltage for the whole
+        flight (audit C5)."""
+        return core.pack_ocv_from_soc(self, soc)
 
     def resistance_at_soc(self, soc: float) -> float:
         """Pack internal resistance at a given SoC — rises as the pack empties."""
-        base_r = max(float(self.pack_resistance), 0.0)
-        if self.soc_nonlinear_enabled and self.soc_bp:
-            scale = _interp_linear_clamped(
-                min(max(float(soc), 0.0), 1.0),
-                list(self.soc_bp), list(self.r_scale_bp))
-            return base_r * max(float(scale), 0.05)
-        return base_r
+        return core.pack_resistance_from_soc(self, soc)
 
     @property
     def pack_resistance(self) -> float:
@@ -3751,8 +3743,8 @@ FW_FIELD_HELP = {
     "batt_chem": ("Chemistry label. Also selects the SoC curve when SoC model "
                   "is set to auto.", "LiPo, Li-ion, LiFePO4."),
     "batt_soc_model": ("How pack voltage falls as the battery empties. auto picks "
-                       "a curve from the chemistry above; linear anchors voltage "
-                       "at full charge (the old behaviour).",
+                       "a curve from the chemistry above; linear falls in a "
+                       "straight line from full charge to the cutoff.",
                        "auto, linear, lipo, liion, lifepo4. Leave on auto."),
     "batt_soc_curve_csv": ("Optional CSV of your own measured discharge curve, "
                            "which overrides the preset.",
@@ -5271,10 +5263,11 @@ def launch_gui():
         """
         Fill the Power Budget from the run just completed.
 
-        Motor SHAFT power is what reaches the air; the copper loss that got it
-        there is a separate, lost row. Adding them would count winding heat as
-        useful output — the same mistake the Propulsion Power metric used to
-        make.
+        What reaches the air is thrust x airspeed; the propeller's own loss
+        and the motor's copper loss are lost rows. Adding winding heat to the
+        shaft power would count it as useful output, and calling the shaft
+        power "to the air" counted the propeller's loss as delivered (audit
+        C7).
         """
         for iid in pb_tv.get_children():
             pb_tv.delete(iid)
@@ -5285,6 +5278,8 @@ def launch_gui():
 
         copper_W = float(metrics.get("motor_copper_loss_W", 0.0) or 0.0)
         shaft_W = max(float(metrics.get("motor_power_W", 0.0)) - copper_W, 0.0)
+        air_W = (float(metrics.get("thrust_required_N", 0.0) or 0.0)
+                 * max(float(metrics.get("airspeed_mps", 0.0) or 0.0), 0.0))
 
         rails = []
         avionics = getattr(cfg, "avionics", None)
@@ -5310,7 +5305,9 @@ def launch_gui():
             # the model by the sag, which showed up as "Unaccounted".
             peripheral_W=(periph_A * float(cfg.battery.vnom_pack)),
             peripheral_A=periph_A,
-            rails=rails)
+            rails=rails,
+            air_W=air_W if air_W > 0 else None,
+            air_label="Propulsive power (thrust x airspeed)")
 
         for row in rows:
             current = ("" if row["current"] is None
@@ -6541,8 +6538,7 @@ def launch_gui():
         # tip is what costs efficiency and makes noise. The speed of sound
         # falls with temperature, so a fixed 200 m/s limit is several percent
         # wrong on a cold day. Scale it with conditions instead.
-        _a_sound = math.sqrt(1.4 * 287.05 *
-                             (float(m.get("ambient_temp_C", 15.0)) + 273.15))
+        _a_sound = core.speed_of_sound_mps(float(m.get("ambient_temp_C", 15.0)))
         _tip_mach = V_tip / max(_a_sound, 1e-9)
         _ins_row(motor_tv, "Prop tip speed",
                  f"{V_tip:.1f} m/s  (Mach {_tip_mach:.2f})",
@@ -6803,7 +6799,8 @@ def launch_gui():
         for _group, _name, _val, _lim, _tag, _note in core.wiring_status_rows(
                 getattr(cfg, "wiring", None), Ipack,
                 float(m.get("motor_I_per_esc_A", 0.0)), float(batt.vmax_pack),
-                float(m.get("ambient_temp_C", 25.0))):
+                float(m.get("ambient_temp_C", 25.0)),
+                motor_current_A=m.get("motor_current_A")):
             _ins_row(batt_tv if _group == "battery" else motor_tv,
                      _name, _val, _lim, _tag, _note)
 

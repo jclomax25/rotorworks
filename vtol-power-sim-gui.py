@@ -1738,7 +1738,9 @@ def tip_speed_mps(diameter_in: float, rpm: float) -> float:
 
 
 def speed_of_sound_mps(temp_C: float) -> float:
-    return 331.3 * math.sqrt(max(1.0 + float(temp_C) / 273.15, 1e-6))
+    """Speed of sound at a temperature: the shared core formula, so the three
+    simulators judge tip Mach against the same number."""
+    return core.speed_of_sound_mps(temp_C)
 
 
 def density_altitude_m(rho: float) -> float:
@@ -5075,10 +5077,10 @@ def launch_gui(args=None) -> None:
                   "Which discharge curve the pack uses.\n\n"
                   "auto: breakpoints if given, else a CSV curve, else the "
                   "preset for the chemistry above.\n\n"
-                  "linear: no curve at all. Open-circuit voltage is held at "
-                  "FULL CHARGE for the whole flight, so this is OPTIMISTIC "
-                  "near the end of the pack — it ignores the sag that makes "
-                  "the last minutes draw more current for the same power.\n\n"
+                  "linear: no curve. Open-circuit voltage falls in a straight "
+                  "line from full charge to the cutoff. Real packs hold their "
+                  "voltage through the middle and drop at the end, so this "
+                  "is pessimistic mid-flight and optimistic near empty.\n\n"
                   "A chemistry name forces that preset.")
     _table_picker(tab_batt, "SoC curve (CSV)", "soc_curve",
                   "Measured discharge curve for this pack.\n\n"
@@ -6612,7 +6614,8 @@ def launch_gui(args=None) -> None:
         _wiring = getattr(cfg, "wiring", None)
         for _group, _name, _val, _lim, _tag, _note in core.wiring_status_rows(
                 _wiring, hover_I, hover_I / max(cfg.num_lift_rotors, 1),
-                float(batt.vmax_pack), float(cfg.ambient_temp_C), where="hover"):
+                float(batt.vmax_pack), float(cfg.ambient_temp_C), where="hover",
+                motor_current_A=m.get("hover_lift_current_A")):
             _row(batt_status_tv if _group == "battery" else motor_status_tv,
                  _name, _val, _lim, _tag, _note)
 
@@ -6950,6 +6953,20 @@ def launch_gui(args=None) -> None:
     def update_power_budget(cfg, m):
         _clear_tree(pb_tv)
         pack_I = float(m.get("pack_current_A", 0.0))
+        # What reaches the air (audit C7): thrust x airspeed in wing-borne
+        # cruise, the momentum ideal in hover. In transition the lift rotors
+        # and the wing share the load, with no simple ideal, so the shaft
+        # power is shown whole, named for where it goes.
+        _regime = str(m.get("regime", ""))
+        if _regime == "cruise":
+            _air = (float(m.get("drag_N", 0.0) or 0.0)
+                    * max(float(m.get("airspeed_mps", 0.0) or 0.0), 0.0))
+            _air_label = "Propulsive power (thrust x airspeed)"
+        elif _regime == "hover":
+            _air = m.get("hover_ideal_power_W")
+            _air_label = "Power to the air (momentum ideal)"
+        else:
+            _air, _air_label = None, ""
         rows = core.build_power_budget(
             total_in_W=float(m.get("total_power_W", 0.0)),
             motor_shaft_W=float(m.get("shaft_power_W", 0.0)),
@@ -6971,7 +6988,9 @@ def launch_gui(args=None) -> None:
                           + cfg.periph_current_A) or None,
             rails=[{"name": f"{v:g}V", "voltage_V": v, "current_A": a,
                     "efficiency": e}
-                   for v, (a, e) in sorted(cfg.avionics_rails.items())] or None)
+                   for v, (a, e) in sorted(cfg.avionics_rails.items())] or None,
+            air_W=(float(_air) if _air is not None else None),
+            **({"air_label": _air_label} if _air_label else {}))
         for r in rows:
             pb_tv.insert("", "end", tags=(r["kind"],),
                          values=(r["name"], f"{r['watts']:.1f}", f"{r['pct']:.1f}%",
@@ -6984,9 +7003,10 @@ def launch_gui(args=None) -> None:
         pb_scope.configure(text=(
             f"At the cruise speed of {float(m.get('airspeed_mps', 0.0)):.1f} m/s "
             f"({m.get('regime', '')}). Motor losses come from the Kv / Rm / I0 "
-            f"model; rotor aerodynamic losses are inside the shaft power, through "
-            f"the figure of merit and propeller efficiency. A motor covered by a "
-            f"bench table has its loss inside the measured power instead."))
+            f"model. The rotors' and propellers' own aerodynamic loss is its "
+            f"own row in cruise and hover; in transition it is inside the shaft "
+            f"power. A motor covered by a bench table has its loss inside the "
+            f"measured power instead."))
 
         # Only the leaf rows: the subtotal and total rows are sums of these,
         # so charting them too would double the whole.

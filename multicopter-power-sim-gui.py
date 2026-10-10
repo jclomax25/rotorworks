@@ -97,6 +97,10 @@ from matplotlib.lines import Line2D
 # Constants
 # -------------------------------
 AIR_DENSITY = 1.225  # kg/m^3 (sea level ISA)
+# Standard gravity, the same value the other simulators and the core use.
+# The multicopter used 9.81, which put its thrust columns 0.03% apart from
+# the vertical-thrust ones (audit M12, E11).
+G0 = core.G0
 
 # Default rotor inflow efficiency map in forward flight.
 # eta > 1.0 means translational lift improves rotor efficiency at that advance ratio.
@@ -120,10 +124,19 @@ g0 = 9.80665 # m/s^2
 # -------------------------------
 class BatteryConfig:
     """
-    Simple pack model:
-      - nominal voltage taken as Vmax_cell * Ncells
-      - internal resistance modeled as Rcell * Ncells (series)
-      - under-load voltage V = Vnom - I*Rpack (clamped at Vmin_cell*Ncells)
+    Pack model:
+      - pack voltages are the per-cell min / nominal / max times the cells
+        in series (vmin_pack, vnom_pack, vmax_pack)
+      - internal resistance R_pack = R_cell * N_series / N_parallel, scaled
+        with state of charge by the SoC curve (pack_resistance_at)
+      - open-circuit voltage follows the SoC curve for the chemistry, else
+        falls linearly from full charge to the cutoff (core.pack_ocv_from_soc)
+      - under load V = OCV - I * R_pack, solved exactly for a constant-power
+        load (core.solve_pack_for_power). It is NOT clamped at the cutoff:
+        a pack that cannot hold its cutoff under load reads below it, and the
+        low-voltage checks fire.
+    This docstring used to describe a model the code no longer used (audit
+    M12).
     """
     def __init__(self,
                  chemistry: Optional[str],
@@ -1194,7 +1207,7 @@ def _translating_drag_and_tilt(config: DroneConfig, speed_mps: float) -> Tuple[f
     else:
         a_level = float(config.parasite_area)
     a_top = max(float(getattr(config, "top_area", 0.0) or 0.0), 0.0)
-    weight_N = max(config.drone_weight_g * 9.81 / 1000.0, 1e-9)
+    weight_N = max(config.drone_weight_g * G0 / 1000.0, 1e-9)
     if a_top <= 0.0 or q <= 0.0:
         drag = q * a_level * cd
         return drag, math.atan2(drag, weight_N)
@@ -1219,7 +1232,7 @@ def required_tilt_deg(config: DroneConfig, speed_mps: float, orientation: str) -
     """
     if orientation not in ("forward", "translating"):
         return 0.0
-    weight_force = config.drone_weight_g * 9.81 / 1000.0
+    weight_force = config.drone_weight_g * G0 / 1000.0
     drag_force = drag_force_required(config, speed_mps, orientation=orientation)
     return math.degrees(math.atan2(drag_force, max(weight_force, 1e-9)))
 
@@ -1272,7 +1285,7 @@ def total_disk_area(config: DroneConfig) -> float:
 
 def disk_loading_N_m2(config: DroneConfig) -> float:
     """Disk loading: DL = W / (N * A_disk) [N/m²]."""
-    weight_N = config.drone_weight_g * 9.81 / 1000.0
+    weight_N = config.drone_weight_g * G0 / 1000.0
     area = total_disk_area(config)
     return weight_N / area if area > 0 else 0.0
 
@@ -1285,13 +1298,13 @@ def available_total_thrust_N(config: DroneConfig) -> float:
             _cached = getattr(config.propeller, "_thrust_g_max", None)
             _max_g = (_cached if _cached is not None
                       else float(config.propeller.table["Thrust_g"].max()))
-            return float(_max_g) * 9.81 / 1000.0 * nm
+            return float(_max_g) * G0 / 1000.0 * nm
         except Exception:
             pass
 
     max_thr_g = float(getattr(config.propeller, "max_thrust_g", 0.0) or 0.0)
     if max_thr_g > 0:
-        return max_thr_g * 9.81 / 1000.0 * nm
+        return max_thr_g * G0 / 1000.0 * nm
 
     # Fallback from motor max power + actuator-disk estimate.
     p_max_pm = max(float(getattr(config.motor, "max_power", 0.0) or 0.0), 0.0)
@@ -1462,7 +1475,7 @@ def hover_wind_resistance_mps(config: DroneConfig) -> float:
     if A_frontal < 1e-4:          # smaller than 1 cm2 is not a real airframe
         return float("nan")
 
-    weight_N = config.drone_weight_g * 9.81 / 1000.0
+    weight_N = config.drone_weight_g * G0 / 1000.0
 
     t_avail = max(available_total_thrust_N(config), 0.0)
     if t_avail <= weight_N:
@@ -1513,7 +1526,7 @@ def thrust_required(config: DroneConfig, speed_mps: float, orientation: str,
 
     This function returns total thrust magnitude (N).
     """
-    weight_force = config.drone_weight_g * 9.81 / 1000.0  # Convert grams to kg
+    weight_force = config.drone_weight_g * G0 / 1000.0  # Convert grams to kg
 
     drag_force = drag_force_required(config, speed_mps, orientation)
 
@@ -1597,7 +1610,7 @@ def interpolate_motor_point(config: DroneConfig, thrust_per_motor_N: float) -> d
     if config.propeller.table is None:
         raise ValueError("No prop_table loaded, cannot interpolate.")
 
-    thrust_g = thrust_per_motor_N * 1000.0 / 9.81
+    thrust_g = thrust_per_motor_N * 1000.0 / G0
     df = config.propeller.table
 
     if "Thrust_g" not in df.columns or "Power_W" not in df.columns:
@@ -2222,7 +2235,7 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         drone, motor_power_W=hover_motor_power_W, periph_power_W=periph_power_W
     )
     hover_propulsion_power_W = max(float(hover_total_power_W) - float(periph_power_W), 0.0)
-    hover_thrust_total_g = hover_thrust_total_N * 1000.0 / 9.81
+    hover_thrust_total_g = hover_thrust_total_N * 1000.0 / G0
     hover_efficiency_gW = hover_thrust_total_g / hover_propulsion_power_W if hover_propulsion_power_W > 0 else 0.0
 
     A_total = total_disk_area(drone)
@@ -2231,7 +2244,9 @@ def _compute_operating_metrics_core(drone: DroneConfig,
     drive_eff_hover = hover_drive_efficiency(drone, hover_thrust_total_N, p_actual_induced)
 
     tip_speed = tip_speed_mps_from_rpm(drone.propeller.diameter_in, float(rpm_est)) if rpm_est is not None else float("nan")
-    tip_mach = tip_speed / 340.0 if tip_speed == tip_speed else float("nan")
+    # Against the speed of sound at the ambient temperature (audit M12).
+    tip_mach = (tip_speed / core.speed_of_sound_mps(ambient_temp_C)
+                if tip_speed == tip_speed else float("nan"))
 
     # Motor current on the WINDING side of the ESC (audit M2, M3). It used to
     # be the ESC's input current P / V, which understates the winding current
@@ -2244,6 +2259,14 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         getattr(drone.motor, "kv", None),
         float(getattr(drone.motor, "resistance", 0.0) or 0.0), _v_supply)
     p_copper = (motor_current_A ** 2) * float(getattr(drone.motor, "resistance", 0.0))
+    # No-load (iron and bearing) loss, I0 x V_emf, which the motor pays at
+    # any load. The Power Budget used to leave it, and every rotor loss,
+    # inside a shaft-power residual (audit M9).
+    _kv = getattr(drone.motor, "kv", None)
+    p_noload = (float(getattr(drone.motor, "idle_current", 0.0) or 0.0)
+                * float(rpm_est) / float(_kv)
+                if (_kv and rpm_est is not None and math.isfinite(float(rpm_est)))
+                else 0.0)
     # The motor thermal estimate is anchored to the motor's rated current:
     # at the rating we assume a 55 C rise, scaling with I^2.  If no rating was
     # supplied there is nothing to scale against, so report ambient rather
@@ -2378,6 +2401,11 @@ def _compute_operating_metrics_core(drone: DroneConfig,
         "inflow_power_multiplier": float(inflow_mult),
         "noise_significant":   bool(math.isfinite(tip_mach) and tip_mach > 0.6),
         "motor_copper_loss_W_per_motor": float(p_copper),
+        "motor_noload_loss_W_per_motor": float(p_noload),
+        # Momentum-theory power the rotors put into the air at this point:
+        # what the Power Budget counts as delivered (audit C7, M9).
+        "ideal_rotor_power_W": float(ideal_rotor_power_W(
+            drone, airspeed, orientation, load_factor=load_factor)),
         "battery_loss_W":      float(battery_loss_W),
         "motor_temp_est_C":    float(motor_temp_est_C),
         "esc_temp_est_C":      float(esc_temp_est_C),
@@ -2915,7 +2943,7 @@ def simulate_mission(config: DroneConfig,
             else:
                 alt_now_m = _target_alt
 
-            potential_power_w = (config.drone_weight_g * 9.81 / 1000.0) * (climb_cmd - descent_cmd)
+            potential_power_w = (config.drone_weight_g * G0 / 1000.0) * (climb_cmd - descent_cmd)
             kinetic_power_w = kinetic_power_term_W(
                 config.drone_weight_g,
                 current_speed_mps,
@@ -3488,13 +3516,13 @@ def make_motor_operating_point_figure(config: DroneConfig, metrics: dict, figsiz
     # starts at half the lower of the table's first row and the operating
     # point: near zero thrust in forward flight g/W runs into the hundreds
     # and flattens everything else on the axis.
-    t_lo_N = float(df["Thrust_g"].min()) * 9.81 / 1000.0 if len(thrust_g) else 0.0
-    top_N = max(float(df["Thrust_g"].max()) * 9.81 / 1000.0 if len(thrust_g) else 0.0,
+    t_lo_N = float(df["Thrust_g"].min()) * G0 / 1000.0 if len(thrust_g) else 0.0
+    top_N = max(float(df["Thrust_g"].max()) * G0 / 1000.0 if len(thrust_g) else 0.0,
                 thrust_pm_N)
     lo_N = 0.5 * (min(t_lo_N, thrust_pm_N) if thrust_pm_N > 0 else t_lo_N)
     sweep_N = ([lo_N + (top_N - lo_N) * i / 59 for i in range(60)]
                if top_N > lo_N > 0 else [])
-    sweep_g = [t * 1000.0 / 9.81 for t in sweep_N]
+    sweep_g = [t * 1000.0 / G0 for t in sweep_N]
     sweep_W = [motor_power_per_motor_W(config, t, speed, orientation) for t in sweep_N]
     bench = Line2D([], [], color="gray", label="Faint: bench table (0 m/s)", **faint)
     
@@ -3515,7 +3543,7 @@ def make_motor_operating_point_figure(config: DroneConfig, metrics: dict, figsiz
     
     # Mark operating point on subplot 1 (both y-axes), from the same model
     # as the curves so it lies on them.
-    thrust_g_op = thrust_pm_N * 1000.0 / 9.81
+    thrust_g_op = thrust_pm_N * 1000.0 / G0
     point = interpolate_motor_point(config, thrust_pm_N)
     power_op = (motor_power_per_motor_W(config, thrust_pm_N, speed, orientation)
                 if thrust_pm_N > 0 else 0.0)
@@ -4250,7 +4278,7 @@ MC_FIELD_HELP = {
                  "Typically 1C."),
     "batt_chem": ("Chemistry label, for your own reference.", "LiPo, Li-ion, LiFePO4."),
     "batt_soc_model": ("How pack voltage falls as it empties. auto uses a built-in "
-                       "curve, linear uses a straight line.",
+                       "curve, linear a straight line from full charge to the cutoff.",
                        "Leave on auto unless you have measured your own curve."),
     "batt_soc_curve_csv": ("Optional CSV of your own measured discharge curve.",
                            "Columns: soc, ocv_cell, r_scale."),
@@ -5799,10 +5827,11 @@ def launch_gui():
         """
         Fill the Power Budget from the run just completed.
 
-        Motor SHAFT power is what reaches the air; the copper loss that got it
-        there is a separate, lost row. Adding them would count winding heat as
-        useful output — the same mistake the Propulsion Power metric used to
-        make.
+        What reaches the air is the momentum-theory ideal; the rotors' own
+        aerodynamic loss, the motors' copper and no-load losses and the ESC
+        loss are each a lost row. The motor's shaft power used to be shown as
+        "to the air": a residual of motor input less copper loss, with the
+        no-load loss and every rotor loss inside it (audit M9, C7).
         """
         for iid in pb_tv.get_children():
             pb_tv.delete(iid)
@@ -5811,8 +5840,11 @@ def launch_gui():
         if total_W <= 0:
             return
 
-        copper_W = float(metrics.get("motor_copper_loss_W_per_motor", 0.0) or 0.0) * max(int(cfg.num_motors), 1)
-        shaft_W = max(float(metrics.get("motor_power_W", 0.0)) - copper_W, 0.0)
+        _n = max(int(cfg.num_motors), 1)
+        copper_W = float(metrics.get("motor_copper_loss_W_per_motor", 0.0) or 0.0) * _n
+        noload_W = float(metrics.get("motor_noload_loss_W_per_motor", 0.0) or 0.0) * _n
+        shaft_W = max(float(metrics.get("motor_power_W", 0.0)) - copper_W - noload_W, 0.0)
+        _air = metrics.get("ideal_rotor_power_W")
 
         rails = []
         avionics = getattr(cfg, "avionics", None)
@@ -5830,6 +5862,9 @@ def launch_gui():
             total_in_W=total_W,
             motor_shaft_W=shaft_W,
             motor_copper_W=copper_W,
+            motor_iron_W=noload_W,
+            air_W=(float(_air) if _air is not None else None),
+            air_label="Power to the air (momentum ideal)",
             battery_i2r_W=float(metrics.get("battery_i2r_loss_W", 0.0) or 0.0),
             esc_loss_W=float(metrics.get("esc_loss_W", 0.0) or 0.0),
             wire_loss_W=float(metrics.get("wire_loss_W", 0.0) or 0.0),
@@ -7161,8 +7196,7 @@ def launch_gui():
         # than a fixed figure — as the fixed-wing check now does.
         if tip_mach is not None:
             tm = float(tip_mach)
-            _a_sound = math.sqrt(1.4 * 287.05 *
-                                 (float(metrics.get("ambient_temp_C", 15.0)) + 273.15))
+            _a_sound = core.speed_of_sound_mps(float(metrics.get("ambient_temp_C", 15.0)))
             _insert_status_row(prop_table_tv, "Tip Mach",
                 f"{tm:.3f}  ({tm * _a_sound:.0f} m/s)", "<= 0.60",
                 _classify(tm, 0.60),
@@ -7298,7 +7332,8 @@ def launch_gui():
         # IT and the pack's full-charge voltage.
         for _group, _name, _val, _lim, _tag, _note in core.wiring_status_rows(
                 getattr(config, "wiring", None), Ipack, Iesc,
-                float(batt.vmax_pack), float(metrics.get("ambient_temp_C", 25.0))):
+                float(batt.vmax_pack), float(metrics.get("ambient_temp_C", 25.0)),
+                motor_current_A=metrics.get("motor_current_A")):
             _insert_status_row(batt_table if _group == "battery" else motor_table,
                                _name, _val, _lim, _tag, _note)
 
@@ -8344,7 +8379,7 @@ def launch_gui():
                 course_deg=course_deg,
                 ambient_temp_C=(float(v_temp.get()) if v_temp.get().strip() else 25.0),
             )
-            potential_power_w = (drone.drone_weight_g * 9.81 / 1000.0) * (climb_rate - descent_rate)
+            potential_power_w = (drone.drone_weight_g * G0 / 1000.0) * (climb_rate - descent_rate)
             base_total_w = float(metrics.get("total_power_W", 0.0))
             adj_total_w = max(base_total_w + potential_power_w, 0.0)
             if base_total_w > 0:
@@ -9330,7 +9365,7 @@ def main():
         descent_rate = max(float(args.descent_rate_mps), 0.0)
         if climb_rate > 0 and descent_rate > 0:
             descent_rate = 0.0
-        potential_power_w = (drone.drone_weight_g * 9.81 / 1000.0) * (climb_rate - descent_rate)
+        potential_power_w = (drone.drone_weight_g * G0 / 1000.0) * (climb_rate - descent_rate)
         base_total_w = float(metrics.get("total_power_W", 0.0))
         adj_total_w = max(base_total_w + potential_power_w, 0.0)
         if base_total_w > 0:

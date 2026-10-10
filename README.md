@@ -1344,8 +1344,9 @@ better.
   internal resistance as functions of SoC, using a chemistry preset
   (LiPo / Li-ion / LiFePO4), a CSV you measured, or breakpoints you supply.
   Resistance rises steeply below about 20% SoC, which is what makes voltage
-  sag worse late in a flight. Set `--battery_soc_model linear` to disable the
-  curve and anchor voltage at full charge (the older behaviour). Mission runs
+  sag worse late in a flight. Set `--battery_soc_model linear` to replace the
+  curve with a straight line from full charge to the cutoff (it used to hold
+  full-charge voltage for the whole flight; audit C5). Mission runs
   track SoC phase-by-phase; single-point runs evaluate at full charge.
 - ISA atmosphere with optional temperature override.
 - Thermal figures are first-order estimates anchored to component ratings,
